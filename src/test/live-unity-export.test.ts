@@ -5,11 +5,11 @@ import { UnityExporter } from '../main/services/unity-exporter';
 
 const liveIt = process.env.TILEMAP_LIVE_EXPORT === '1' ? it : it.skip;
 
-liveIt('eksportuje wskazany projekt danych do wskazanego katalogu Unity Assets', async () => {
+liveIt('eksportuje wskazany projekt do dokładnego katalogu docelowego integracji Unity', async () => {
   const projectRoot = process.env.TILEMAP_EXPORT_PROJECT_ROOT;
-  const assetsDirectory = process.env.TILEMAP_EXPORT_UNITY_ASSETS;
-  if (!projectRoot || !assetsDirectory) {
-    throw new Error('Ustaw TILEMAP_EXPORT_PROJECT_ROOT i TILEMAP_EXPORT_UNITY_ASSETS.');
+  const targetDirectory = process.env.TILEMAP_EXPORT_UNITY_TARGET;
+  if (!projectRoot || !targetDirectory) {
+    throw new Error('Ustaw TILEMAP_EXPORT_PROJECT_ROOT i TILEMAP_EXPORT_UNITY_TARGET.');
   }
 
   const database = new ProjectDatabase(projectRoot);
@@ -17,12 +17,11 @@ liveIt('eksportuje wskazany projekt danych do wskazanego katalogu Unity Assets',
     const exporter = new UnityExporter();
     const preview = await exporter.preview(
       database,
-      { targetAssetsDirectory: assetsDirectory },
-      () => true,
+      { integration: 'unity', targetDirectory },
     );
     expect(preview.files.length).toBeGreaterThan(0);
     const result = exporter.run(database, preview.token);
-    expect(result.exported).toBe(preview.files.length);
+    expect(result.fileCount).toBe(preview.files.length);
     expect(existsSync(result.manifestPath)).toBe(true);
   } finally {
     database.close();

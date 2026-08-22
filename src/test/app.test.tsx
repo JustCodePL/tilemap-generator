@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import type { TilemapGeneratorApi } from '../shared/bridge';
-import type { AssetDetail, AssetVersion, ProjectInfo } from '../shared/domain';
+import type { AssetDetail, AssetSummary, AssetVersion, ProjectInfo } from '../shared/domain';
 import { App, GenerationLogPanel, PreviewZoomControls, ProjectReferencesPanel, ProjectSettingsProposalsPanel, ReviewControls, TerrainSeamPreview } from '../renderer/ui/App';
 
 const projectFixture: ProjectInfo = {
@@ -11,7 +11,7 @@ const projectFixture: ProjectInfo = {
   projection: 'isometric', tileWidthPx: 256, tileHeightPx: 128, pixelsPerUnit: 256,
   maxConcurrentJobs: 1,
   aiVerificationEnabled: true,
-  styleSummary: '', styleSummaryStale: false, unityExportPath: null,
+  styleSummary: '', styleSummaryStale: false, exportTargets: {},
   createdAt: '2026-08-07T10:00:00.000Z', updatedAt: '2026-08-07T10:00:00.000Z',
 };
 
@@ -20,14 +20,20 @@ beforeEach(() => {
   window.tilemap = {
     projects: {
       current: vi.fn(async () => null), recents: vi.fn(async () => []),
-      create: vi.fn(), open: vi.fn(), openRecent: vi.fn(), update: vi.fn(), close: vi.fn(), removeRecent: vi.fn(),
+      chooseStorageDirectory: vi.fn(), create: vi.fn(), open: vi.fn(), openRecent: vi.fn(), update: vi.fn(), close: vi.fn(), removeRecent: vi.fn(),
       settingsProposals: vi.fn(async () => []), reviewSettingsProposal: vi.fn(),
     },
     assets: { list: vi.fn(), get: vi.fn(), review: vi.fn(), undoApproval: vi.fn(), undoRejection: vi.fn() },
     references: { list: vi.fn(async () => []), add: vi.fn(), update: vi.fn(), remove: vi.fn() },
     generation: { enqueue: vi.fn(), cancel: vi.fn(), retry: vi.fn(), verify: vi.fn(), jobs: vi.fn(), logs: vi.fn(async () => []), onEvent: vi.fn(() => () => undefined) },
     style: { history: vi.fn(), update: vi.fn(), restore: vi.fn(), rebuild: vi.fn() },
-    export: { chooseTarget: vi.fn(), preview: vi.fn(), run: vi.fn() },
+    export: {
+      listIntegrations: vi.fn(async () => [{
+        id: 'unity', label: 'Unity', description: 'PNG, manifest i narzędzia edytora Unity.',
+        targetLabel: 'Katalog docelowy',
+      }]),
+      chooseTarget: vi.fn(), preview: vi.fn(), run: vi.fn(),
+    },
     codex: { health: vi.fn(), refresh: vi.fn() },
     comfy: {
       health: vi.fn(async () => ({
@@ -76,10 +82,41 @@ beforeEach(() => {
   } as unknown as TilemapGeneratorApi;
 });
 
+function mockOpenedProject(project: ProjectInfo, assets: AssetSummary[] = []) {
+  vi.mocked(window.tilemap.projects.current).mockResolvedValue(project);
+  vi.mocked(window.tilemap.assets.list).mockResolvedValue(assets);
+  vi.mocked(window.tilemap.generation.jobs).mockResolvedValue([]);
+  vi.mocked(window.tilemap.style.history).mockResolvedValue([]);
+  vi.mocked(window.tilemap.codex.health).mockResolvedValue({
+    state: 'ready', version: '0.142.5', appServer: true, imageGeneration: true,
+    imagegenSkill: true, skillPath: 'C:\\imagegen\\SKILL.md', logPath: null, message: 'Gotowe',
+  });
+}
+
 it('pokazuje ekran tworzenia projektu bez otwartego registry', async () => {
   render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
   expect(await screen.findByRole('heading', { name: /Spójny świat/i })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: /Utwórz projekt/i })).toBeInTheDocument();
+  expect(screen.getByText('Eksport przez integracje')).toBeInTheDocument();
+  expect(screen.queryByText('Eksport gotowy dla Unity')).not.toBeInTheDocument();
+});
+
+it('tworzy projekt top-down z bazowym tile 1:1', async () => {
+  vi.mocked(window.tilemap.projects.chooseStorageDirectory).mockResolvedValue('C:\\biblioteka');
+  vi.mocked(window.tilemap.projects.create).mockResolvedValue(projectFixture);
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+
+  expect(await screen.findByRole('button', { name: /Utwórz projekt/i })).toBeDisabled();
+  fireEvent.click(screen.getByRole('button', { name: 'Wybierz katalog biblioteki' }));
+  expect(await screen.findByText('C:\\biblioteka')).toBeInTheDocument();
+  fireEvent.change(await screen.findByLabelText('Projekcja'), { target: { value: 'top_down' } });
+  fireEvent.change(screen.getByLabelText('Bazowa szerokość tile (px)'), { target: { value: '255' } });
+  expect(screen.getByLabelText('Wysokość 1:1')).toHaveValue('255px');
+  fireEvent.click(screen.getByRole('button', { name: /Utwórz projekt/i }));
+
+  await waitFor(() => expect(window.tilemap.projects.create).toHaveBeenCalledWith({
+    name: 'Nowy świat', artBrief: '', projection: 'top_down', tileWidthPx: 255,
+  }, 'C:\\biblioteka'));
 });
 
 it('sprawdza ostatni projekt przed otwarciem i pozwala usunąć go z listy', async () => {
@@ -100,6 +137,143 @@ it('sprawdza ostatni projekt przed otwarciem i pozwala usunąć go z listy', asy
   expect(screen.queryByText('Nieistniejący świat')).not.toBeInTheDocument();
 });
 
+it('oddziela katalog biblioteki od neutralnego ekranu integracji eksportu', async () => {
+  mockOpenedProject(projectFixture);
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+  fireEvent.click(await screen.findByRole('button', { name: 'Strona główna projektu Test' }));
+
+  expect(await screen.findByText('C:\\project')).toBeInTheDocument();
+  expect(screen.getByText('Registry, historia i wszystkie wersje assetów.')).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Eksport' }));
+  expect(await screen.findByRole('heading', { name: 'Integracje eksportu' })).toBeInTheDocument();
+  expect(await screen.findByRole('button', { name: /Unity.*PNG, manifest/i })).toHaveAttribute('aria-pressed', 'true');
+  expect(screen.getByLabelText('Ustawienia integracji Unity')).toHaveTextContent('Narzędzia Unity są instalowane raz, osobno w Assets/TilemapGeneratorIntegration.');
+  expect(screen.queryByText('UNITY DELIVERY')).not.toBeInTheDocument();
+  expect(screen.queryByText('KATALOG ASSETS')).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Przygotuj podgląd' })).toBeDisabled();
+});
+
+it('pozwala przygotować plan usunięcia bez zatwierdzonych assetów', async () => {
+  const targetDirectory = 'C:\\gra\\Assets\\Generated\\Tilemap';
+  const project = { ...projectFixture, exportTargets: { unity: targetDirectory } };
+  mockOpenedProject(project);
+  vi.mocked(window.tilemap.export.preview).mockResolvedValue({
+    token: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+    integration: 'unity',
+    targetDirectory,
+    manifestPath: `${targetDirectory}\\tilemap-assets.json`,
+    assetCount: 0,
+    files: [{
+      assetId: null,
+      versionId: null,
+      sourcePath: null,
+      destinationPath: `${targetDirectory}\\flat_tile\\obsolete.png`,
+      role: 'asset',
+      action: 'delete',
+    }],
+  });
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+  fireEvent.click(await screen.findByRole('button', { name: 'Eksport' }));
+
+  const prepare = await screen.findByRole('button', { name: 'Przygotuj podgląd' });
+  expect(prepare).toBeEnabled();
+  fireEvent.click(prepare);
+
+  await waitFor(() => expect(window.tilemap.export.preview).toHaveBeenCalledWith({
+    integration: 'unity',
+    targetDirectory,
+  }));
+  expect(await screen.findByText('0 assetów · 1 plik')).toBeInTheDocument();
+  expect(screen.getByText('USUNIĘCIE')).toHaveClass('delete');
+});
+
+it('wybiera cel i wykonuje eksport przez integrację Unity', async () => {
+  const approvedAsset: AssetSummary = {
+    id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    name: 'Łąka',
+    description: 'Zatwierdzona łąka',
+    category: 'flat_tile',
+    elevationLevels: 0,
+    relativeWidth: 1,
+    relativeHeight: 1,
+    currentApprovedVersionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    latestVersion: null,
+    versionCount: 1,
+    codexThreadId: null,
+    createdAt: projectFixture.createdAt,
+    updatedAt: projectFixture.updatedAt,
+  };
+  const targetDirectory = 'C:\\gra\\Assets\\Generated\\Tilemap';
+  const manifestPath = `${targetDirectory}\\tilemap-assets.json`;
+  const refreshedProject = { ...projectFixture, exportTargets: { unity: targetDirectory } };
+  mockOpenedProject(projectFixture, [approvedAsset]);
+  vi.mocked(window.tilemap.projects.current).mockResolvedValueOnce(projectFixture).mockResolvedValue(refreshedProject);
+  vi.mocked(window.tilemap.export.chooseTarget).mockResolvedValue(targetDirectory);
+  vi.mocked(window.tilemap.export.preview).mockResolvedValue({
+    token: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    integration: 'unity',
+    targetDirectory,
+    manifestPath,
+    assetCount: 1,
+    files: [
+      {
+        assetId: approvedAsset.id,
+        versionId: approvedAsset.currentApprovedVersionId,
+        sourcePath: 'C:\\project\\assets\\meadow.png',
+        destinationPath: `${targetDirectory}\\flat_tile\\meadow.png`,
+        role: 'asset',
+        action: 'create',
+      },
+      {
+        assetId: null,
+        versionId: null,
+        sourcePath: null,
+        destinationPath: `${targetDirectory}\\obsolete.png`,
+        role: 'integration_support',
+        action: 'delete',
+      },
+    ],
+  });
+  vi.mocked(window.tilemap.export.run).mockResolvedValue({
+    assetCount: 1,
+    fileCount: 2,
+    writtenFileCount: 2,
+    manifestPath,
+  });
+  const alertSpy = vi.spyOn(window, 'alert').mockImplementation(() => undefined);
+  const queryClient = new QueryClient();
+
+  render(<QueryClientProvider client={queryClient}><App /></QueryClientProvider>);
+  fireEvent.click(await screen.findByRole('button', { name: 'Eksport' }));
+  expect(await screen.findByRole('heading', { name: 'Integracje eksportu' })).toBeInTheDocument();
+
+  fireEvent.click(await screen.findByRole('button', { name: 'Wybierz miejsce eksportu' }));
+  expect(await screen.findByText(targetDirectory)).toBeInTheDocument();
+  expect(window.tilemap.export.chooseTarget).toHaveBeenCalledWith('unity');
+
+  fireEvent.click(screen.getByRole('button', { name: 'Przygotuj podgląd' }));
+  await waitFor(() => expect(window.tilemap.export.preview).toHaveBeenCalledWith({
+    integration: 'unity',
+    targetDirectory,
+  }));
+  expect(await screen.findByRole('heading', { name: 'Plan eksportu' })).toBeInTheDocument();
+  expect(screen.getByText('1 asset · 2 pliki')).toBeInTheDocument();
+  expect(screen.getByText('USUNIĘCIE')).toHaveClass('delete');
+
+  fireEvent.click(screen.getByRole('button', { name: 'Eksportuj przez Unity' }));
+  await waitFor(() => expect(window.tilemap.export.run).toHaveBeenCalledWith('cccccccc-cccc-4ccc-8ccc-cccccccccccc'));
+  await waitFor(() => expect(screen.queryByRole('heading', { name: 'Plan eksportu' })).not.toBeInTheDocument());
+  expect(screen.queryByRole('button', { name: 'Eksportuj przez Unity' })).not.toBeInTheDocument();
+  await waitFor(() => expect(window.tilemap.projects.current).toHaveBeenCalledTimes(2));
+  expect(queryClient.getQueryData<ProjectInfo>(['project'])?.exportTargets.unity).toBe(targetDirectory);
+  expect(alertSpy).toHaveBeenCalledWith(expect.stringContaining('Unity: wyeksportowano 1 zatwierdzony asset.'));
+  expect(alertSpy).toHaveBeenCalledWith(expect.stringContaining('Zmienione pliki: 2/2.'));
+  alertSpy.mockRestore();
+});
+
 it('pozwala generować asset z samej nazwy bez opcjonalnego opisu', async () => {
   vi.mocked(window.tilemap.projects.current).mockResolvedValue({
     id: '11111111-1111-4111-8111-111111111111', rootPath: 'C:\\project', name: 'Test', artBrief: '',
@@ -109,7 +283,7 @@ it('pozwala generować asset z samej nazwy bez opcjonalnego opisu', async () => 
     codexGenerationEnabled: true,
     comfyUiEnabled: false,
     comfyUiProfile: 'z_image_turbo',
-    styleSummary: '', styleSummaryStale: false, unityExportPath: null,
+    styleSummary: '', styleSummaryStale: false, exportTargets: {},
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   });
   vi.mocked(window.tilemap.assets.list).mockResolvedValue([]);
@@ -129,9 +303,9 @@ it('pozwala generować asset z samej nazwy bez opcjonalnego opisu', async () => 
   fireEvent.change(await screen.findByLabelText('Nazwa assetu'), { target: { value: 'Kamienna droga' } });
   fireEvent.change(screen.getByLabelText('Typ assetu'), { target: { value: 'elevated_tile' } });
   fireEvent.change(screen.getByLabelText('Elevation height (poziomy)'), { target: { value: '2' } });
-  fireEvent.change(screen.getByLabelText('Footprint X — zajęte komórki'), { target: { value: '2' } });
-  fireEvent.change(screen.getByLabelText('Footprint Y — zajęte komórki'), { target: { value: '2' } });
-  expect(screen.getByText('4 pola łącznie')).toBeInTheDocument();
+  expect(screen.getByLabelText('Footprint X — zajęte komórki')).toBeDisabled();
+  expect(screen.getByLabelText('Footprint Y — zajęte komórki')).toBeDisabled();
+  expect(screen.getByText('1 pole łącznie')).toBeInTheDocument();
   const generate = screen.getByRole('button', { name: /Generuj asset/i });
   expect(screen.getByLabelText('Opis dla agenta (opcjonalnie)')).toHaveValue('');
   await waitFor(() => expect(generate).toBeEnabled());
@@ -139,7 +313,7 @@ it('pozwala generować asset z samej nazwy bez opcjonalnego opisu', async () => 
 
   await waitFor(() => expect(window.tilemap.generation.enqueue).toHaveBeenCalledWith(expect.objectContaining({
     name: 'Kamienna droga', prompt: '', category: 'elevated_tile', elevationLevels: 2,
-    footprint: { x: 2, y: 2 },
+    footprint: { x: 1, y: 1 },
   })));
   expect(vi.mocked(window.tilemap.generation.enqueue).mock.calls[0][0]).not.toHaveProperty('pivot');
 });
@@ -210,6 +384,30 @@ it('oferuje dedykowany road tile jako komplet 16 wariantów', async () => {
   expect(vi.mocked(window.tilemap.generation.enqueue).mock.calls[0][0]).not.toHaveProperty('roadConnections');
 });
 
+it('ukrywa elevated tile i pokazuje kierunki dróg N/E/S/W w projekcie top-down', async () => {
+  vi.mocked(window.tilemap.projects.current).mockResolvedValue({
+    ...projectFixture, projection: 'top_down', tileHeightPx: 256,
+  });
+  vi.mocked(window.tilemap.assets.list).mockResolvedValue([]);
+  vi.mocked(window.tilemap.generation.jobs).mockResolvedValue([]);
+  vi.mocked(window.tilemap.style.history).mockResolvedValue([]);
+  vi.mocked(window.tilemap.codex.health).mockResolvedValue({
+    state: 'ready', version: '0.142.5', appServer: true, imageGeneration: true,
+    imagegenSkill: true, skillPath: 'C:\\imagegen\\SKILL.md', logPath: null, message: 'Gotowe',
+  });
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+  const category = await screen.findByLabelText('Typ assetu');
+  expect(screen.queryByRole('option', { name: 'Elevated terrain' })).not.toBeInTheDocument();
+  expect(screen.getByText('Bazowy kwadrat 1:1')).toBeInTheDocument();
+  expect(screen.getByText('256×256px')).toBeInTheDocument();
+  expect(screen.getByLabelText('Footprint X — zajęte komórki')).toBeDisabled();
+  expect(screen.getByLabelText('Footprint Y — zajęte komórki')).toBeDisabled();
+
+  fireEvent.change(category, { target: { value: 'road_tile' } });
+  expect(screen.getByText(/kierunki N\/E\/S\/W/)).toBeInTheDocument();
+});
+
 it('pokazuje komplet road tile jako siatkę 4×4 bez zielonych markerów', async () => {
   const roadVersion: AssetVersion = {
     id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', assetId: '33333333-3333-4333-8333-333333333333',
@@ -276,7 +474,7 @@ it('pokazuje retry po nieudanej generacji także bez aktywnego joba', async () =
     aiVerificationEnabled: true,
     styleSummary: '',
     styleSummaryStale: false,
-    unityExportPath: null,
+    exportTargets: {},
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   });
@@ -325,7 +523,7 @@ it('pokazuje szczegóły błędu w modalu i krótką akcję Ponów obok statusu'
     maxConcurrentJobs: 1,
     aiVerificationEnabled: true,
     styleSummary: '',
-    styleSummaryStale: false, unityExportPath: null, createdAt: failedVersion.createdAt, updatedAt: failedVersion.updatedAt,
+    styleSummaryStale: false, exportTargets: {}, createdAt: failedVersion.createdAt, updatedAt: failedVersion.updatedAt,
   });
   vi.mocked(window.tilemap.assets.list).mockResolvedValue([failedAsset]);
   vi.mocked(window.tilemap.assets.get).mockResolvedValue(failedAsset);
@@ -462,6 +660,48 @@ it('układa dziewięć kopii terenu w podglądzie szwów', () => {
     '--preview-pan-x': '32px',
     '--preview-pan-y': '16px',
   });
+});
+
+it('układa podgląd szwów top-down na prostokątnej siatce 3×3', () => {
+  const version: AssetVersion = {
+    id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    assetId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    parentVersionId: null,
+    mode: 'generate',
+    status: 'needs_review',
+    prompt: '',
+    feedback: '',
+    category: 'flat_tile',
+    elevationLevels: 0,
+    relativeWidth: 1,
+    relativeHeight: 1,
+    tags: ['łąka'],
+    finalPath: 'assets/meadow/final.png',
+    imageUrl: 'tilemap-asset://asset/meadow.png',
+    width: 256,
+    height: 256,
+    footprint: { x: 1, y: 1 },
+    pivot: { x: 0.5, y: 0.5 },
+    aiDescription: '',
+    aiVerificationStatus: 'passed',
+    aiVerificationMessage: '',
+    rejectionReason: '',
+    error: '',
+    createdAt: projectFixture.createdAt,
+    updatedAt: projectFixture.updatedAt,
+  };
+  const view = render(<TerrainSeamPreview
+    assetName="Łąka"
+    tileWidth={256}
+    tileHeight={256}
+    projection="top_down"
+    zoom={100}
+    onZoom={vi.fn()}
+    version={version}
+  />);
+
+  expect(view.container.querySelector('.seam-grid')).toHaveStyle({ width: '768px', height: '768px' });
+  expect(screen.getByAltText('Łąka — sąsiad 3,2')).toHaveStyle({ left: '640px', top: '384px' });
 });
 
 it('steruje zoomem podglądu krokami i pozwala go zresetować', () => {
@@ -766,7 +1006,7 @@ it('pokazuje podejścia w prawym sidebarze assetu, a Art Direction tylko na pozi
     maxConcurrentJobs: 1,
     aiVerificationEnabled: true,
     styleSummary: '',
-    styleSummaryStale: false, unityExportPath: null, createdAt: version.createdAt, updatedAt: version.updatedAt,
+    styleSummaryStale: false, exportTargets: {}, createdAt: version.createdAt, updatedAt: version.updatedAt,
   });
   vi.mocked(window.tilemap.assets.list).mockResolvedValue([detail]);
   vi.mocked(window.tilemap.assets.get).mockResolvedValue(detail);
@@ -805,7 +1045,7 @@ it('otwiera stronę projektu z nagłówka i wylicza wysokość bazowego tile 2:1
     aiVerificationEnabled: true,
     styleSummary: '',
     styleSummaryStale: false,
-    unityExportPath: null,
+    exportTargets: {},
     createdAt: '2026-08-07T10:00:00.000Z',
     updatedAt: '2026-08-07T10:00:00.000Z',
   };
@@ -849,4 +1089,38 @@ it('otwiera stronę projektu z nagłówka i wylicza wysokość bazowego tile 2:1
     codexGenerationEnabled: true, comfyUiEnabled: true, comfyUiProfile: 'z_image_turbo',
     stableDiffusionCppEnabled: true,
   })));
+});
+
+it('pokazuje niemutowalną projekcję top-down i zapisuje nieparzystą bazę 1:1', async () => {
+  const project: ProjectInfo = {
+    ...projectFixture,
+    projection: 'top_down',
+    tileWidthPx: 255,
+    tileHeightPx: 255,
+    pixelsPerUnit: 255,
+  };
+  vi.mocked(window.tilemap.projects.current).mockResolvedValue(project);
+  vi.mocked(window.tilemap.projects.update).mockResolvedValue({
+    ...project, tileWidthPx: 257, tileHeightPx: 257,
+  });
+  vi.mocked(window.tilemap.assets.list).mockResolvedValue([]);
+  vi.mocked(window.tilemap.generation.jobs).mockResolvedValue([]);
+  vi.mocked(window.tilemap.style.history).mockResolvedValue([]);
+  vi.mocked(window.tilemap.codex.health).mockResolvedValue({
+    state: 'ready', version: '0.142.5', appServer: true, imageGeneration: true,
+    imagegenSkill: true, skillPath: 'C:\\imagegen\\SKILL.md', logPath: null, message: 'Gotowe',
+  });
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+  fireEvent.click(await screen.findByRole('button', { name: 'Strona główna projektu Test' }));
+  expect(await screen.findByLabelText('Projekcja projektu')).toHaveValue('Top-down 1:1');
+  expect(screen.getByLabelText('Wysokość tile 1:1')).toHaveValue('255px');
+  fireEvent.change(screen.getByLabelText('Bazowa szerokość tile (px)'), { target: { value: '257' } });
+  expect(screen.getByLabelText('Wysokość tile 1:1')).toHaveValue('257px');
+  fireEvent.click(screen.getByRole('button', { name: /Zapisz ustawienia/i }));
+
+  await waitFor(() => expect(window.tilemap.projects.update).toHaveBeenCalledWith(expect.objectContaining({
+    tileWidthPx: 257,
+  })));
+  expect(vi.mocked(window.tilemap.projects.update).mock.calls[0][0]).not.toHaveProperty('projection');
 });

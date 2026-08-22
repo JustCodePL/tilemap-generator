@@ -3,7 +3,12 @@ import { copyFileSync, existsSync, readFileSync, statSync, writeFileSync } from 
 import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
-import type { AssetCategory, ComfyUiHealth, ComfyUiProfile } from '../../shared/domain';
+import type {
+  AssetCategory,
+  ComfyUiHealth,
+  ComfyUiProfile,
+  ProjectProjection,
+} from '../../shared/domain';
 import { nullLogger, type Logger } from '../services/app-logger';
 
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8188';
@@ -14,7 +19,7 @@ const PROFILE_VAE = 'ae.safetensors';
 const BACKGROUND_MODEL = 'birefnet.safetensors';
 const WORKFLOW_VERSION = 'z-image-turbo-transparent-v1';
 const OUTPUT_NODE_ID = '14';
-const REQUIRED_NODES = [
+const CORE_NODES = [
   'UNETLoader',
   'CLIPLoader',
   'VAELoader',
@@ -24,16 +29,21 @@ const REQUIRED_NODES = [
   'EmptySD3LatentImage',
   'KSampler',
   'VAEDecode',
+  'SaveImage',
+] as const;
+const TRANSPARENCY_NODES = [
   'LoadBackgroundRemovalModel',
   'RemoveBackground',
   'InvertMask',
   'JoinImageWithAlpha',
-  'SaveImage',
 ] as const;
+const REQUIRED_NODES = [...CORE_NODES, ...TRANSPARENCY_NODES] as const;
+const TRANSPARENCY_NODE_NAMES = new Set<string>(TRANSPARENCY_NODES);
 
 export interface ComfyGenerationRequest {
   assetName: string;
   category: AssetCategory;
+  projection: ProjectProjection;
   prompt: string;
   feedback: string;
   artBrief: string;
@@ -102,7 +112,11 @@ export class ComfyService {
       ]);
       const systemInfo = system.system as Record<string, unknown> | undefined;
       const version = typeof systemInfo?.comfyui_version === 'string' ? systemInfo.comfyui_version : null;
-      const ready = missingNodes.length === 0 && missingModels.length === 0;
+      const missingCoreNodes = missingNodes.filter((node) => !TRANSPARENCY_NODE_NAMES.has(node));
+      const missingCoreModels = missingModels.filter((model) => model !== BACKGROUND_MODEL);
+      const ready = missingCoreNodes.length === 0 && missingCoreModels.length === 0;
+      const missingTransparencyNodes = missingNodes.filter((node) => TRANSPARENCY_NODE_NAMES.has(node));
+      const missingTransparencyModels = missingModels.filter((model) => model === BACKGROUND_MODEL);
       this.healthValue = {
         state: ready ? 'ready' : 'detected',
         installed: true,
@@ -114,10 +128,15 @@ export class ComfyService {
         missingNodes,
         missingModels,
         message: ready
-          ? `ComfyUI i profil Z-Image Turbo są gotowe pod ${this.endpoint}.`
+          ? missingTransparencyNodes.length || missingTransparencyModels.length
+            ? `ComfyUI i profil Z-Image Turbo są gotowe dla nieprzezroczystych kafli top-down i materiałów dróg. Assety z przezroczystością wymagają: ${[
+              missingTransparencyNodes.length ? `node'ów ${missingTransparencyNodes.join(', ')}` : '',
+              missingTransparencyModels.length ? `modeli ${missingTransparencyModels.join(', ')}` : '',
+            ].filter(Boolean).join('; ')}.`
+            : `ComfyUI i profil Z-Image Turbo są gotowe pod ${this.endpoint}.`
           : `ComfyUI odpowiada, ale profil Z-Image Turbo jest niekompletny: ${[
-            missingNodes.length ? `brak node'ów: ${missingNodes.join(', ')}` : '',
-            missingModels.length ? `brak modeli: ${missingModels.join(', ')}` : '',
+            missingCoreNodes.length ? `brak node'ów: ${missingCoreNodes.join(', ')}` : '',
+            missingCoreModels.length ? `brak modeli: ${missingCoreModels.join(', ')}` : '',
           ].filter(Boolean).join('; ')}.`,
       };
     } catch (error) {
@@ -149,8 +168,20 @@ export class ComfyService {
   }
 
   async generate(request: ComfyGenerationRequest): Promise<ComfyGenerationResult> {
+    const transparentOutput = !request.roadAtlas
+      && !(request.projection === 'top_down' && request.category === 'flat_tile');
     if (this.healthValue.state !== 'ready') {
       throw new Error(this.healthValue.message || 'ComfyUI nie jest gotowe.');
+    }
+    if (transparentOutput) {
+      const missingNodes = this.healthValue.missingNodes.filter((node) => TRANSPARENCY_NODE_NAMES.has(node));
+      const missingModels = this.healthValue.missingModels.filter((model) => model === BACKGROUND_MODEL);
+      if (missingNodes.length || missingModels.length) {
+        throw new Error(`Workflow z przezroczystością wymaga dodatkowych zależności ComfyUI: ${[
+          missingNodes.length ? `node'ów ${missingNodes.join(', ')}` : '',
+          missingModels.length ? `modeli ${missingModels.join(', ')}` : '',
+        ].filter(Boolean).join('; ')}.`);
+      }
     }
     const seed = randomInt(0, 0x7fffffff);
     const steps = 8;
@@ -169,7 +200,7 @@ export class ComfyService {
       sampler,
       scheduler,
       filenamePrefix: `TilemapGenerator/${randomUUID()}`,
-      transparent: !request.roadAtlas,
+      transparent: transparentOutput,
     });
     const workflowHash = createHash('sha256').update(WORKFLOW_VERSION).digest('hex');
     request.onProgress?.('ComfyUI przyjęło workflow Z-Image Turbo.');
@@ -222,7 +253,7 @@ export class ComfyService {
           model: PROFILE_MODEL,
           clip: PROFILE_CLIP,
           vae: PROFILE_VAE,
-          backgroundRemovalModel: BACKGROUND_MODEL,
+          backgroundRemovalModel: transparentOutput ? BACKGROUND_MODEL : null,
           seed,
           steps,
           cfg,
@@ -381,13 +412,17 @@ function buildWorkflow(input: {
 }
 
 function buildPrompt(request: ComfyGenerationRequest): string {
+  const isTopDown = request.projection === 'top_down';
+  const opaqueTerrain = isTopDown && request.category === 'flat_tile';
   const typeInstruction = request.roadAtlas
-    ? 'Create one full-frame, opaque, edge-to-edge material sample for an isometric road surface. Show only the road material texture: no road shape, no tile, no atlas, no transparency, no border and no background.'
+    ? `Create one full-frame, opaque, edge-to-edge material sample for a ${isTopDown ? 'top-down' : 'isometric'} road surface. Show only the road material texture: no road shape, no tile, no atlas, no transparency, no border and no background.`
     : request.category === 'flat_tile'
-      ? 'Create one seamless 2:1 isometric terrain diamond that reaches all four canvas edges and tiles without gaps.'
+      ? isTopDown
+        ? 'Create one seamless square top-down terrain tile that fills the complete canvas, including all four corners. Match left to right and top to bottom edges without a border or shadow.'
+        : 'Create one seamless 2:1 isometric terrain diamond that reaches all four canvas edges and tiles without gaps.'
       : request.category === 'elevated_tile'
         ? 'Create one elevated 2:1 isometric terrain tile with a readable top diamond and vertical walls.'
-        : 'Create one isolated game asset in a fixed isometric view.';
+        : `Create one isolated game asset in a fixed ${isTopDown ? 'orthographic top-down' : 'isometric'} view.`;
   return [
     `Asset: ${request.assetName}`,
     `Category: ${request.category}`,
@@ -397,8 +432,8 @@ function buildPrompt(request: ComfyGenerationRequest): string {
     request.artBrief ? `Project art direction: ${request.artBrief}` : '',
     request.styleSummary ? `Established project style: ${request.styleSummary}` : '',
     request.verificationFeedback ? `The previous attempt failed deterministic validation. Correct this exact issue: ${request.verificationFeedback}` : '',
-    'Centered composition, orthographic isometric camera, no text, no frame, no UI, no cast shadow outside the object.',
-    request.roadAtlas
+    `Centered composition, ${isTopDown ? 'straight overhead orthographic top-down' : 'orthographic isometric'} camera, no text, no frame, no UI, no cast shadow outside the object.`,
+    request.roadAtlas || opaqueTerrain
       ? 'Fill the entire frame with useful opaque material. Do not add a background or leave empty margins.'
       : 'Use a simple high-contrast background so the configured BiRefNet stage can extract a clean alpha silhouette.',
   ].filter(Boolean).join('\n\n');

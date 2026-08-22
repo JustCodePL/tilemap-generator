@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
@@ -387,10 +388,42 @@ function cancellationError(): Error {
   return error;
 }
 
+export interface ResolveCodexExecutableOptions {
+  platform?: NodeJS.Platform;
+  environment?: NodeJS.ProcessEnv;
+  homeDirectory?: string;
+  fileExists?: (candidate: string) => boolean;
+}
+
+export function resolveCodexExecutable(options: ResolveCodexExecutableOptions = {}): string {
+  const platform = options.platform ?? process.platform;
+  const environment = options.environment ?? process.env;
+  const homeDirectory = options.homeDirectory ?? os.homedir();
+  const fileExists = options.fileExists ?? existsSync;
+  const explicit = environment.TILEMAP_CODEX_EXE?.trim();
+  if (explicit) {
+    const candidate = path.resolve(explicit);
+    if (!fileExists(candidate)) {
+      throw new Error(`TILEMAP_CODEX_EXE wskazuje nieistniejący plik: ${candidate}`);
+    }
+    return candidate;
+  }
+  if (platform !== 'darwin') return 'codex';
+
+  const candidates = [
+    '/Applications/ChatGPT.app/Contents/Resources/codex',
+    path.join(homeDirectory, 'Applications', 'ChatGPT.app', 'Contents', 'Resources', 'codex'),
+    path.join(homeDirectory, '.local', 'bin', 'codex'),
+    '/opt/homebrew/bin/codex',
+    '/usr/local/bin/codex',
+  ];
+  return candidates.find((candidate) => fileExists(candidate)) ?? 'codex';
+}
+
 async function detectCodex(): Promise<{ command: string; prefixArgs: string[]; version: string }> {
-  let command = 'codex';
+  let command = resolveCodexExecutable();
   let prefixArgs: string[] = [];
-  if (process.platform === 'win32') {
+  if (process.platform === 'win32' && command === 'codex') {
     try {
       const located = await execFileAsync('where.exe', ['codex.cmd'], { timeout: 10_000, windowsHide: true });
       const shim = located.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);

@@ -191,6 +191,81 @@ it('automatycznie poprawia teren po nieudanym deterministycznym teście szwów',
   database.close();
 });
 
+it('generuje pełny kwadrat top-down i ponawia go na prostokątnej siatce', async () => {
+  const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-top-down-')), 'project');
+  temporaryDirectories.push(path.dirname(root));
+  mkdirSync(root);
+  const database = ProjectDatabase.create(root, {
+    name: 'Top-down', artBrief: 'Czytelna trawa z góry', projection: 'top_down', tileWidthPx: 64,
+  });
+  let turns = 0;
+  let generationPrompt = '';
+  let retryPrompt = '';
+  const fakeCodex = {
+    runExclusive: async <T>(operation: () => Promise<T>) => operation(),
+    ensureAssetThread: async () => 'thread-top-down',
+    skillPath: () => '/Applications/ChatGPT.app/imagegen/SKILL.md',
+    interruptActiveTurn: async () => undefined,
+    runTurn: async (_threadId: string, input: Array<Record<string, unknown>>) => {
+      turns += 1;
+      const prompt = String(input[0].text);
+      if (turns === 1) generationPrompt = prompt;
+      else retryPrompt = prompt;
+      const outputPath = prompt.match(/exactly (.+?final\.png)/i)?.[1];
+      if (!outputPath) throw new Error('Test nie znalazł ścieżki final.png w prompcie.');
+      mkdirSync(path.dirname(outputPath), { recursive: true });
+      if (turns === 1) {
+        await sharp({
+          create: { width: 64, height: 64, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+        }).composite([{ input: Buffer.from('<svg width="60" height="60"><rect width="60" height="60" fill="#5b9249"/></svg>'), left: 2, top: 2 }])
+          .png().toFile(outputPath);
+      } else {
+        await sharp({
+          create: { width: 64, height: 64, channels: 3, background: { r: 91, g: 146, b: 73 } },
+        }).png().toFile(outputPath);
+      }
+      return {
+        turnId: `turn-top-down-${turns}`,
+        items: [],
+        finalMessage: JSON.stringify({
+          status: 'completed', finalPath: outputPath, category: 'flat_tile', tags: ['trawa'],
+          pivot: { x: 0.5, y: 0.5 }, description: 'Trawiasty teren top-down', message: '',
+        }),
+      };
+    },
+  } as unknown as CodexService;
+  const queue = new GenerationQueue(fakeCodex);
+  queue.attach(database);
+  const terminal = new Promise<GenerationEvent>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Kolejka nie zakończyła top-down joba.')), 10_000);
+    queue.on('event', (event: GenerationEvent) => {
+      if (event.type === 'completed' || event.type === 'failed') {
+        clearTimeout(timeout);
+        resolve(event);
+      }
+    });
+  });
+  const job = queue.enqueue({
+    name: 'Łąka z góry', prompt: '', mode: 'generate', category: 'flat_tile', footprint: { x: 1, y: 1 },
+  });
+
+  await expect(terminal).resolves.toMatchObject({ type: 'completed', jobId: job.id });
+  expect(turns).toBe(2);
+  expect(generationPrompt).toContain('orthographic top-down');
+  expect(generationPrompt).toContain('fixed 1:1 orthogonal grid');
+  expect(generationPrompt).toContain('left edge must match the right edge pixel-for-pixel');
+  expect(generationPrompt).toContain('does not require transparency');
+  expect(generationPrompt).not.toContain('isometric diamond');
+  expect(retryPrompt).toContain('regular orthogonal grid');
+  expect(retryPrompt).toContain('Match left to right and top to bottom');
+  expect(database.getAsset(job.assetId)?.versions[0]).toMatchObject({
+    width: 64, height: 64, status: 'needs_review',
+  });
+
+  await queue.shutdown();
+  database.close();
+});
+
 it('pomija weryfikację i automatyczną korektę AI, zachowując kontrolę techniczną', async () => {
   const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-no-ai-verification-')), 'project');
   temporaryDirectories.push(path.dirname(root));
@@ -260,7 +335,8 @@ it('zapisuje pominiętą kontrolę AI i pozwala uruchomić ją ręcznie dla goto
   temporaryDirectories.push(path.dirname(root));
   mkdirSync(root);
   const database = ProjectDatabase.create(root, {
-    name: 'Ręczna weryfikacja AI', artBrief: 'Miękkie malarskie krawędzie', tileWidthPx: 64,
+    name: 'Ręczna weryfikacja AI', artBrief: 'Miękkie malarskie krawędzie',
+    projection: 'top_down', tileWidthPx: 64,
   });
   database.updateProjectSettings({
     name: 'Ręczna weryfikacja AI', artBrief: 'Miękkie malarskie krawędzie', tileWidthPx: 64,
@@ -324,6 +400,8 @@ it('zapisuje pominiętą kontrolę AI i pozwala uruchomić ją ręcznie dla goto
   expect(verificationInput.some((item) => item.type === 'localImage')).toBe(true);
   expect(verificationInput.some((item) => item.type === 'skill')).toBe(false);
   expect(String(verificationInput[0].text)).toContain('Nie generuj ani nie edytuj obrazu');
+  expect(String(verificationInput[0].text)).toContain('Oczekiwana projekcja: top-down 1:1');
+  expect(String(verificationInput[0].text)).toContain('Odrzuć perspektywę izometryczną');
   expect(database.listGenerationLogs(job.assetId).at(-1)).toMatchObject({
     stage: 'verification', level: 'success', attempt: 0,
   });
@@ -434,7 +512,7 @@ it('automatycznie poprawia i zapisuje kompletny zestaw 16 road tile', async () =
       const prompt = String(input[0].text);
       if (turns === 1) generationPrompt = prompt;
       else retryPrompt = prompt;
-      const roadMaterialPath = [...prompt.matchAll(/[A-Za-z]:\\[^\r\n]*?road-material\.png/g)].at(-1)?.[0];
+      const roadMaterialPath = [...prompt.matchAll(/(?:exactly|use) ((?:[A-Za-z]:\\|\/)[^\r\n]*?road-material\.png)/gi)].at(-1)?.[1];
       if (!roadMaterialPath) throw new Error('Test nie znalazł ścieżki road-material.png w prompcie.');
       const outputDirectory = path.dirname(roadMaterialPath);
       mkdirSync(outputDirectory, { recursive: true });

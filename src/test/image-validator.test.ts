@@ -8,6 +8,7 @@ import {
   createRoadVariantsFromSource,
   validateElevatedTerrainTile,
   validateRoadTile,
+  validateTerrainPng,
   validateTerrainTile,
   validateTransparentPng,
   verifyTerrainSeams,
@@ -68,6 +69,50 @@ describe('validateTerrainTile', () => {
       .png().toFile(file);
 
     await expect(validateTerrainTile(file, 256, 128)).rejects.toThrow(/dokładnie 256×128px/);
+  });
+});
+
+describe('top-down terrain validation', () => {
+  it('akceptuje pełny nieprzezroczysty kwadrat 1:1', async () => {
+    const directory = temp();
+    const file = path.join(directory, 'top-down.png');
+    await sharp({
+      create: { width: 128, height: 128, channels: 3, background: { r: 78, g: 132, b: 62 } },
+    }).png().toFile(file);
+
+    await expect(validateTerrainPng(file, 'top_down')).resolves.toMatchObject({
+      width: 128,
+      height: 128,
+      alphaMin: 255,
+      alphaMax: 255,
+    });
+    await expect(validateTerrainTile(file, 128, 128, 'top_down')).resolves.toEqual({
+      left: 0,
+      top: 0,
+      right: 127,
+      bottom: 127,
+    });
+  });
+
+  it('odrzuca kwadrat top-down z przezroczystym paddingiem', async () => {
+    const directory = temp();
+    const file = path.join(directory, 'top-down-padded.png');
+    await sharp({
+      create: { width: 128, height: 128, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+    }).composite([{ input: Buffer.from('<svg width="112" height="112"><rect width="112" height="112" fill="#4e843e"/></svg>'), left: 8, top: 8 }])
+      .png().toFile(file);
+
+    await expect(validateTerrainTile(file, 128, 128, 'top_down')).rejects.toThrow(/kwadrat/);
+  });
+
+  it('odrzuca top-down z choćby pojedynczymi przezroczystymi narożnikami', async () => {
+    const directory = temp();
+    const file = path.join(directory, 'top-down-transparent-corners.png');
+    const pixels = Buffer.alloc(64 * 64 * 4, 255);
+    for (const index of [0, 63, 63 * 64, 64 * 64 - 1]) pixels[index * 4 + 3] = 0;
+    await sharp(pixels, { raw: { width: 64, height: 64, channels: 4 } }).png().toFile(file);
+
+    await expect(validateTerrainPng(file, 'top_down')).rejects.toThrow(/nieprzezroczysty.*narożnikach/);
   });
 });
 
@@ -175,6 +220,63 @@ describe('createRoadVariantsFromMaterial', () => {
 
     await expect(createRoadVariantsFromMaterial(directory, source, 256, 128)).rejects.toThrow(/chroma-key/);
   });
+
+  it('buduje i waliduje komplet portów N-E-S-W dla top-down', async () => {
+    const directory = temp();
+    const source = path.join(directory, 'top-down-road-material.png');
+    await sharp({
+      create: { width: 512, height: 512, channels: 3, background: { r: 175, g: 122, b: 70 } },
+    }).png().toFile(source);
+
+    const variants = await createRoadVariantsFromMaterial(
+      directory,
+      source,
+      128,
+      128,
+      'top_down',
+    );
+
+    expect(variants).toHaveLength(16);
+    for (const variant of variants) {
+      await expect(validateTransparentPng(variant.filePath)).resolves.toMatchObject({
+        width: 128,
+        height: 128,
+      });
+      await expect(validateRoadTile(
+        variant.filePath,
+        128,
+        128,
+        variant.connectionMask,
+        'top_down',
+      )).resolves.toBeDefined();
+    }
+  });
+
+  it('zachowuje identyczne przeciwległe porty top-down dla nieparzystej komórki', async () => {
+    const directory = temp();
+    const source = path.join(directory, 'top-down-odd-road-material.png');
+    const sourcePixels = Buffer.alloc(130 * 130 * 3);
+    for (let y = 0; y < 130; y += 1) {
+      for (let x = 0; x < 130; x += 1) {
+        const offset = (y * 130 + x) * 3;
+        sourcePixels[offset] = 70 + (x % 150);
+        sourcePixels[offset + 1] = 50 + (y % 170);
+        sourcePixels[offset + 2] = 35 + ((x + y) % 120);
+      }
+    }
+    await sharp(sourcePixels, { raw: { width: 130, height: 130, channels: 3 } }).png().toFile(source);
+
+    const variants = await createRoadVariantsFromMaterial(directory, source, 65, 65, 'top_down');
+    const northSouth = variants.find((variant) => variant.connectionMask === 5)!;
+    const eastWest = variants.find((variant) => variant.connectionMask === 10)!;
+    const ns = await sharp(northSouth.filePath).ensureAlpha().raw().toBuffer();
+    const ew = await sharp(eastWest.filePath).ensureAlpha().raw().toBuffer();
+
+    expect(ns.subarray(0, 65 * 4)).toEqual(ns.subarray(64 * 65 * 4, 65 * 65 * 4));
+    const leftColumn = Buffer.from(Array.from({ length: 65 }, (_, y) => [...ew.subarray(y * 65 * 4, y * 65 * 4 + 4)]).flat());
+    const rightColumn = Buffer.from(Array.from({ length: 65 }, (_, y) => [...ew.subarray((y * 65 + 64) * 4, (y * 65 + 65) * 4)]).flat());
+    expect(leftColumn).toEqual(rightColumn);
+  });
 });
 
 describe('verifyTerrainSeams', () => {
@@ -221,6 +323,38 @@ describe('verifyTerrainSeams', () => {
     expect(result.passed).toBe(false);
     expect(result.colorSeamRatio).toBeGreaterThan(0.03);
     expect(result.colorSeamPixels).toBeGreaterThan(0);
+  });
+
+  it('układa top-down na prostokątnej siatce 3×3 i wykrywa padding', async () => {
+    const directory = temp();
+    const valid = path.join(directory, 'top-down-seamless.png');
+    const invalid = path.join(directory, 'top-down-gapped.png');
+    await sharp({
+      create: { width: 64, height: 64, channels: 3, background: { r: 82, g: 139, b: 67 } },
+    }).png().toFile(valid);
+    await sharp({
+      create: { width: 64, height: 64, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+    }).composite([{ input: Buffer.from('<svg width="60" height="60"><rect width="60" height="60" fill="#528b43"/></svg>'), left: 2, top: 2 }])
+      .png().toFile(invalid);
+
+    const passed = await verifyTerrainSeams(
+      valid,
+      path.join(directory, 'top-down-preview.png'),
+      64,
+      64,
+      'top_down',
+    );
+    const failed = await verifyTerrainSeams(
+      invalid,
+      path.join(directory, 'top-down-gap-preview.png'),
+      64,
+      64,
+      'top_down',
+    );
+
+    expect(passed).toMatchObject({ passed: true, gapPixels: 0, colorSeamPixels: 0 });
+    expect(failed.passed).toBe(false);
+    expect(failed.gapPixels).toBeGreaterThan(0);
   });
 });
 

@@ -13,6 +13,104 @@ afterEach(() => {
 });
 
 describe('ProjectDatabase', () => {
+  it('przechowuje cele i historię eksportu przez neutralny identyfikator integracji', () => {
+    const root = temporaryProjectRoot();
+    const database = ProjectDatabase.create(root, {
+      name: 'Biblioteka', artBrief: '', tileWidthPx: 256,
+    });
+    const target = path.join(root, 'delivery', 'unity');
+    const manifest = path.join(target, 'tilemap-assets.json');
+
+    expect(database.getProject().exportTargets).toEqual({});
+    expect(database.getProject()).not.toHaveProperty('unityExportPath');
+
+    database.setExportTarget('unity', target);
+    database.recordExport('unity', target, manifest, 3);
+
+    expect(database.getProject().exportTargets).toEqual({ unity: target });
+    expect(database.sqlite.prepare(`
+      SELECT integration, target_path, manifest_path, asset_count FROM export_records
+    `).get()).toMatchObject({
+      integration: 'unity',
+      target_path: target,
+      manifest_path: manifest,
+      asset_count: 3,
+    });
+    database.close();
+  });
+
+  it('atomowo zapisuje cel i historię ukończonego eksportu', () => {
+    const root = temporaryProjectRoot();
+    const database = ProjectDatabase.create(root, {
+      name: 'Atomowy eksport', artBrief: '', tileWidthPx: 256,
+    });
+    const target = path.join(root, 'delivery');
+    database.sqlite.exec(`
+      CREATE TRIGGER fail_export_record BEFORE INSERT ON export_records
+      BEGIN
+        SELECT RAISE(ABORT, 'test export failure');
+      END;
+    `);
+
+    expect(() => database.commitExport(
+      'unity', target, path.join(target, 'tilemap-assets.json'), 2,
+    )).toThrow(/test export failure/);
+    expect(database.getProject().exportTargets).toEqual({});
+    expect(database.sqlite.prepare('SELECT COUNT(*) AS count FROM export_records').get())
+      .toMatchObject({ count: 0 });
+    database.close();
+  });
+
+  it('migruje projekt v16 do pustych celów i neutralnej historii eksportu', () => {
+    const root = temporaryProjectRoot();
+    const original = ProjectDatabase.create(root, {
+      name: 'Eksport v16', artBrief: '', tileWidthPx: 256,
+    });
+    const legacyAssets = path.join(root, 'UnityProject', 'Assets');
+    const legacyManifest = path.join(legacyAssets, 'TilemapGenerator', 'tilemap-assets.json');
+    original.sqlite.exec('ALTER TABLE projects ADD COLUMN unity_export_path TEXT;');
+    original.sqlite.prepare('UPDATE projects SET unity_export_path = ?').run(legacyAssets);
+    original.sqlite.exec(`
+      DROP TABLE export_targets;
+      ALTER TABLE export_records DROP COLUMN integration;
+      PRAGMA user_version = 16;
+    `);
+    original.sqlite.prepare(`
+      INSERT INTO export_records (id, target_path, manifest_path, asset_count, created_at)
+      VALUES ('legacy-export', ?, ?, 2, '2026-08-01T10:00:00.000Z')
+    `).run(legacyAssets, legacyManifest);
+    original.close();
+
+    const migrated = new ProjectDatabase(root);
+    expect(migrated.getProject().exportTargets).toEqual({});
+    expect(migrated.sqlite.prepare(`
+      SELECT integration, target_path, manifest_path, asset_count FROM export_records
+      WHERE id = 'legacy-export'
+    `).get()).toMatchObject({
+      integration: 'unity',
+      target_path: legacyAssets,
+      manifest_path: legacyManifest,
+      asset_count: 2,
+    });
+    expect(readdirSync(path.join(root, 'backups')).some((name) => name.startsWith('registry-v16-'))).toBe(true);
+    migrated.close();
+  });
+
+  it('wymusza footprint 1×1 dla terenów i dróg', () => {
+    const root = temporaryProjectRoot();
+    const database = ProjectDatabase.create(root, {
+      name: 'Stała komórka', artBrief: '', projection: 'top_down', tileWidthPx: 65,
+    });
+
+    for (const category of ['flat_tile', 'road_tile'] as const) {
+      expect(() => database.enqueueGeneration({
+        name: category === 'flat_tile' ? 'Łąka' : 'Droga', prompt: '', mode: 'generate', category,
+        footprint: { x: 2, y: 1 },
+      })).toThrow(/footprint 1×1/);
+    }
+    database.close();
+  });
+
   it('przechowuje odrzucone wersje i zatwierdza kolejną bez kasowania historii', async () => {
     const root = temporaryProjectRoot();
     const database = ProjectDatabase.create(root, {
@@ -329,6 +427,39 @@ describe('ProjectDatabase', () => {
     database.close();
   });
 
+  it('zatwierdza nieparzysty rozmiar propozycji top-down bez utraty proporcji 1:1', () => {
+    const root = temporaryProjectRoot();
+    const database = ProjectDatabase.create(root, {
+      name: 'Mapa top-down', artBrief: 'Chłodna paleta', projection: 'top_down', tileWidthPx: 255,
+    });
+    const proposal = database.createProjectSettingsProposal({
+      reason: 'Nowa próbka wymaga nieco większej komórki projektu.',
+      settings: { tileWidthPx: 257, artBrief: 'Ciepła paleta' },
+      referenceIds: [],
+    });
+
+    database.reviewProjectSettingsProposal(proposal.id, 'approved');
+
+    expect(database.getProject()).toMatchObject({
+      projection: 'top_down', tileWidthPx: 257, tileHeightPx: 257, artBrief: 'Ciepła paleta',
+    });
+    database.close();
+  });
+
+  it('odrzuca nieparzystą szerokość w propozycji projektu izometrycznego', () => {
+    const root = temporaryProjectRoot();
+    const database = ProjectDatabase.create(root, {
+      name: 'Mapa izometryczna', artBrief: '', tileWidthPx: 256,
+    });
+
+    expect(() => database.createProjectSettingsProposal({
+      reason: 'Propozycja celowo narusza geometrię komórki izometrycznej.',
+      settings: { tileWidthPx: 257 },
+      referenceIds: [],
+    })).toThrow(/musi być parzysta/);
+    database.close();
+  });
+
   it('dodaje tabelę propozycji ustawień podczas migracji projektu v4', () => {
     const root = temporaryProjectRoot();
     const original = ProjectDatabase.create(root, {
@@ -348,7 +479,9 @@ describe('ProjectDatabase', () => {
     const database = ProjectDatabase.create(root, {
       name: 'Stara nazwa', artBrief: '', tileWidthPx: 256,
     });
-    expect(database.getProject()).toMatchObject({ maxConcurrentJobs: 1, aiVerificationEnabled: true });
+    expect(database.getProject()).toMatchObject({
+      projection: 'isometric', tileHeightPx: 128, maxConcurrentJobs: 1, aiVerificationEnabled: true,
+    });
 
     const updated = database.updateProjectSettings({
       name: 'Wyspy',
@@ -364,6 +497,42 @@ describe('ProjectDatabase', () => {
       maxConcurrentJobs: 4, aiVerificationEnabled: false,
     });
     expect(JSON.parse(readFileSync(path.join(root, 'tilemap-project.json'), 'utf8'))).toMatchObject({ name: 'Wyspy' });
+    database.close();
+  });
+
+  it('przechowuje niemutowalną projekcję top-down i utrzymuje bazowy tile 1:1', () => {
+    const root = temporaryProjectRoot();
+    const database = ProjectDatabase.create(root, {
+      name: 'Widok z góry', artBrief: '', projection: 'top_down', tileWidthPx: 255,
+    });
+
+    expect(database.getProject()).toMatchObject({
+      projection: 'top_down', tileWidthPx: 255, tileHeightPx: 255, pixelsPerUnit: 255,
+    });
+    expect(JSON.parse(readFileSync(path.join(root, 'tilemap-project.json'), 'utf8'))).toMatchObject({
+      name: 'Widok z góry', projection: 'top_down',
+    });
+
+    const updated = database.updateProjectSettings({
+      name: 'Widok z góry',
+      artBrief: 'Czytelna mapa',
+      projection: 'isometric',
+      tileWidthPx: 257,
+      pixelsPerUnit: 255,
+      maxConcurrentJobs: 2,
+      aiVerificationEnabled: true,
+    } as Parameters<ProjectDatabase['updateProjectSettings']>[0] & { projection: 'isometric' });
+
+    expect(updated).toMatchObject({
+      projection: 'top_down', tileWidthPx: 257, tileHeightPx: 257,
+    });
+    expect(JSON.parse(readFileSync(path.join(root, 'tilemap-project.json'), 'utf8'))).toMatchObject({
+      projection: 'top_down',
+    });
+    expect(() => database.enqueueGeneration({
+      name: 'Niedozwolona wyspa', prompt: '', mode: 'generate', category: 'elevated_tile',
+      elevationLevels: 1, footprint: { x: 1, y: 1 },
+    })).toThrow(/nie jest obsługiwany.*top-down/);
     database.close();
   });
 

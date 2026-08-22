@@ -67,7 +67,7 @@ it('wykrywa gotowy profil Z-Image Turbo i zapisuje provenance workflow', async (
   });
 
   const result = await service.generate({
-    assetName: 'Leśna chata', category: 'building', prompt: 'Drewno i mech', feedback: '',
+    assetName: 'Leśna chata', category: 'building', projection: 'isometric', prompt: 'Drewno i mech', feedback: '',
     artBrief: 'Miękka malowana stylistyka', styleSummary: '', outputPath,
     outputSize: { width: 128, height: 192 }, roadAtlas: false, attempt: 1,
     verificationFeedback: '', signal: new AbortController().signal,
@@ -84,9 +84,30 @@ it('wykrywa gotowy profil Z-Image Turbo i zapisuje provenance workflow', async (
   expect(workflow['1']).toMatchObject({ class_type: 'UNETLoader', inputs: { unet_name: 'z_image_turbo_bf16.safetensors' } });
   expect(workflow['10']).toMatchObject({ class_type: 'LoadBackgroundRemovalModel', inputs: { bg_removal_name: 'birefnet.safetensors' } });
   expect(workflow['14']).toMatchObject({ class_type: 'SaveImage', inputs: { images: ['13', 0] } });
+
+  const topDownOutput = path.join(root, 'top-down.png');
+  submitted = null;
+  await service.generate({
+    assetName: 'Łąka', category: 'flat_tile', projection: 'top_down', prompt: 'Soczysta trawa', feedback: '',
+    artBrief: '', styleSummary: '', outputPath: topDownOutput,
+    outputSize: { width: 128, height: 128 }, roadAtlas: false, attempt: 1,
+    verificationFeedback: '', signal: new AbortController().signal,
+  });
+  const topDownWorkflow = (submitted as unknown as Record<string, unknown>).prompt as Record<string, { class_type: string; inputs: Record<string, unknown> }>;
+  expect(topDownWorkflow['10']).toBeUndefined();
+  expect(topDownWorkflow['14']).toMatchObject({ class_type: 'SaveImage', inputs: { images: ['9', 0] } });
+  expect(topDownWorkflow['5'].inputs.text).toContain('square top-down terrain tile');
 });
 
-it('raportuje brakujące node-y i modele zamiast oznaczać ComfyUI jako gotowe', async () => {
+it('pozwala generować opaque top-down bez BiRefNet, ale blokuje workflow z przezroczystością', async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-comfy-opaque-'));
+  temporaryDirectories.push(root);
+  const outputPath = path.join(root, 'top-down.png');
+  const png = await sharp({
+    create: { width: 64, height: 64, channels: 4, background: { r: 40, g: 100, b: 50, alpha: 1 } },
+  }).png().toBuffer();
+  let promptRequests = 0;
+
   vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
     const url = new URL(String(input));
     if (url.pathname === '/system_stats') return jsonResponse({ system: { comfyui_version: '0.30.2' } });
@@ -97,13 +118,62 @@ it('raportuje brakujące node-y i modele zamiast oznaczać ComfyUI jako gotowe',
       url.pathname.includes('diffusion_models') ? 'z_image_turbo_bf16.safetensors'
         : url.pathname.includes('text_encoders') ? 'qwen_3_4b.safetensors' : 'ae.safetensors',
     ]);
+    if (url.pathname === '/prompt') {
+      promptRequests += 1;
+      return jsonResponse({ prompt_id: 'opaque-prompt' });
+    }
+    if (url.pathname === '/history/opaque-prompt') {
+      return jsonResponse({
+        'opaque-prompt': {
+          status: { completed: true, status_str: 'success' },
+          outputs: { '14': { images: [{ filename: 'opaque.png', type: 'output' }] } },
+        },
+      });
+    }
+    if (url.pathname === '/view') return new Response(png, { status: 200, headers: { 'Content-Type': 'image/png' } });
+    return new Response('not found', { status: 404 });
+  }));
+
+  const service = new ComfyService(undefined, 'http://127.0.0.1:8188');
+  await expect(service.refresh()).resolves.toMatchObject({
+    state: 'ready', server: true,
+    missingNodes: ['RemoveBackground'], missingModels: ['birefnet.safetensors'],
+  });
+  expect(service.health().message).toContain('gotowe dla nieprzezroczystych kafli top-down');
+
+  await expect(service.generate({
+    assetName: 'Łąka', category: 'flat_tile', projection: 'top_down', prompt: '', feedback: '',
+    artBrief: '', styleSummary: '', outputPath, outputSize: { width: 64, height: 64 },
+    roadAtlas: false, attempt: 1, verificationFeedback: '', signal: new AbortController().signal,
+  })).resolves.toMatchObject({ promptId: 'opaque-prompt' });
+  expect(existsSync(outputPath)).toBe(true);
+
+  await expect(service.generate({
+    assetName: 'Chata', category: 'building', projection: 'top_down', prompt: '', feedback: '',
+    artBrief: '', styleSummary: '', outputPath: path.join(root, 'building.png'),
+    outputSize: { width: 64, height: 64 }, roadAtlas: false, attempt: 1,
+    verificationFeedback: '', signal: new AbortController().signal,
+  })).rejects.toThrow(/Workflow z przezroczystością.*RemoveBackground.*birefnet/);
+  expect(promptRequests).toBe(1);
+});
+
+it('nie oznacza ComfyUI jako gotowego, gdy brakuje zależności bazowego workflow', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    if (url.pathname === '/system_stats') return jsonResponse({ system: { comfyui_version: '0.30.2' } });
+    if (url.pathname === '/object_info/KSampler') return jsonResponse({});
+    if (url.pathname.startsWith('/object_info/')) return jsonResponse({ available: {} });
+    if (url.pathname === '/models/diffusion_models') return jsonResponse([]);
+    if (url.pathname === '/models/text_encoders') return jsonResponse(['qwen_3_4b.safetensors']);
+    if (url.pathname === '/models/vae') return jsonResponse(['ae.safetensors']);
+    if (url.pathname === '/models/background_removal') return jsonResponse(['birefnet.safetensors']);
     return new Response('not found', { status: 404 });
   }));
 
   const service = new ComfyService(undefined, 'http://127.0.0.1:8188');
   await expect(service.refresh()).resolves.toMatchObject({
     state: 'detected', server: true,
-    missingNodes: ['RemoveBackground'], missingModels: ['birefnet.safetensors'],
+    missingNodes: ['KSampler'], missingModels: ['z_image_turbo_bf16.safetensors'],
   });
 });
 

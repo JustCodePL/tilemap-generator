@@ -12,6 +12,7 @@ import type {
   GenerationLogLevel,
   GenerationStage,
   GeneratorProvider,
+  ProjectProjection,
   ProjectReference,
 } from '../../shared/domain';
 import {
@@ -37,6 +38,7 @@ import {
   type TerrainSeamValidation,
   validateElevatedTerrainTile,
   validateRoadTile,
+  validateTerrainPng,
   validateTerrainTile,
   validateTransparentPng,
   verifyTerrainSeams,
@@ -232,6 +234,9 @@ export class GenerationQueue extends EventEmitter {
             context.feedback ? `Uwagi do tej wersji: ${context.feedback}` : '',
             `Brief projektu: ${project.artBrief || '(brak)'}`,
             `Kanoniczny styl projektu: ${project.styleSummary || '(jeszcze nie ustalono)'}`,
+            project.projection === 'top_down'
+              ? 'Oczekiwana projekcja: top-down 1:1, kamera ortograficzna dokładnie z góry. Odrzuć perspektywę izometryczną lub ukośną.'
+              : 'Oczekiwana projekcja: izometryczna 2:1, stała kamera ortograficzna. Odrzuć widok top-down lub inną perspektywę.',
             'Kontrole techniczne PNG, wymiarów i geometrii zostały już wykonane deterministycznie.',
             'Oceń zgodność treści, kompozycji, perspektywy i stylu z powyższym kontekstem.',
             'Zwróć status passed, jeśli asset nadaje się do oceny użytkownika. Zwróć failed tylko przy konkretnej widocznej wadzie i krótko ją opisz po polsku.',
@@ -377,12 +382,8 @@ export class GenerationQueue extends EventEmitter {
           : null;
         const project = database.getProject();
         const projectReferences = database.listProjectReferences();
-        const terrainVerification = isTileAssetCategory(context.category)
-          && context.footprint.x === 1
-          && context.footprint.y === 1;
-        const roadVerification = isRoadAssetCategory(context.category)
-          && context.footprint.x === 1
-          && context.footprint.y === 1;
+        const terrainVerification = isTileAssetCategory(context.category);
+        const roadVerification = isRoadAssetCategory(context.category);
         const maxAttempts = project.aiVerificationEnabled && (terrainVerification || roadVerification)
           ? MAX_GEOMETRY_ATTEMPTS
           : 1;
@@ -420,6 +421,7 @@ export class GenerationQueue extends EventEmitter {
                 text: activeAttempt === 1
                   ? buildGenerationPrompt(
                     context,
+                    project.projection,
                     project.artBrief,
                     project.styleSummary,
                     project.tileWidthPx,
@@ -431,6 +433,7 @@ export class GenerationQueue extends EventEmitter {
                   : terrainVerification
                     ? buildTerrainRetryPrompt(
                       context,
+                      project.projection,
                       project.artBrief,
                       project.styleSummary,
                       project.tileWidthPx,
@@ -442,6 +445,7 @@ export class GenerationQueue extends EventEmitter {
                     )
                     : buildRoadRetryPrompt(
                       context,
+                      project.projection,
                       project.artBrief,
                       project.styleSummary,
                       project.tileWidthPx,
@@ -477,6 +481,7 @@ export class GenerationQueue extends EventEmitter {
             const comfyResult = await this.comfy.generate({
               assetName: context.assetName,
               category: context.category,
+              projection: project.projection,
               prompt: context.prompt,
               feedback: context.feedback,
               artBrief: project.artBrief,
@@ -513,6 +518,7 @@ export class GenerationQueue extends EventEmitter {
             const stableDiffusionCppResult = await this.stableDiffusionCpp.generate({
               assetName: context.assetName,
               category: context.category,
+              projection: project.projection,
               prompt: context.prompt,
               feedback: context.feedback,
               artBrief: project.artBrief,
@@ -565,6 +571,7 @@ export class GenerationQueue extends EventEmitter {
                 roadMaterialPath,
                 project.tileWidthPx,
                 project.tileHeightPx,
+                project.projection,
               );
               stagedFinal = path.join(attemptPath, 'road-grid.png');
               await createRoadVariantGrid(
@@ -615,13 +622,14 @@ export class GenerationQueue extends EventEmitter {
             database.updateJob(job.id, 'generating', `${attemptLabel}: weryfikacja szwów 3×3…`);
             this.log(database, job.id, 'verification', 'info', activeAttempt, 'Uruchomiono deterministyczny test szwów 3×3.');
             try {
-              validated = await validateTransparentPng(stagedFinal);
+              validated = await validateTerrainPng(stagedFinal, project.projection);
               const seamPreviewPath = path.join(attemptPath, 'seam-preview.png');
               const seam = await verifyTerrainSeams(
                 stagedFinal,
                 seamPreviewPath,
                 project.tileWidthPx,
                 project.tileHeightPx,
+                project.projection,
               );
               previousSeamPreview = seamPreviewPath;
               database.addArtifact(
@@ -640,7 +648,12 @@ export class GenerationQueue extends EventEmitter {
                     project.tileHeightPx * context.elevationLevels,
                   );
                 } else {
-                  await validateTerrainTile(stagedFinal, project.tileWidthPx, project.tileHeightPx);
+                  await validateTerrainTile(
+                    stagedFinal,
+                    project.tileWidthPx,
+                    project.tileHeightPx,
+                    project.projection,
+                  );
                 }
               } catch (error) {
                 geometryFailure = error instanceof Error ? error.message : String(error);
@@ -648,7 +661,7 @@ export class GenerationQueue extends EventEmitter {
               if (geometryFailure || !seam.passed) {
                 throw new Error([
                   geometryFailure ? `Walidacja geometrii: ${geometryFailure}` : '',
-                  summarizeTerrainSeamResult(seam),
+                  summarizeTerrainSeamResult(seam, project.projection),
                 ].filter(Boolean).join(' '));
               }
               this.log(
@@ -692,6 +705,7 @@ export class GenerationQueue extends EventEmitter {
                   project.tileWidthPx,
                   project.tileHeightPx,
                   variant.connectionMask,
+                  project.projection,
                 );
               }
               validated = firstValidation!;
@@ -862,6 +876,7 @@ export class GenerationQueue extends EventEmitter {
 
 function buildGenerationPrompt(
   context: JobContext,
+  projection: ProjectProjection,
   artBrief: string,
   styleSummary: string,
   tileWidth: number,
@@ -870,6 +885,10 @@ function buildGenerationPrompt(
   projectReferences: ProjectReference[],
   aiVerificationEnabled: boolean,
 ): string {
+  const isTopDown = projection === 'top_down';
+  if (isTopDown && context.category === 'elevated_tile') {
+    throw new Error('Projekcja top-down nie obsługuje elevated tile. Użyj flat terrain albo projektu izometrycznego.');
+  }
   const editInstructions = context.mode === 'edit'
     ? [
       'Intent: edit.',
@@ -887,7 +906,7 @@ function buildGenerationPrompt(
     context,
   );
   const geometryInstructions = isRoadAssetCategory(context.category)
-    ? buildRoadMaterialInstructions(tileWidth, tileHeight, aiVerificationEnabled)
+    ? buildRoadMaterialInstructions(tileWidth, tileHeight, projection, aiVerificationEnabled)
     : !isTerrainTile
     ? relativePixelSize
       ? [
@@ -895,7 +914,7 @@ function buildGenerationPrompt(
         `The final transparent PNG canvas MUST be exactly ${relativePixelSize.width}x${relativePixelSize.height}px.`,
         `The project base tile is ${tileWidth}x${tileHeight}px. Scale the ${context.category} consistently against that tile; keep the full silhouette visible and anchor it at the bottom center with transparent padding where needed.`,
       ].join('\n')
-      : 'Composition/framing: one isolated isometric asset, fixed camera, fully visible silhouette, with transparent padding where needed.'
+      : `Composition/framing: one isolated ${isTopDown ? 'top-down' : 'isometric'} asset, fixed orthographic camera, fully visible silhouette, with transparent padding where needed.`
     : context.category === 'elevated_tile'
       ? [
         `Asset type: ELEVATED TILE with elevation height ${context.elevationLevels}. This type is authoritative; do not flatten the asset.`,
@@ -910,7 +929,21 @@ function buildGenerationPrompt(
           ? 'Before returning final.png, build an exact 3x3 repeat using the grid offsets above and inspect it at 100%: the nine top faces must read as one continuous surface with no visible grid. Repair the sprite if any internal boundary is visible.'
           : '',
       ].join('\n')
-      : [
+      : isTopDown
+        ? [
+          'Asset type: FLAT TOP-DOWN TILE.',
+          `The final PNG canvas MUST be exactly ${tileWidth}x${tileHeight}px and fill the square cell edge to edge.`,
+          'The terrain covers the complete canvas, including all four corners. No transparent padding, border, frame, bevel, rim, cast shadow, or lighting change at a tile edge.',
+          `Copies use a regular orthogonal grid with offsets (±${tileWidth}px, 0) and (0, ±${tileHeight}px). Every copy must meet edge-to-edge without gaps, overlap, steps, or bulges.`,
+          'It is a flat seamless ground tile. The left edge must match the right edge pixel-for-pixel, and the top edge must match the bottom edge, so texture, color, scale, and lighting continue across copies.',
+          aiVerificationEnabled
+            ? 'Before returning final.png, build an exact orthogonal 3x3 repeat and inspect it at 100%: it must read as one continuous surface with no visible internal grid. Repair the tile if any boundary is visible.'
+            : '',
+          aiVerificationEnabled
+            ? 'Crop and resize the result as needed, then validate the exact dimensions and edge-to-edge coverage before returning final.png.'
+            : '',
+        ].join('\n')
+        : [
         'Asset type: FLAT TILE.',
         `The final PNG canvas MUST be exactly ${tileWidth}x${tileHeight}px.`,
         'The isometric diamond must fill the entire canvas: its four vertices touch the top, right, bottom, and left canvas edges. No outer transparent padding.',
@@ -923,7 +956,8 @@ function buildGenerationPrompt(
         aiVerificationEnabled
           ? 'After chroma-key removal, crop and resize the result as needed, then validate the exact dimensions and edge-to-edge alpha bounds before returning final.png.'
           : '',
-      ].join('\n');
+        ].join('\n');
+  const opaqueTopDownTerrain = isTopDown && context.category === 'flat_tile';
   const outputInstructions = isRoadAssetCategory(context.category)
     ? [
       'Use one built-in image generation call to create one opaque, full-frame material swatch. This is an intermediate texture source, not the final transparent road asset.',
@@ -931,11 +965,11 @@ function buildGenerationPrompt(
       'Do not run background removal, chroma-key processing or the transparent-output helper. Do not use CLI/API and do not request OPENAI_API_KEY. The application creates geometry, shoulders, alpha, exact dimensions and all 16 variants after this turn.',
       `In the final JSON use ${path.join(stagingPath, 'road-material.png')} as finalPath.`,
     ].join('\n')
-    : `Project-bound output: copy the final transparent PNG to exactly ${path.join(stagingPath, 'final.png')}. Preserve any useful source as ${path.join(stagingPath, 'source.png')}.`;
+    : `Project-bound output: copy the final ${opaqueTopDownTerrain ? 'PNG' : 'transparent PNG'} to exactly ${path.join(stagingPath, 'final.png')}. Preserve any useful source as ${path.join(stagingPath, 'source.png')}.`;
   return [
     '$imagegen',
     'Use case: stylized-concept',
-    `Asset type: isometric Unity game asset, category ${context.category}`,
+    `Asset type: ${isTopDown ? 'orthographic top-down' : 'isometric'} game asset, category ${context.category}`,
     `Asset title: ${context.assetName}`,
     context.prompt
       ? `Additional request: ${context.prompt}`
@@ -945,14 +979,18 @@ function buildGenerationPrompt(
     `Project art brief: ${artBrief || '(not established)'}`,
     `Canonical approved style summary: ${styleSummary || '(no approved assets yet)'}`,
     formatProjectReferences(projectReferences),
-    `Isometric base tile: ${tileWidth}x${tileHeight}px (fixed 2:1); asset type: ${context.category}; footprint: ${context.footprint.x}x${context.footprint.y} cells.`,
+    `${isTopDown ? 'Top-down base tile' : 'Isometric base tile'}: ${tileWidth}x${tileHeight}px (${isTopDown ? 'fixed 1:1 orthogonal grid' : 'fixed 2:1'}); asset type: ${context.category}; footprint: ${context.footprint.x}x${context.footprint.y} cells.`,
     geometryInstructions,
     isRoadAssetCategory(context.category)
       ? 'Constraints for the source swatch: opaque edge-to-edge material; no text; no watermark; no frame; no objects. The application, not imagegen, makes the final road variants transparent.'
-      : 'Constraints: final deliverable must be a transparent PNG with transparent corners; no text; no watermark; no frame; no unrelated props.',
+      : opaqueTopDownTerrain
+        ? 'Constraints: final deliverable must be a full-canvas terrain PNG with all four corners covered; no text; no watermark; no frame; no unrelated props.'
+        : 'Constraints: final deliverable must be a transparent PNG with transparent corners; no text; no watermark; no frame; no unrelated props.',
     isRoadAssetCategory(context.category)
       ? 'Use the built-in image generation workflow. This source intentionally does not request transparency, so do not enter the imagegen transparent-output workflow.'
-      : 'Use the built-in image generation workflow. Follow the imagegen skill transparent-output workflow. Never switch to CLI/API or request OPENAI_API_KEY.',
+      : opaqueTopDownTerrain
+        ? 'Use the built-in image generation workflow. This full-canvas terrain intentionally does not require transparency, so do not run background removal, chroma-key, or transparent-output helpers. Never switch to CLI/API or request OPENAI_API_KEY.'
+        : 'Use the built-in image generation workflow. Follow the imagegen skill transparent-output workflow. Never switch to CLI/API or request OPENAI_API_KEY.',
     outputInstructions,
     aiVerificationEnabled
       ? isRoadAssetCategory(context.category)
@@ -966,12 +1004,14 @@ function buildGenerationPrompt(
     `Return category exactly as ${context.category}; also return concise searchable tags.`,
     buildPivotInstruction(context.category, tileHeight, elevatedWallHeight, relativePixelSize?.height, aiVerificationEnabled),
     aiVerificationEnabled
-      ? 'Choose pivot only after the final PNG is complete and inspected. Return it as normalized Unity coordinates in pivot; the user can override this recommendation during final review.'
+      ? 'Choose pivot only after the final PNG is complete and inspected. Return it as normalized sprite coordinates in pivot; the user can override this recommendation during final review.'
       : 'Return the pivot from the category geometry and intended ground anchor without reopening the final PNG. The user can override it during final review.',
     'Finish with JSON matching the supplied schema and put the actual final PNG path in finalPath.',
     isRoadAssetCategory(context.category)
       ? 'The road source is deliberately opaque and requires no transparency fallback. Do not return needs_user_decision merely because built-in image generation has no native alpha.'
-      : 'If the built-in transparent workflow is genuinely unsuitable, do not use fallback; return status needs_user_decision and explain why in message.',
+      : opaqueTopDownTerrain
+        ? 'Do not return needs_user_decision merely because this terrain has no transparent pixels; opaque edge-to-edge coverage is required.'
+        : 'If the built-in transparent workflow is genuinely unsuitable, do not use fallback; return status needs_user_decision and explain why in message.',
   ].filter(Boolean).join('\n\n');
 }
 
@@ -983,29 +1023,34 @@ function buildPivotInstruction(
   aiVerificationEnabled = true,
 ): string {
   if (category === 'flat_tile' || category === 'road_tile') {
-    return 'Pivot recommendation: use the exact cell center, normalized Unity pivot {"x":0.5,"y":0.5}.';
+    return 'Pivot recommendation: use the exact cell center, normalized sprite pivot {"x":0.5,"y":0.5}.';
   }
   if (category === 'elevated_tile') {
     const canvasHeight = tileHeight + elevatedWallHeight;
     const pivotY = 1 - (tileHeight / 2) / canvasHeight;
-    return `Pivot recommendation: anchor the center of the top walkable diamond. For this exact canvas return normalized Unity pivot {"x":0.5,"y":${Number(pivotY.toFixed(6))}}.`;
+    return `Pivot recommendation: anchor the center of the top walkable diamond. For this exact canvas return normalized sprite pivot {"x":0.5,"y":${Number(pivotY.toFixed(6))}}.`;
   }
   if (category === 'building' || category === 'character' || category === 'vegetation' || category === 'prop') {
     return [
       aiVerificationEnabled
         ? 'Pivot recommendation: inspect the finished alpha silhouette and place the anchor at its logical ground-contact point, usually bottom-center at the feet or base.'
         : 'Pivot recommendation: use the logical ground-contact point established during composition, usually bottom-center at the feet or base.',
-      `Coordinates are normalized Unity coordinates: x from left to right and y from bottom to top${relativeCanvasHeight ? ` on the final ${relativeCanvasHeight}px-high canvas` : ''}. Account for transparent padding; do not blindly return canvas bottom when the contact point is above it.`,
+      `Coordinates are normalized sprite coordinates: x from left to right and y from bottom to top${relativeCanvasHeight ? ` on the final ${relativeCanvasHeight}px-high canvas` : ''}. Account for transparent padding; do not blindly return canvas bottom when the contact point is above it.`,
     ].join(' ');
   }
   return aiVerificationEnabled
-    ? 'Pivot recommendation: inspect the finished asset and choose its logical runtime anchor. Return normalized Unity coordinates, x left-to-right and y bottom-to-top, accounting for transparent padding.'
-    : 'Pivot recommendation: use the logical runtime anchor established during composition. Return normalized Unity coordinates, x left-to-right and y bottom-to-top, accounting for planned transparent padding.';
+    ? 'Pivot recommendation: inspect the finished asset and choose its logical runtime anchor. Return normalized sprite coordinates, x left-to-right and y bottom-to-top, accounting for transparent padding.'
+    : 'Pivot recommendation: use the logical runtime anchor established during composition. Return normalized sprite coordinates, x left-to-right and y bottom-to-top, accounting for planned transparent padding.';
 }
 
-function buildRoadMaterialInstructions(tileWidth: number, tileHeight: number, aiVerificationEnabled = true): string {
+function buildRoadMaterialInstructions(
+  tileWidth: number,
+  tileHeight: number,
+  projection: ProjectProjection,
+  aiVerificationEnabled = true,
+): string {
   return [
-    'Asset type: ROAD SURFACE MATERIAL SOURCE for deterministic isometric geometry.',
+    `Asset type: ROAD SURFACE MATERIAL SOURCE for deterministic ${projection === 'top_down' ? 'top-down' : 'isometric'} geometry.`,
     `The application will map this material into exact ${tileWidth}x${tileHeight}px road tiles. Imagegen must create material appearance only; it must not design any road layout.`,
     'Create a close-up, orthographic swatch of the requested road surface material filling the entire rectangular image edge to edge.',
     'Use diffuse, nearly direction-neutral lighting and an even material scale suitable for a strategy-game road viewed from above.',
@@ -1020,6 +1065,7 @@ function buildRoadMaterialInstructions(tileWidth: number, tileHeight: number, ai
 
 function buildTerrainRetryPrompt(
   context: JobContext,
+  projection: ProjectProjection,
   artBrief: string,
   styleSummary: string,
   tileWidth: number,
@@ -1029,8 +1075,16 @@ function buildTerrainRetryPrompt(
   projectReferences: ProjectReference[],
   includesSeamPreview: boolean,
 ): string {
+  const isTopDown = projection === 'top_down';
   const elevatedWallHeight = tileHeight * context.elevationLevels;
-  const repairGeometry = context.category === 'elevated_tile'
+  const repairGeometry = isTopDown
+    ? [
+      `Repair contract: output exactly ${tileWidth}x${tileHeight}px and cover the complete square canvas, including all four corners.`,
+      `Repair the tile for a regular orthogonal grid with offsets (±${tileWidth}px, 0) and (0, ±${tileHeight}px). Copies must meet without gaps, overlaps, steps, padding, or scaling.`,
+      'Repair both coverage gaps and visible color/material seams. Match left to right and top to bottom edge pixels; remove any outline, rim, highlight, bevel, shadow, or edge color shift.',
+      'Do not add extrusion, cliff faces, transparent padding, a frame, text, watermark, or unrelated props.',
+    ].join('\n')
+    : context.category === 'elevated_tile'
     ? [
       `Repair asset type: ELEVATED TILE, elevation height ${context.elevationLevels}. Do not flatten the candidate.`,
       `Output exactly ${tileWidth}x${tileHeight + elevatedWallHeight}px: a ${tileWidth}x${tileHeight}px top diamond followed by ${elevatedWallHeight}px visible front-left and front-right walls.`,
@@ -1064,18 +1118,23 @@ function buildTerrainRetryPrompt(
     repairGeometry,
     'Preserve the requested material, palette, texture, lighting, and style; change only geometry and edge pixels needed to make the tile seamless.',
     'Do not hide a seam by overlapping copies, changing grid offsets, adding padding, or scaling the sprite. The final asset itself must pass at the exact project dimensions.',
-    'Before returning final.png, build and inspect your own exact 3x3 repeat at 100%. It must read as one continuous surface with equal top diamonds and no visible internal grid.',
-    'Follow the imagegen skill transparent-output workflow. Never switch to CLI/API or request OPENAI_API_KEY.',
-    `Copy the repaired transparent PNG to exactly ${path.join(stagingPath, 'final.png')}.`,
+    `Before returning final.png, build and inspect your own exact ${isTopDown ? 'orthogonal ' : ''}3x3 repeat at 100%. It must read as one continuous surface with ${isTopDown ? 'equal square cells' : 'equal top diamonds'} and no visible internal grid.`,
+    isTopDown
+      ? 'Use the built-in image generation workflow without background removal, chroma-key, or transparent-output helpers. The repaired square terrain must remain opaque edge to edge. Never switch to CLI/API or request OPENAI_API_KEY.'
+      : 'Follow the imagegen skill transparent-output workflow. Never switch to CLI/API or request OPENAI_API_KEY.',
+    `Copy the repaired ${isTopDown ? '' : 'transparent '}PNG to exactly ${path.join(stagingPath, 'final.png')}.`,
     buildPivotInstruction(context.category, tileHeight, elevatedWallHeight),
-    'Choose pivot only after the repaired final PNG is complete and inspected. Return it in normalized Unity coordinates; the user can override it during final review.',
+    'Choose pivot only after the repaired final PNG is complete and inspected. Return it in normalized sprite coordinates; the user can override it during final review.',
     'Finish with JSON matching the supplied schema and put that actual PNG path in finalPath.',
-    'If the built-in transparent workflow is genuinely unsuitable, return status needs_user_decision instead of using a fallback.',
+    isTopDown
+      ? 'Do not return needs_user_decision merely because the required terrain is opaque.'
+      : 'If the built-in transparent workflow is genuinely unsuitable, return status needs_user_decision instead of using a fallback.',
   ].filter(Boolean).join('\n\n');
 }
 
 function buildRoadRetryPrompt(
   context: JobContext,
+  projection: ProjectProjection,
   artBrief: string,
   styleSummary: string,
   tileWidth: number,
@@ -1095,7 +1154,7 @@ function buildRoadRetryPrompt(
     `Project art brief: ${artBrief || '(not established)'}`,
     `Canonical approved style summary: ${styleSummary || '(no approved assets yet)'}`,
     formatProjectReferences(projectReferences),
-    buildRoadMaterialInstructions(tileWidth, tileHeight),
+    buildRoadMaterialInstructions(tileWidth, tileHeight, projection),
     'Use one built-in image generation call. Generate a new full-frame material swatch instead of editing or repairing road geometry.',
     `Copy the selected native-resolution opaque image to exactly ${path.join(stagingPath, 'road-material.png')}.`,
     'Do not run transparent-output, chroma-key or alpha-helper workflows. Do not use CLI/API or request OPENAI_API_KEY. The application owns all geometry and transparency.',
@@ -1148,15 +1207,19 @@ function formatGapRatio(value: number): string {
   return `${(value * 100).toFixed(3).replace('.', ',')}%`;
 }
 
-function summarizeTerrainSeamResult(seam: TerrainSeamValidation): string {
+function summarizeTerrainSeamResult(
+  seam: TerrainSeamValidation,
+  projection: ProjectProjection,
+): string {
   return [
     `Deterministyczny test dokładnego powtórzenia 3×3: ${seam.passed ? 'zaliczony' : 'niezaliczony'}.`,
     `Ciągłość alfa/geometrii: ${seam.gapPixels}/${seam.inspectedPixels} pikseli luk (${formatGapRatio(seam.gapRatio)}).`,
     `Ciągłość koloru i materiału: ${seam.colorSeamPixels}/${seam.colorInspectedPixels} próbek wspólnych krawędzi `
       + `przekracza próg widocznego szwu (${formatGapRatio(seam.colorSeamRatio)}; `
       + `średni wynik ${seam.averageColorSeamScore.toFixed(3)}, maksymalny ${seam.maxColorSeamScore.toFixed(3)}).`,
-    'Wymagana korekta: zachowaj dokładny romb 2:1 i bieżący canvas; usuń obrysy, cienie, uskoki oraz zmianę koloru na krawędziach; '
-      + 'dopasuj top-left do bottom-right i top-right do bottom-left. Nie maskuj błędu overlapem, paddingiem, skalą ani zmianą offsetu siatki.',
+    projection === 'top_down'
+      ? 'Wymagana korekta: zachowaj pełny kwadrat 1:1 i bieżący canvas; usuń obrysy, cienie, uskoki oraz zmianę koloru na krawędziach; dopasuj lewą krawędź do prawej i górną do dolnej. Nie maskuj błędu overlapem, paddingiem, skalą ani zmianą offsetu siatki.'
+      : 'Wymagana korekta: zachowaj dokładny romb 2:1 i bieżący canvas; usuń obrysy, cienie, uskoki oraz zmianę koloru na krawędziach; dopasuj top-left do bottom-right i top-right do bottom-left. Nie maskuj błędu overlapem, paddingiem, skalą ani zmianą offsetu siatki.',
   ].join(' ');
 }
 

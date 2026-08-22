@@ -46,7 +46,7 @@ it('wykrywa lokalne Z-Image Turbo, uruchamia sd-cli i zapisuje przezroczysty wyn
     state: 'ready', installed: true, profile: 'z_image_turbo', missingFiles: [],
   });
   const result = await service.generate({
-    assetName: 'Leśna chata', category: 'building', prompt: 'Drewno i mech', feedback: '',
+    assetName: 'Leśna chata', category: 'building', projection: 'isometric', prompt: 'Drewno i mech', feedback: '',
     artBrief: 'Miękka malowana stylistyka', styleSummary: '', outputPath,
     outputSize: { width: 128, height: 192 }, roadAtlas: false, attempt: 1,
     verificationFeedback: '', signal: new AbortController().signal,
@@ -68,6 +68,19 @@ it('wykrywa lokalne Z-Image Turbo, uruchamia sd-cli i zapisuje przezroczysty wyn
     metadata: { profile: 'z_image_turbo', steps: 8, cfg: 1, workflowVersion: expect.any(String) },
   });
   expect(result.workflowHash).toMatch(/^[a-f0-9]{64}$/);
+
+  const topDownOutput = path.join(root, 'top-down.png');
+  const topDownResult = await service.generate({
+    assetName: 'Łąka', category: 'flat_tile', projection: 'top_down', prompt: 'Soczysta trawa', feedback: '',
+    artBrief: '', styleSummary: '', outputPath: topDownOutput,
+    outputSize: { width: 128, height: 128 }, roadAtlas: false, attempt: 1,
+    verificationFeedback: '', signal: new AbortController().signal,
+  });
+  const topDownImage = await sharp(topDownOutput).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  expect(topDownImage.info).toMatchObject({ width: 128, height: 128, channels: 4 });
+  expect(topDownImage.data[3]).toBe(255);
+  expect(invokedArgs.join(' ')).toContain('square top-down terrain tile');
+  expect(topDownResult.metadata).toMatchObject({ chromaBackground: null });
 });
 
 it('raportuje brak programu i modeli bez uruchamiania procesu', async () => {

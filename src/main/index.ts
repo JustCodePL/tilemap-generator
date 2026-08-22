@@ -17,10 +17,28 @@ let mainWindow: BrowserWindow | null = null;
 let cleanup: (() => Promise<void>) | null = null;
 let cleanupStarted = false;
 let readyToQuit = false;
+let windowCreation: Promise<void> | null = null;
 const projects = new ProjectManager();
 
-function createWindow(): void {
-  mainWindow = new BrowserWindow({
+function createWindow(): Promise<void> {
+  if (cleanupStarted || readyToQuit) return Promise.resolve();
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.show();
+    mainWindow.focus();
+    return Promise.resolve();
+  }
+  windowCreation ??= createWindowOnce().finally(() => { windowCreation = null; });
+  return windowCreation;
+}
+
+async function createWindowOnce(): Promise<void> {
+  if (cleanup) {
+    const previousCleanup = cleanup;
+    cleanup = null;
+    await previousCleanup();
+  }
+
+  const window = new BrowserWindow({
     width: 1540,
     height: 960,
     minWidth: 1120,
@@ -36,24 +54,33 @@ function createWindow(): void {
       webSecurity: true,
     },
   });
+  mainWindow = window;
 
-  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  mainWindow.webContents.on('will-navigate', (event, url) => {
+  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  window.webContents.on('will-navigate', (event, url) => {
     const allowed = MAIN_WINDOW_VITE_DEV_SERVER_URL
       ? new URL(url).origin === new URL(MAIN_WINDOW_VITE_DEV_SERVER_URL).origin
       : url.startsWith('file://');
     if (!allowed) event.preventDefault();
   });
+  window.on('close', (event) => {
+    if (process.platform !== 'darwin' || cleanupStarted || readyToQuit) return;
+    event.preventDefault();
+    window.hide();
+  });
+  window.on('closed', () => {
+    if (mainWindow === window) mainWindow = null;
+  });
 
-  cleanup = registerIpc(mainWindow, projects, new AppLogger(app.getPath('userData')));
+  cleanup = registerIpc(window, projects, new AppLogger(app.getPath('userData')));
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
-    void mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
+    await window.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
   } else {
-    void mainWindow.loadFile(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`));
+    await window.loadFile(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`));
   }
 }
 
-void app.whenReady().then(() => {
+void app.whenReady().then(async () => {
   protocol.handle('tilemap-asset', (request) => {
     try {
       return net.fetch(pathToFileURL(projects.resolveAssetRequest(request.url)).toString());
@@ -61,13 +88,13 @@ void app.whenReady().then(() => {
       return new Response(error instanceof Error ? error.message : String(error), { status: 404 });
     }
   });
-  createWindow();
+  await createWindow();
   const smokeQuitMs = Number(process.env.TILEMAP_SMOKE_AUTO_QUIT_MS ?? 0);
   if (Number.isFinite(smokeQuitMs) && smokeQuitMs > 0 && smokeQuitMs <= 60_000) {
     setTimeout(() => app.quit(), smokeQuitMs);
   }
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    void createWindow();
   });
 });
 
@@ -80,9 +107,10 @@ app.on('before-quit', (event) => {
   event.preventDefault();
   if (cleanupStarted) return;
   cleanupStarted = true;
-  void cleanup().finally(() => {
+  const shutdown = cleanup;
+  cleanup = null;
+  void shutdown().finally(() => {
     readyToQuit = true;
-    cleanup = null;
     app.quit();
   });
 });

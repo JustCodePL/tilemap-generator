@@ -259,13 +259,21 @@ namespace TilemapGenerator.TerrainBlend.Editor
                 + gridLayout.CellToLocalInterpolated(new Vector3(0.5f, 0.5f, 0f)));
             var right = gridLayout.transform.TransformVector(new Vector3(gridLayout.cellSize.x * 0.5f, 0f, 0f));
             var up = gridLayout.transform.TransformVector(new Vector3(0f, gridLayout.cellSize.y * 0.5f, 0f));
-            var points = new[]
-            {
-                center - right,
-                center + up,
-                center + right,
-                center - up,
-            };
+            var points = gridLayout.cellLayout == GridLayout.CellLayout.Rectangle
+                ? new[]
+                {
+                    center - right - up,
+                    center - right + up,
+                    center + right + up,
+                    center + right - up,
+                }
+                : new[]
+                {
+                    center - right,
+                    center + up,
+                    center + right,
+                    center - up,
+                };
             Handles.color = painting
                 ? new Color(0.2f, 1f, 0.35f, 0.16f)
                 : new Color(1f, 0.15f, 0.15f, 0.2f);

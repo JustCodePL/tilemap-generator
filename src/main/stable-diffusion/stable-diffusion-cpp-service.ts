@@ -6,6 +6,7 @@ import path from 'node:path';
 import sharp from 'sharp';
 import type {
   AssetCategory,
+  ProjectProjection,
   StableDiffusionCppHealth,
   StableDiffusionCppInstallEvent,
   StableDiffusionCppModelId,
@@ -28,6 +29,7 @@ const CHROMA_BACKGROUND = '#ff00ff';
 export interface StableDiffusionCppGenerationRequest {
   assetName: string;
   category: AssetCategory;
+  projection: ProjectProjection;
   prompt: string;
   feedback: string;
   artBrief: string;
@@ -104,8 +106,11 @@ export class StableDiffusionCppService extends EventEmitter {
 
   async refresh(): Promise<StableDiffusionCppHealth> {
     this.paths = resolvePaths(this.pathOverrides, this.installer.resolveSelectedPaths());
+    const executableName = path.basename(
+      this.paths.executablePath || (process.platform === 'win32' ? 'sd-cli.exe' : 'sd-cli'),
+    );
     const missingFiles = [
-      ['sd-cli.exe', this.paths.executablePath],
+      [executableName, this.paths.executablePath],
       [path.basename(this.paths.modelPath || DEFAULT_MODEL), this.paths.modelPath],
       [path.basename(this.paths.llmPath || DEFAULT_LLM), this.paths.llmPath],
       [path.basename(this.paths.vaePath || DEFAULT_VAE), this.paths.vaePath],
@@ -125,7 +130,7 @@ export class StableDiffusionCppService extends EventEmitter {
         ? 'stable-diffusion.cpp i profil Z-Image Turbo są gotowe.'
         : installed
           ? `Wykryto stable-diffusion.cpp, ale brakuje plików: ${missingFiles.join(', ')}.`
-          : 'Nie wykryto sd-cli.exe. Ustaw TILEMAP_SD_CPP_EXE albo umieść program w katalogu tools/stable-diffusion.cpp.',
+          : `Nie wykryto ${executableName}. Ustaw TILEMAP_SD_CPP_EXE albo umieść program w katalogu tools/stable-diffusion.cpp.`,
     };
     this.logger.info('stable-diffusion-cpp.health', {
       state: this.healthValue.state,
@@ -181,6 +186,8 @@ export class StableDiffusionCppService extends EventEmitter {
     const cfg = 1;
     const samplingMethod = 'euler';
     const generationSize = chooseGenerationSize(request.outputSize);
+    const transparentOutput = !request.roadAtlas
+      && !(request.projection === 'top_down' && request.category === 'flat_tile');
     const prompt = buildPrompt(request);
     const rawPath = `${request.outputPath}.sd-cpp-raw.png`;
     const args = [
@@ -210,7 +217,7 @@ export class StableDiffusionCppService extends EventEmitter {
       samplingMethod,
       width: generationSize.width,
       height: generationSize.height,
-      transparent: !request.roadAtlas,
+      transparent: transparentOutput,
     })).digest('hex');
 
     request.onProgress?.('stable-diffusion.cpp uruchamia Z-Image Turbo.');
@@ -233,9 +240,20 @@ export class StableDiffusionCppService extends EventEmitter {
       }
       request.onProgress?.(request.roadAtlas
         ? 'stable-diffusion.cpp zapisał materiał drogi.'
-        : 'Usuwanie jednolitego tła i dopasowanie canvasu…');
+        : transparentOutput
+          ? 'Usuwanie jednolitego tła i dopasowanie canvasu…'
+          : 'Dopasowanie pełnokadrowego terenu do canvasu…');
       if (request.roadAtlas) {
         copyFileSync(rawPath, request.outputPath);
+      } else if (!transparentOutput) {
+        if (request.outputSize) {
+          await sharp(rawPath)
+            .resize(request.outputSize.width, request.outputSize.height, { fit: 'fill' })
+            .png()
+            .toFile(request.outputPath);
+        } else {
+          copyFileSync(rawPath, request.outputPath);
+        }
       } else {
         const keyedPath = `${request.outputPath}.sd-cpp-alpha.png`;
         const keyColor = await removeConnectedBackground(rawPath, keyedPath);
@@ -270,7 +288,7 @@ export class StableDiffusionCppService extends EventEmitter {
           samplingMethod,
           generationWidth: generationSize.width,
           generationHeight: generationSize.height,
-          chromaBackground: request.roadAtlas ? null : CHROMA_BACKGROUND,
+          chromaBackground: transparentOutput ? CHROMA_BACKGROUND : null,
           workflowVersion: WORKFLOW_VERSION,
         },
       };
@@ -286,13 +304,17 @@ export class StableDiffusionCppService extends EventEmitter {
 }
 
 export function buildPrompt(request: StableDiffusionCppGenerationRequest): string {
+  const isTopDown = request.projection === 'top_down';
+  const opaqueTerrain = isTopDown && request.category === 'flat_tile';
   const typeInstruction = request.roadAtlas
-    ? 'Create one full-frame, opaque, edge-to-edge material sample for an isometric road surface. Show only the road material texture: no road shape, no tile, no atlas, no transparency, no border and no background.'
+    ? `Create one full-frame, opaque, edge-to-edge material sample for a ${isTopDown ? 'top-down' : 'isometric'} road surface. Show only the road material texture: no road shape, no tile, no atlas, no transparency, no border and no background.`
     : request.category === 'flat_tile'
-      ? 'Create one seamless 2:1 isometric terrain diamond that reaches the horizontal and vertical center points of the canvas and tiles without gaps.'
+      ? isTopDown
+        ? 'Create one seamless square top-down terrain tile that fills the complete canvas, including all four corners. Match left to right and top to bottom edges without a border or shadow.'
+        : 'Create one seamless 2:1 isometric terrain diamond that reaches the horizontal and vertical center points of the canvas and tiles without gaps.'
       : request.category === 'elevated_tile'
         ? 'Create one elevated 2:1 isometric terrain tile with a readable top diamond and vertical walls.'
-        : 'Create one isolated game asset in a fixed isometric view.';
+        : `Create one isolated game asset in a fixed ${isTopDown ? 'orthographic top-down' : 'isometric'} view.`;
   return [
     `Asset: ${request.assetName}`,
     `Category: ${request.category}`,
@@ -302,8 +324,8 @@ export function buildPrompt(request: StableDiffusionCppGenerationRequest): strin
     request.artBrief ? `Project art direction: ${request.artBrief}` : '',
     request.styleSummary ? `Established project style: ${request.styleSummary}` : '',
     request.verificationFeedback ? `The previous attempt failed deterministic validation. Correct this exact issue: ${request.verificationFeedback}` : '',
-    'Centered composition, orthographic isometric camera, no text, no frame, no UI, no cast shadow outside the object.',
-    request.roadAtlas
+    `Centered composition, ${isTopDown ? 'straight overhead orthographic top-down' : 'orthographic isometric'} camera, no text, no frame, no UI, no cast shadow outside the object.`,
+    request.roadAtlas || opaqueTerrain
       ? 'Fill the entire frame with useful opaque material. Do not add a background or leave empty margins.'
       : `Use a perfectly flat, uniform ${CHROMA_BACKGROUND} magenta background. No gradient, texture, horizon, floor or shadow in the background. Do not use magenta in the asset itself. The application removes only background connected to the canvas border.`,
   ].filter(Boolean).join('\n\n');

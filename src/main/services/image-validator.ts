@@ -4,8 +4,9 @@ import sharp from 'sharp';
 import {
   hasRoadConnection,
   roadCanonicalVariantMasks,
-  roadConnectionDirections,
+  roadConnectionDirectionsForProjection,
   roadVariantMasks,
+  type ProjectProjection,
 } from '../../shared/domain';
 
 export interface ValidatedImage {
@@ -54,35 +55,61 @@ const TERRAIN_PREVIEW_CELLS = Array.from({ length: 3 }, (_, row) => row - 1)
   .flatMap((y) => Array.from({ length: 3 }, (_, column) => ({ x: column - 1, y })))
   .sort((left, right) => (left.x + left.y) - (right.x + right.y) || left.x - right.x);
 
-export async function validateTransparentPng(filePath: string): Promise<ValidatedImage> {
+export async function validatePng(
+  filePath: string,
+  options: { requireTransparency?: boolean; requireTransparentCorners?: boolean } = {},
+): Promise<ValidatedImage> {
+  const requireTransparency = options.requireTransparency ?? false;
+  const requireTransparentCorners = options.requireTransparentCorners ?? false;
   const image = sharp(filePath, { failOn: 'error' });
   const metadata = await image.metadata();
   if (metadata.format !== 'png') throw new Error('Wynik nie jest plikiem PNG.');
   if (!metadata.width || !metadata.height) throw new Error('PNG nie zawiera poprawnych wymiarów.');
-  if (!metadata.hasAlpha) throw new Error('PNG nie ma kanału alfa.');
+  if (requireTransparency && !metadata.hasAlpha) throw new Error('PNG nie ma kanału alfa.');
 
   const stats = await image.stats();
   const alpha = stats.channels[3];
-  if (!alpha || alpha.min >= 250) throw new Error('PNG nie zawiera przezroczystych pikseli.');
-  if (alpha.max <= 5) throw new Error('PNG jest całkowicie przezroczysty.');
+  const alphaMin = alpha?.min ?? 255;
+  const alphaMax = alpha?.max ?? 255;
+  if (requireTransparency && alphaMin >= 250) throw new Error('PNG nie zawiera przezroczystych pikseli.');
+  if (alphaMax <= 5) throw new Error('PNG jest całkowicie przezroczysty.');
 
-  const corners = [
-    { left: 0, top: 0 },
-    { left: metadata.width - 1, top: 0 },
-    { left: 0, top: metadata.height - 1 },
-    { left: metadata.width - 1, top: metadata.height - 1 },
-  ];
-  for (const corner of corners) {
-    const pixel = await sharp(filePath).extract({ ...corner, width: 1, height: 1 }).ensureAlpha().raw().toBuffer();
-    if (pixel[3] > 48) throw new Error('Co najmniej jeden narożnik PNG nie jest przezroczysty.');
+  if (requireTransparentCorners) {
+    const corners = [
+      { left: 0, top: 0 },
+      { left: metadata.width - 1, top: 0 },
+      { left: 0, top: metadata.height - 1 },
+      { left: metadata.width - 1, top: metadata.height - 1 },
+    ];
+    for (const corner of corners) {
+      const pixel = await sharp(filePath).extract({ ...corner, width: 1, height: 1 }).ensureAlpha().raw().toBuffer();
+      if (pixel[3] > 48) throw new Error('Co najmniej jeden narożnik PNG nie jest przezroczysty.');
+    }
   }
-  return { width: metadata.width, height: metadata.height, alphaMin: alpha.min, alphaMax: alpha.max };
+  return { width: metadata.width, height: metadata.height, alphaMin, alphaMax };
+}
+
+export async function validateTransparentPng(filePath: string): Promise<ValidatedImage> {
+  return validatePng(filePath, { requireTransparency: true, requireTransparentCorners: true });
+}
+
+export async function validateTerrainPng(
+  filePath: string,
+  projection: ProjectProjection,
+): Promise<ValidatedImage> {
+  if (projection === 'isometric') return validateTransparentPng(filePath);
+  const validated = await validatePng(filePath);
+  if (validated.alphaMin < 250) {
+    throw new Error('Tile top-down musi być nieprzezroczysty na całym kwadratowym canvasie, także w narożnikach.');
+  }
+  return validated;
 }
 
 export async function validateTerrainTile(
   filePath: string,
   expectedWidth: number,
   expectedHeight: number,
+  projection: ProjectProjection = 'isometric',
 ): Promise<TerrainTileBounds> {
   const { data, info } = await sharp(filePath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   if (info.width !== expectedWidth || info.height !== expectedHeight) {
@@ -111,7 +138,9 @@ export async function validateTerrainTile(
   const heightCoverage = (bottom - top + 1) / info.height;
   if (widthCoverage < 0.96 || heightCoverage < 0.96) {
     throw new Error(
-      'Tile terenu nie wypełnia komórki: romb musi dochodzić do wszystkich czterech krawędzi canvasa bez zewnętrznego paddingu.',
+      projection === 'isometric'
+        ? 'Tile terenu nie wypełnia komórki: romb musi dochodzić do wszystkich czterech krawędzi canvasa bez zewnętrznego paddingu.'
+        : 'Tile terenu nie wypełnia komórki: kwadrat musi dochodzić do wszystkich czterech krawędzi canvasa bez zewnętrznego paddingu.',
     );
   }
   return { left, top, right, bottom };
@@ -168,6 +197,7 @@ export async function validateRoadTile(
   expectedWidth: number,
   expectedHeight: number,
   connectionMask: number,
+  projection: ProjectProjection = 'isometric',
 ): Promise<RoadTileValidation> {
   if (!Number.isInteger(connectionMask) || connectionMask < 0 || connectionMask > 15) {
     throw new Error('Maska połączeń road tile musi być liczbą od 0 do 15.');
@@ -182,25 +212,28 @@ export async function validateRoadTile(
   const pixelCount = info.width * info.height;
   const visible = new Uint8Array(pixelCount);
   let visiblePixels = 0;
-  let diamondPixels = 0;
+  let cellPixels = 0;
   let outsideDiamondPixels = 0;
   for (let y = 0; y < info.height; y += 1) {
     for (let x = 0; x < info.width; x += 1) {
       const index = y * info.width + x;
       const alpha = data[index * info.channels + 3];
       const diamondDistance = isometricDiamondDistance(x, y, info.width, info.height);
-      if (diamondDistance <= 1) diamondPixels += 1;
+      if (projection === 'top_down' || diamondDistance <= 1) cellPixels += 1;
       if (alpha <= 48) continue;
       visible[index] = 1;
       visiblePixels += 1;
-      if (diamondDistance > 1.04) outsideDiamondPixels += 1;
+      if (projection === 'isometric' && diamondDistance > 1.04) outsideDiamondPixels += 1;
     }
   }
 
-  const visibleRatio = diamondPixels ? visiblePixels / diamondPixels : 1;
+  const visibleRatio = cellPixels ? visiblePixels / cellPixels : 1;
   if (visibleRatio < 0.02) throw new Error('Road tile jest pusty albo droga jest zbyt mała, by połączyć komórki.');
   if (visibleRatio > 0.68) {
-    throw new Error('Road tile wypełnia prawie cały romb jak teren. Poza pasem drogi musi pozostać przezroczysty.');
+    throw new Error(
+      `Road tile wypełnia prawie ${projection === 'isometric' ? 'cały romb' : 'całą komórkę'} jak teren. `
+      + 'Poza pasem drogi musi pozostać przezroczysty.',
+    );
   }
   if (outsideDiamondPixels / pixelCount > 0.002) {
     throw new Error('Road tile zawiera widoczne piksele poza rombem komórki. Usuń cień, padding lub dekoracje wychodzące poza tile.');
@@ -219,18 +252,20 @@ export async function validateRoadTile(
     throw new Error('Road tile zawiera odłączone elementy. Wszystkie odcinki drogi muszą tworzyć jedną sieć przez środek komórki.');
   }
 
-  const connections = roadConnectionDirections.map((direction) => {
+  const connections = roadConnectionDirectionsForProjection(projection).map((direction) => {
     const expected = hasRoadConnection(connectionMask, direction.bit);
     const region = regionIndices(info.width, info.height, direction.x, direction.y, 0.085, 0.17)
       .filter((index) => {
         const x = index % info.width;
         const y = Math.floor(index / info.width);
-        return isometricDiamondDistance(x, y, info.width, info.height) <= 1.02;
+        return projection === 'top_down' || isometricDiamondDistance(x, y, info.width, info.height) <= 1.02;
       });
     const boundary = region.filter((index) => {
       const x = index % info.width;
       const y = Math.floor(index / info.width);
-      return isometricDiamondDistance(x, y, info.width, info.height) >= 0.88;
+      return projection === 'isometric'
+        ? isometricDiamondDistance(x, y, info.width, info.height) >= 0.88
+        : topDownBoundaryDistance(x, y, info.width, info.height) <= 0.06;
     });
     const visibleInRegion = region.filter((index) => visible[index] && reachable[index]).length;
     const visibleAtBoundary = boundary.filter((index) => visible[index] && reachable[index]).length;
@@ -257,6 +292,7 @@ export async function verifyTerrainSeams(
   previewPath: string,
   gridWidth?: number,
   gridHeight?: number,
+  projection: ProjectProjection = 'isometric',
 ): Promise<TerrainSeamValidation> {
   const metadata = await sharp(filePath).metadata();
   if (!metadata.width || !metadata.height) throw new Error('Nie można odczytać wymiarów tile terenu.');
@@ -270,8 +306,12 @@ export async function verifyTerrainSeams(
   const patchHeight = tileHeight * 3 + (spriteHeight - tileHeight);
   const placements = TERRAIN_PREVIEW_CELLS.map(({ x, y }) => ({
     input: filePath,
-    left: Math.round(tileWidth + ((x - y) * tileWidth) / 2),
-    top: Math.round(tileHeight + ((x + y) * tileHeight) / 2),
+    left: projection === 'isometric'
+      ? Math.round(tileWidth + ((x - y) * tileWidth) / 2)
+      : tileWidth + (x * tileWidth),
+    top: projection === 'isometric'
+      ? Math.round(tileHeight + ((x + y) * tileHeight) / 2)
+      : tileHeight + (y * tileHeight),
   }));
 
   const transparentPatch = sharp({
@@ -289,7 +329,7 @@ export async function verifyTerrainSeams(
       const normalizedY = Math.abs((localY + 0.5 - tileHeight / 2) / (tileHeight / 2));
       for (let localX = 0; localX < tileWidth; localX += 1) {
         const normalizedX = Math.abs((localX + 0.5 - tileWidth / 2) / (tileWidth / 2));
-        if (normalizedX + normalizedY > 1) continue;
+        if (projection === 'isometric' && normalizedX + normalizedY > 1) continue;
         const x = placement.left + localX;
         const y = placement.top + localY;
         if (x >= 0 && x < patchWidth && y >= 0 && y < patchHeight) expected[y * patchWidth + x] = 1;
@@ -313,7 +353,9 @@ export async function verifyTerrainSeams(
   }
 
   const gapRatio = inspectedPixels ? gapPixels / inspectedPixels : 1;
-  const colorSeams = inspectTerrainColorSeams(data, info.channels, patchWidth, patchHeight, tileWidth, tileHeight, placements);
+  const colorSeams = projection === 'isometric'
+    ? inspectTerrainColorSeams(data, info.channels, patchWidth, patchHeight, tileWidth, tileHeight, placements)
+    : inspectTopDownTerrainColorSeams(data, info.channels, patchWidth, patchHeight, tileWidth, tileHeight, placements);
   return {
     passed: gapRatio <= MAX_TERRAIN_GAP_RATIO && colorSeams.ratio <= MAX_TERRAIN_COLOR_SEAM_RATIO,
     gapPixels,
@@ -337,6 +379,15 @@ interface Pixel {
 function isometricDiamondDistance(x: number, y: number, width: number, height: number): number {
   return Math.abs((x + 0.5 - width / 2) / (width / 2))
     + Math.abs((y + 0.5 - height / 2) / (height / 2));
+}
+
+function topDownBoundaryDistance(x: number, y: number, width: number, height: number): number {
+  return Math.min(
+    (x + 0.5) / width,
+    (width - x - 0.5) / width,
+    (y + 0.5) / height,
+    (height - y - 0.5) / height,
+  );
 }
 
 function regionIndices(
@@ -487,6 +538,95 @@ function inspectTerrainColorSeams(
   }
 }
 
+function inspectTopDownTerrainColorSeams(
+  data: Buffer,
+  channels: number,
+  patchWidth: number,
+  patchHeight: number,
+  tileWidth: number,
+  tileHeight: number,
+  placements: Array<{ left: number; top: number }>,
+): ColorSeamResult {
+  const cells = TERRAIN_PREVIEW_CELLS.map((cell, index) => ({ ...cell, ...placements[index] }));
+  const shortestSide = Math.min(tileWidth, tileHeight);
+  const nearOffset = Math.max(1, Math.round(shortestSide / 64));
+  const farOffset = Math.max(nearOffset + 1, Math.round(shortestSide * 3 / 64));
+  let seamPixels = 0;
+  let inspectedPixels = 0;
+  let scoreTotal = 0;
+  let maxScore = 0;
+
+  for (const cell of cells) {
+    if (cell.x < 1) {
+      inspectSharedEdge(
+        { x: cell.left + tileWidth, y: cell.top },
+        { x: cell.left + tileWidth, y: cell.top + tileHeight },
+        { x: 1, y: 0 },
+        tileHeight,
+      );
+    }
+    if (cell.y < 1) {
+      inspectSharedEdge(
+        { x: cell.left, y: cell.top + tileHeight },
+        { x: cell.left + tileWidth, y: cell.top + tileHeight },
+        { x: 0, y: 1 },
+        tileWidth,
+      );
+    }
+  }
+
+  return {
+    seamPixels,
+    inspectedPixels,
+    ratio: inspectedPixels ? seamPixels / inspectedPixels : 1,
+    averageScore: inspectedPixels ? scoreTotal / inspectedPixels : 1,
+    maxScore,
+  };
+
+  function inspectSharedEdge(
+    start: { x: number; y: number },
+    end: { x: number; y: number },
+    normal: { x: number; y: number },
+    sampleCount: number,
+  ): void {
+    const endpointMargin = Math.max(2, Math.round(sampleCount * 0.08));
+    for (let sample = endpointMargin; sample < sampleCount - endpointMargin; sample += 1) {
+      const progress = sample / sampleCount;
+      const x = start.x + (end.x - start.x) * progress;
+      const y = start.y + (end.y - start.y) * progress;
+      const nearA = pixelAt(x - normal.x * nearOffset, y - normal.y * nearOffset);
+      const nearB = pixelAt(x + normal.x * nearOffset, y + normal.y * nearOffset);
+      const farA = pixelAt(x - normal.x * farOffset, y - normal.y * farOffset);
+      const farB = pixelAt(x + normal.x * farOffset, y + normal.y * farOffset);
+      const center = pixelAt(x, y);
+      const centerA = pixelAt(x - normal.x, y - normal.y);
+      const centerB = pixelAt(x + normal.x, y + normal.y);
+      if ([nearA, nearB, farA, farB, center, centerA, centerB].some((pixel) => pixel.a <= 48)) continue;
+
+      const localTextureScore = (colorDistance(nearA, farA) + colorDistance(nearB, farB)) / 2;
+      const acrossEdgeScore = colorDistance(nearA, nearB);
+      const edgeLineScore = Math.max(
+        colorDistance(center, nearA),
+        colorDistance(center, nearB),
+        colorDistance(centerA, nearA),
+        colorDistance(centerB, nearB),
+      );
+      const seamScore = Math.max(0, Math.max(acrossEdgeScore, edgeLineScore) - localTextureScore);
+      inspectedPixels += 1;
+      scoreTotal += seamScore;
+      maxScore = Math.max(maxScore, seamScore);
+      if (seamScore > COLOR_SEAM_SCORE_THRESHOLD) seamPixels += 1;
+    }
+  }
+
+  function pixelAt(x: number, y: number): Pixel {
+    const roundedX = Math.max(0, Math.min(patchWidth - 1, Math.round(x)));
+    const roundedY = Math.max(0, Math.min(patchHeight - 1, Math.round(y)));
+    const offset = (roundedY * patchWidth + roundedX) * channels;
+    return { r: data[offset], g: data[offset + 1], b: data[offset + 2], a: data[offset + 3] };
+  }
+}
+
 function colorDistance(left: Pixel, right: Pixel): number {
   return Math.sqrt(
     ((left.r - right.r) ** 2)
@@ -529,6 +669,7 @@ export async function createRoadVariantsFromMaterial(
   sourcePath: string | null,
   tileWidth: number,
   tileHeight: number,
+  projection: ProjectProjection = 'isometric',
 ): Promise<RoadVariantFile[]> {
   if (!sourcePath || !existsSync(sourcePath)) {
     throw new Error('Imagegen nie zapisał pełnokadrowej próbki materiału drogi.');
@@ -540,12 +681,12 @@ export async function createRoadVariantsFromMaterial(
     .modulate({ brightness: 0.78, saturation: 0.92 })
     .png()
     .toBuffer();
-  const outerWidth = Math.max(4, tileHeight * 0.26);
+  const outerWidth = Math.max(4, Math.min(tileWidth, tileHeight) * 0.26);
   const innerWidth = Math.max(2, outerWidth * 0.72);
 
   for (const connectionMask of roadVariantMasks) {
-    const outerMask = roadGeometryMask(connectionMask, tileWidth, tileHeight, outerWidth);
-    const innerMask = roadGeometryMask(connectionMask, tileWidth, tileHeight, innerWidth);
+    const outerMask = roadGeometryMask(connectionMask, tileWidth, tileHeight, outerWidth, projection);
+    const innerMask = roadGeometryMask(connectionMask, tileWidth, tileHeight, innerWidth, projection);
     const shoulder = await sharp(shoulderTexture)
       .ensureAlpha()
       .composite([{ input: outerMask, blend: 'dest-in' }])
@@ -612,8 +753,8 @@ async function createPeriodicRoadTexture(
   // A half-tile period makes opposite ports sample identical pixels after an
   // isometric neighbour offset. Mirroring the quarter patch closes the period
   // without asking imagegen to produce mathematically seamless borders.
-  const periodWidth = Math.max(4, Math.round(tileWidth / 2));
-  const periodHeight = Math.max(4, Math.round(tileHeight / 2));
+  const periodWidth = Math.max(4, Math.floor(tileWidth / 2));
+  const periodHeight = Math.max(4, Math.floor(tileHeight / 2));
   const leftWidth = Math.ceil(periodWidth / 2);
   const rightWidth = periodWidth - leftWidth;
   const topHeight = Math.ceil(periodHeight / 2);
@@ -669,10 +810,11 @@ function roadGeometryMask(
   tileWidth: number,
   tileHeight: number,
   roadWidth: number,
+  projection: ProjectProjection,
 ): Buffer {
   const centerX = tileWidth / 2;
   const centerY = tileHeight / 2;
-  const arms = roadConnectionDirections
+  const arms = roadConnectionDirectionsForProjection(projection)
     .filter((direction) => hasRoadConnection(connectionMask, direction.bit))
     .map((direction) => {
       const anchorX = direction.x * tileWidth;
@@ -685,10 +827,13 @@ function roadGeometryMask(
   const isolated = connectionMask === 0
     ? `<ellipse cx="${centerX}" cy="${centerY}" rx="${roadWidth * 0.58}" ry="${roadWidth * 0.34}"/>`
     : '';
+  const cellShape = projection === 'isometric'
+    ? `<polygon points="${centerX},0 ${tileWidth},${centerY} ${centerX},${tileHeight} 0,${centerY}"/>`
+    : `<rect width="${tileWidth}" height="${tileHeight}"/>`;
   return Buffer.from(
     `<svg width="${tileWidth}" height="${tileHeight}" xmlns="http://www.w3.org/2000/svg">`
-    + `<defs><clipPath id="diamond"><polygon points="${centerX},0 ${tileWidth},${centerY} ${centerX},${tileHeight} 0,${centerY}"/></clipPath></defs>`
-    + `<g clip-path="url(#diamond)" fill="white" stroke="white" stroke-width="${roadWidth}" stroke-linecap="round" stroke-linejoin="round">`
+    + `<defs><clipPath id="cell">${cellShape}</clipPath></defs>`
+    + `<g clip-path="url(#cell)" fill="white" stroke="white" stroke-width="${roadWidth}" stroke-linecap="round" stroke-linejoin="round">`
     + `${isolated}${arms}</g></svg>`,
   );
 }
@@ -705,10 +850,23 @@ const reflectedRoadVariants = [
   { target: 14, source: 7, flip: true, flop: false },
 ] as const;
 
+const topDownReflectedRoadVariants = [
+  { target: 2, source: 1, rotate: 90, flip: false, flop: false },
+  { target: 4, source: 1, rotate: 180, flip: false, flop: false },
+  { target: 8, source: 1, rotate: 270, flip: false, flop: false },
+  { target: 9, source: 3, rotate: 0, flip: false, flop: true },
+  { target: 10, source: 5, rotate: 90, flip: false, flop: false },
+  { target: 11, source: 7, rotate: 270, flip: false, flop: false },
+  { target: 12, source: 3, rotate: 180, flip: false, flop: false },
+  { target: 13, source: 7, rotate: 180, flip: false, flop: false },
+  { target: 14, source: 7, rotate: 90, flip: false, flop: false },
+] as const;
+
 export async function createReflectedRoadVariants(
   stagingPath: string,
   tileWidth: number,
   tileHeight: number,
+  projection: ProjectProjection = 'isometric',
 ): Promise<RoadVariantFile[]> {
   for (const connectionMask of roadCanonicalVariantMasks) {
     const filePath = roadVariantPath(stagingPath, connectionMask);
@@ -727,8 +885,12 @@ export async function createReflectedRoadVariants(
     }
   }
 
-  for (const reflected of reflectedRoadVariants) {
+  const variantsToReflect = projection === 'isometric'
+    ? reflectedRoadVariants
+    : topDownReflectedRoadVariants;
+  for (const reflected of variantsToReflect) {
     let image = sharp(roadVariantPath(stagingPath, reflected.source));
+    if ('rotate' in reflected && reflected.rotate) image = image.rotate(reflected.rotate);
     if (reflected.flip) image = image.flip();
     if (reflected.flop) image = image.flop();
     await image.png().toFile(roadVariantPath(stagingPath, reflected.target));
@@ -745,6 +907,7 @@ export async function createRoadVariantsFromSource(
   sourcePath: string | null,
   tileWidth: number,
   tileHeight: number,
+  projection: ProjectProjection = 'isometric',
 ): Promise<RoadVariantFile[]> {
   const canonicalReady = await canonicalRoadVariantsAreReady(stagingPath, tileWidth, tileHeight);
   if (!canonicalReady) {
@@ -753,9 +916,9 @@ export async function createRoadVariantsFromSource(
         'Imagegen nie zapisał surowego atlasu drogi ani kompletu siedmiu kanonicznych plików.',
       );
     }
-    await extractCanonicalRoadVariants(sourcePath, stagingPath, tileWidth, tileHeight);
+    await extractCanonicalRoadVariants(sourcePath, stagingPath, tileWidth, tileHeight, projection);
   }
-  return createReflectedRoadVariants(stagingPath, tileWidth, tileHeight);
+  return createReflectedRoadVariants(stagingPath, tileWidth, tileHeight, projection);
 }
 
 async function canonicalRoadVariantsAreReady(
@@ -777,11 +940,14 @@ async function extractCanonicalRoadVariants(
   stagingPath: string,
   tileWidth: number,
   tileHeight: number,
+  projection: ProjectProjection,
 ): Promise<void> {
   const { data, info } = await sharp(sourcePath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const gridSize = detectRoadSourceGrid(data, info.width, info.height, info.channels);
-  const diamondMask = Buffer.from(
-    `<svg width="${tileWidth}" height="${tileHeight}"><polygon points="${tileWidth / 2},0 ${tileWidth},${tileHeight / 2} ${tileWidth / 2},${tileHeight} 0,${tileHeight / 2}" fill="white"/></svg>`,
+  const cellMask = Buffer.from(
+    projection === 'isometric'
+      ? `<svg width="${tileWidth}" height="${tileHeight}"><polygon points="${tileWidth / 2},0 ${tileWidth},${tileHeight / 2} ${tileWidth / 2},${tileHeight} 0,${tileHeight / 2}" fill="white"/></svg>`
+      : `<svg width="${tileWidth}" height="${tileHeight}"><rect width="${tileWidth}" height="${tileHeight}" fill="white"/></svg>`,
   );
 
   for (let index = 0; index < roadCanonicalVariantMasks.length; index += 1) {
@@ -797,7 +963,7 @@ async function extractCanonicalRoadVariants(
       .extract({ left, top, width: right - left, height: bottom - top })
       .resize(tileWidth, tileHeight, { fit: 'fill' })
       .ensureAlpha()
-      .composite([{ input: diamondMask, blend: 'dest-in' }])
+      .composite([{ input: cellMask, blend: 'dest-in' }])
       .png()
       .toFile(roadVariantPath(stagingPath, connectionMask));
   }

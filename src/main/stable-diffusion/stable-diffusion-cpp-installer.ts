@@ -82,6 +82,7 @@ export interface StableDiffusionCppResolvedPaths {
 
 export interface StableDiffusionCppInstallerOptions {
   rootPath?: string;
+  platform?: NodeJS.Platform;
   fetcher?: typeof fetch;
   extractArchive?: (archivePath: string, destinationPath: string) => Promise<void>;
   releaseResolver?: (signal: AbortSignal) => Promise<StableDiffusionCppRuntimeRelease>;
@@ -96,6 +97,7 @@ export class StableDiffusionCppInstaller extends EventEmitter {
   private readonly releaseResolver: (signal: AbortSignal) => Promise<StableDiffusionCppRuntimeRelease>;
   private readonly hardwareDetector: () => Promise<StableDiffusionCppHardwareInfo>;
   private readonly catalog: StableDiffusionCppModelDefinition[];
+  private readonly platform: NodeJS.Platform;
   private activeController: AbortController | null = null;
   private hardwarePromise: Promise<StableDiffusionCppHardwareInfo> | null = null;
 
@@ -104,12 +106,13 @@ export class StableDiffusionCppInstaller extends EventEmitter {
     options: StableDiffusionCppInstallerOptions = {},
   ) {
     super();
-    this.rootPath = options.rootPath ?? managedRoot();
+    this.platform = options.platform ?? process.platform;
+    this.rootPath = options.rootPath ?? managedRoot(this.platform);
     this.fetcher = options.fetcher ?? fetch;
     this.extractArchive = options.extractArchive ?? ((archive, destination) => extractZip(archive, { dir: destination }));
     this.releaseResolver = options.releaseResolver ?? ((signal) => resolveLatestRuntime(this.fetcher, signal));
-    this.hardwareDetector = options.hardwareDetector ?? detectHardware;
-    this.catalog = options.catalog ?? createModelCatalog();
+    this.hardwareDetector = options.hardwareDetector ?? (() => detectHardware(this.platform));
+    this.catalog = options.catalog ?? createModelCatalog(this.platform);
   }
 
   async setup(): Promise<StableDiffusionCppSetupInfo> {
@@ -149,6 +152,12 @@ export class StableDiffusionCppInstaller extends EventEmitter {
   }
 
   async install(modelId: StableDiffusionCppModelId): Promise<StableDiffusionCppSetupInfo> {
+    if (this.platform !== 'win32') {
+      throw new Error(
+        'Zarządzana instalacja stable-diffusion.cpp jest dostępna tylko na Windows. '
+        + 'Na macOS zainstaluj binarium sd-cli ręcznie i ustaw TILEMAP_SD_CPP_EXE.',
+      );
+    }
     if (this.activeController) throw new Error('Instalacja stable-diffusion.cpp już trwa.');
     const controller = new AbortController();
     this.activeController = controller;
@@ -354,18 +363,22 @@ export class StableDiffusionCppInstaller extends EventEmitter {
 
   private resolveExecutablePath(): string {
     const explicit = process.env.TILEMAP_SD_CPP_EXE;
-    if (explicit && existsSync(explicit)) return explicit;
+    if (explicit && existsSync(path.resolve(explicit))) return path.resolve(explicit);
     const configPath = this.readConfig().runtime?.executablePath;
     if (configPath && existsSync(configPath)) return configPath;
-    const localAppData = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local');
+    const executableName = this.platform === 'win32' ? 'sd-cli.exe' : 'sd-cli';
     const candidates = [
-      path.join(process.cwd(), 'tools', 'stable-diffusion.cpp', 'sd-cli.exe'),
-      path.join(process.cwd(), 'tools', 'stable-diffusion.cpp', 'bin', 'Release', 'sd-cli.exe'),
-      path.join(this.rootPath, 'sd-cli.exe'),
-      path.join(localAppData, 'stable-diffusion.cpp', 'sd-cli.exe'),
-      ...String(process.env.PATH ?? '').split(path.delimiter).filter(Boolean).map((entry) => path.join(entry, 'sd-cli.exe')),
+      path.join(process.cwd(), 'tools', 'stable-diffusion.cpp', executableName),
+      path.join(process.cwd(), 'tools', 'stable-diffusion.cpp', 'bin', 'Release', executableName),
+      path.join(this.rootPath, executableName),
+      path.join(localApplicationDataRoot(this.platform), 'stable-diffusion.cpp', executableName),
+      ...(this.platform === 'darwin' ? [
+        path.join('/opt/homebrew/bin', executableName),
+        path.join('/usr/local/bin', executableName),
+      ] : []),
+      ...String(process.env.PATH ?? '').split(path.delimiter).filter(Boolean).map((entry) => path.join(entry, executableName)),
     ];
-    return candidates.find((candidate) => existsSync(candidate)) ?? explicit ?? '';
+    return candidates.find((candidate) => existsSync(candidate)) ?? (explicit ? path.resolve(explicit) : '');
   }
 
   private readConfig(): InstallerConfig {
@@ -400,7 +413,7 @@ export class StableDiffusionCppInstaller extends EventEmitter {
   }
 }
 
-function createModelCatalog(): StableDiffusionCppModelDefinition[] {
+function createModelCatalog(platform: NodeJS.Platform): StableDiffusionCppModelDefinition[] {
   const ggufModel = (quantization: 'Q3_K' | 'Q4_K' | 'Q6_K', size: number, sha256: string): StableDiffusionCppManagedFile => ({
     role: 'model',
     fileName: `z_image_turbo-${quantization}.gguf`,
@@ -424,7 +437,7 @@ function createModelCatalog(): StableDiffusionCppModelDefinition[] {
     url: `${MODEL_ORIGIN}/Comfy-Org/z_image_turbo/resolve/${COMFY_Z_IMAGE_REVISION}/split_files/vae/ae.safetensors?download=true`,
     size: 335_304_388,
     sha256: 'afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38',
-    externalCandidates: () => [path.join(comfyModelsRoot(), 'vae', 'ae.safetensors')],
+    externalCandidates: () => [path.join(comfyModelsRoot(platform), 'vae', 'ae.safetensors')],
   };
   const bf16Model: StableDiffusionCppManagedFile = {
     role: 'model', fileName: 'z_image_turbo_bf16.safetensors',
@@ -432,7 +445,7 @@ function createModelCatalog(): StableDiffusionCppModelDefinition[] {
     url: `${MODEL_ORIGIN}/Comfy-Org/z_image_turbo/resolve/${COMFY_Z_IMAGE_REVISION}/split_files/diffusion_models/z_image_turbo_bf16.safetensors?download=true`,
     size: 12_309_866_400,
     sha256: '2407613050b809ffdff18a4ac99af83ea6b95443ecebdf80e064a79c825574a6',
-    externalCandidates: () => [path.join(comfyModelsRoot(), 'diffusion_models', 'z_image_turbo_bf16.safetensors')],
+    externalCandidates: () => [path.join(comfyModelsRoot(platform), 'diffusion_models', 'z_image_turbo_bf16.safetensors')],
   };
   const bf16Llm: StableDiffusionCppManagedFile = {
     role: 'llm', fileName: 'qwen_3_4b.safetensors',
@@ -440,7 +453,7 @@ function createModelCatalog(): StableDiffusionCppModelDefinition[] {
     url: `${MODEL_ORIGIN}/Comfy-Org/z_image_turbo/resolve/${COMFY_Z_IMAGE_REVISION}/split_files/text_encoders/qwen_3_4b.safetensors?download=true`,
     size: 8_044_982_048,
     sha256: '6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a',
-    externalCandidates: () => [path.join(comfyModelsRoot(), 'text_encoders', 'qwen_3_4b.safetensors')],
+    externalCandidates: () => [path.join(comfyModelsRoot(platform), 'text_encoders', 'qwen_3_4b.safetensors')],
   };
   return [
     {
@@ -499,8 +512,8 @@ async function resolveLatestRuntime(fetcher: typeof fetch, signal: AbortSignal):
   };
 }
 
-async function detectHardware(): Promise<StableDiffusionCppHardwareInfo> {
-  if (process.platform !== 'win32') return { gpuName: null, vramMb: null };
+async function detectHardware(platform: NodeJS.Platform): Promise<StableDiffusionCppHardwareInfo> {
+  if (platform !== 'win32') return { gpuName: null, vramMb: null };
   try {
     const output = await runSmallCommand('nvidia-smi.exe', [
       '--query-gpu=name,memory.total', '--format=csv,noheader,nounits',
@@ -529,15 +542,24 @@ function recommendationText(hardware: StableDiffusionCppHardwareInfo, modelId: S
   return `Nie udało się pewnie odczytać VRAM, dlatego polecam bezpieczny profil ${name}.`;
 }
 
-function managedRoot(): string {
+function managedRoot(platform: NodeJS.Platform): string {
   if (process.env.TILEMAP_SD_CPP_HOME) return path.resolve(process.env.TILEMAP_SD_CPP_HOME);
-  const localAppData = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local');
-  return path.join(localAppData, 'Tilemap Generator', 'stable-diffusion.cpp');
+  return path.join(localApplicationDataRoot(platform), 'Tilemap Generator', 'stable-diffusion.cpp');
 }
 
-function comfyModelsRoot(): string {
-  const localAppData = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local');
-  return path.join(localAppData, 'Comfy-Desktop', 'ComfyUI-Shared', 'models');
+function comfyModelsRoot(platform: NodeJS.Platform): string {
+  if (platform === 'darwin') {
+    return path.join(localApplicationDataRoot(platform), 'ComfyUI', 'models');
+  }
+  return path.join(localApplicationDataRoot(platform), 'Comfy-Desktop', 'ComfyUI-Shared', 'models');
+}
+
+function localApplicationDataRoot(platform: NodeJS.Platform): string {
+  if (platform === 'win32') {
+    return process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local');
+  }
+  if (platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support');
+  return process.env.XDG_DATA_HOME ?? path.join(os.homedir(), '.local', 'share');
 }
 
 function fileMatches(filePath: string, expectedSize: number): boolean {

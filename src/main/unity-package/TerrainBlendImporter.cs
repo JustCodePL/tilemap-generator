@@ -16,7 +16,29 @@ namespace TilemapGenerator.TerrainBlend.Editor
     public static class TerrainBlendImporter
     {
         private const string ManifestFileName = "tilemap-assets.json";
+        private const string GeneratedOwnershipFileName = "tilemap-generated-ownership.json";
+        private const int GeneratedOwnershipSchemaVersion = 1;
         private static bool rebuildScheduled;
+        private static readonly HashSet<string> PendingDeletedManifestPaths = new(StringComparer.Ordinal);
+        private static readonly HashSet<string> FixedGeneratedFiles = new(StringComparer.Ordinal)
+        {
+            "TerrainBlendSet.asset",
+            "BuildingSet.asset",
+            "TerrainBlendSupportTile.asset",
+            "Prefabs/TerrainGrid.prefab",
+        };
+        private static readonly HashSet<string> TerrainGeneratedFileNames = new(StringComparer.Ordinal)
+        {
+            "BaseTile.asset",
+            "WallTile.asset",
+            "BlendRuleTile.asset",
+            "TerrainDefinition.asset",
+        };
+        private static readonly HashSet<string> BuildingGeneratedFileNames = new(StringComparer.Ordinal)
+        {
+            "BuildingDefinition.asset",
+            "Building.prefab",
+        };
 
         private static readonly NeighborSpec[] Neighbors =
         {
@@ -30,13 +52,21 @@ namespace TilemapGenerator.TerrainBlend.Editor
             new(128, new Vector3Int(-1, 1, 0), 64, 1),
         };
 
-        private static readonly RoadNeighborSpec[] RoadNeighbors =
+        private static readonly RoadNeighborSpec[] IsometricRoadNeighbors =
         {
             // Isometric Grid cell axes mapped to the visual diamond edges.
             new(1, new Vector3Int(-1, 0, 0)), // NW
             new(2, new Vector3Int(0, -1, 0)), // NE
             new(4, new Vector3Int(1, 0, 0)),  // SE
             new(8, new Vector3Int(0, 1, 0)),  // SW
+        };
+
+        private static readonly RoadNeighborSpec[] TopDownRoadNeighbors =
+        {
+            new(1, new Vector3Int(0, 1, 0)),  // N
+            new(2, new Vector3Int(1, 0, 0)),  // E
+            new(4, new Vector3Int(0, -1, 0)), // S
+            new(8, new Vector3Int(-1, 0, 0)), // W
         };
 
         static TerrainBlendImporter()
@@ -54,7 +84,17 @@ namespace TilemapGenerator.TerrainBlend.Editor
                 return;
             }
 
-            var manifestGuids = AssetDatabase.FindAssets("tilemap-assets", new[] { "Assets/TilemapGenerator" });
+            var deletedManifestPaths = PendingDeletedManifestPaths.ToArray();
+            PendingDeletedManifestPaths.Clear();
+            foreach (var deletedManifestPath in deletedManifestPaths)
+            {
+                CleanupDeletedManifest(deletedManifestPath);
+            }
+            CleanupOrphanGeneratedOwnership();
+
+            // The Unity integration may be exported to any chosen directory
+            // below Assets, so discover manifests across the whole project.
+            var manifestGuids = AssetDatabase.FindAssets("tilemap-assets", new[] { "Assets" });
             foreach (var guid in manifestGuids)
             {
                 var manifestPath = AssetDatabase.GUIDToAssetPath(guid);
@@ -70,25 +110,130 @@ namespace TilemapGenerator.TerrainBlend.Editor
             EditorApplication.delayCall += RebuildAll;
         }
 
+        internal static void ScheduleDeletedManifestCleanup(string deletedManifestPath)
+        {
+            PendingDeletedManifestPaths.Add(NormalizeAssetPath(deletedManifestPath));
+            ScheduleRebuild();
+        }
+
+        internal static void CleanupDeletedManifest(string deletedManifestPath)
+        {
+            var manifestPath = NormalizeAssetPath(deletedManifestPath);
+            if (!IsSafeManifestAssetPath(manifestPath)) return;
+            // A failed external export can remove and restore the manifest before
+            // this delayed cleanup runs. In that case the delivery is still live.
+            if (File.Exists(manifestPath) || AssetDatabase.AssetPathExists(manifestPath)) return;
+            var exportRoot = NormalizeAssetPath(Path.GetDirectoryName(manifestPath) ?? "Assets");
+            var generatedRoot = $"{exportRoot}/Generated";
+            var ownershipPath = $"{generatedRoot}/{GeneratedOwnershipFileName}";
+            if (!TryReadGeneratedOwnership(
+                generatedRoot,
+                ownershipPath,
+                manifestPath,
+                null,
+                out var ownership)
+                || ownership == null) return;
+            CleanupGeneratedOwnership(
+                generatedRoot,
+                ownershipPath,
+                manifestPath,
+                ownership.projectId,
+                ownership);
+            AssetDatabase.SaveAssets();
+        }
+
+        private static void CleanupOrphanGeneratedOwnership()
+        {
+            var changed = false;
+            var ownershipGuids = AssetDatabase.FindAssets(
+                "tilemap-generated-ownership",
+                new[] { "Assets" });
+            foreach (var guid in ownershipGuids)
+            {
+                var ownershipPath = NormalizeAssetPath(AssetDatabase.GUIDToAssetPath(guid));
+                if (Path.GetFileName(ownershipPath) != GeneratedOwnershipFileName) continue;
+                var generatedRoot = NormalizeAssetPath(Path.GetDirectoryName(ownershipPath) ?? "Assets");
+                if (!TryReadGeneratedOwnership(
+                    generatedRoot,
+                    ownershipPath,
+                    null,
+                    null,
+                    out var ownership)
+                    || ownership == null) continue;
+                // The manifest can disappear only briefly during an atomic external
+                // replacement or rollback. Delayed cleanup must preserve its Generated
+                // assets (and their Unity GUIDs) once the exact path exists again.
+                if (File.Exists(ownership.manifestPath)
+                    || AssetDatabase.AssetPathExists(ownership.manifestPath)) continue;
+                CleanupGeneratedOwnership(
+                    generatedRoot,
+                    ownershipPath,
+                    ownership.manifestPath,
+                    ownership.projectId,
+                    ownership);
+                changed = true;
+            }
+            if (changed) AssetDatabase.SaveAssets();
+        }
+
         private static void BuildManifest(string manifestPath)
         {
             var textAsset = AssetDatabase.LoadAssetAtPath<TextAsset>(manifestPath);
             if (textAsset == null) return;
             var manifest = JsonUtility.FromJson<ExportManifest>(textAsset.text);
-            if (manifest == null || manifest.schemaVersion < 6 || manifest.assets == null) return;
+            if (manifest == null
+                || manifest.schemaVersion != 8
+                || manifest.project == null
+                || !Guid.TryParse(manifest.project.id, out _)
+                || (manifest.project.projection != "isometric"
+                    && manifest.project.projection != "top_down")
+                || manifest.tile == null
+                || manifest.tile.widthPx <= 0
+                || manifest.tile.heightPx <= 0
+                || manifest.tile.pixelsPerUnit <= 0
+                || manifest.managedFiles == null
+                || manifest.assets == null
+                || !HasSafeOwnedPaths(manifest)) return;
+            var isTopDown = manifest.project.projection == "top_down";
 
-            var exportRoot = NormalizeAssetPath(Path.GetDirectoryName(manifestPath) ?? "Assets/TilemapGenerator");
+            var exportRoot = NormalizeAssetPath(Path.GetDirectoryName(manifestPath) ?? "Assets");
             var generatedRoot = $"{exportRoot}/Generated";
             var terrainRoot = $"{generatedRoot}/Terrains";
             var buildingRoot = $"{generatedRoot}/Buildings";
             var roadRoot = $"{generatedRoot}/Roads";
+            var ownershipPath = $"{generatedRoot}/{GeneratedOwnershipFileName}";
+            if (!TryReadGeneratedOwnership(
+                generatedRoot,
+                ownershipPath,
+                manifestPath,
+                manifest.project.id,
+                out var existingOwnership)) return;
+            var desiredGeneratedFiles = PlannedGeneratedFiles(manifest);
+            if (desiredGeneratedFiles.Count == 0)
+            {
+                CleanupGeneratedOwnership(
+                    generatedRoot,
+                    ownershipPath,
+                    manifestPath,
+                    manifest.project.id,
+                    existingOwnership);
+                return;
+            }
+            var provisionalOwnership = new HashSet<string>(desiredGeneratedFiles, StringComparer.Ordinal);
+            if (existingOwnership != null) provisionalOwnership.UnionWith(existingOwnership.managedFiles);
+            WriteGeneratedOwnership(
+                generatedRoot,
+                ownershipPath,
+                manifestPath,
+                manifest.project.id,
+                provisionalOwnership);
             EnsureFolder(terrainRoot);
             EnsureFolder(buildingRoot);
             EnsureFolder(roadRoot);
 
             var terrainDefinitions = new List<TerrainBlendDefinition>();
             var buildingDefinitions = new List<BuildingDefinition>();
-            var roadTiles = new List<IsometricRuleTile>();
+            var roadTiles = new List<RuleTile>();
             foreach (var asset in manifest.assets)
             {
                 if (asset.terrainBlend != null
@@ -97,19 +242,34 @@ namespace TilemapGenerator.TerrainBlend.Editor
                     && !string.IsNullOrWhiteSpace(asset.terrainBlend.wallFile))
                 {
                     var terrainDefinition = BuildTerrain(exportRoot, terrainRoot, manifest.tile, asset);
-                    if (terrainDefinition != null) terrainDefinitions.Add(terrainDefinition);
+                    if (terrainDefinition == null)
+                    {
+                        Debug.LogError($"Tilemap Generator: nie udało się zbudować terenu {asset.id}.");
+                        return;
+                    }
+                    terrainDefinitions.Add(terrainDefinition);
                 }
 
                 if (asset.category == "building" && !string.IsNullOrWhiteSpace(asset.file))
                 {
                     var buildingDefinition = BuildBuilding(exportRoot, buildingRoot, manifest.tile, asset);
-                    if (buildingDefinition != null) buildingDefinitions.Add(buildingDefinition);
+                    if (buildingDefinition == null)
+                    {
+                        Debug.LogError($"Tilemap Generator: nie udało się zbudować budynku {asset.id}.");
+                        return;
+                    }
+                    buildingDefinitions.Add(buildingDefinition);
                 }
 
                 if (asset.category == "road_tile" && asset.roadVariants?.Length == 16)
                 {
-                    var roadTile = BuildRoad(exportRoot, roadRoot, manifest.tile, asset);
-                    if (roadTile != null) roadTiles.Add(roadTile);
+                    var roadTile = BuildRoad(exportRoot, roadRoot, manifest.tile, asset, isTopDown);
+                    if (roadTile == null)
+                    {
+                        Debug.LogError($"Tilemap Generator: nie udało się zbudować drogi {asset.id}.");
+                        return;
+                    }
+                    roadTiles.Add(roadTile);
                 }
             }
 
@@ -121,7 +281,7 @@ namespace TilemapGenerator.TerrainBlend.Editor
             var buildingSet = LoadOrCreate<BuildingSet>(buildingSetPath, out _);
             buildingSet.ConfigureGenerated(buildingDefinitions);
             EditorUtility.SetDirty(buildingSet);
-            BuildBuildingPalette(generatedRoot, manifest.tile, buildingDefinitions);
+            BuildBuildingPalette(generatedRoot, manifest.tile, buildingDefinitions, isTopDown);
             var supportTilePath = $"{generatedRoot}/TerrainBlendSupportTile.asset";
             var supportTile = LoadOrCreate<TerrainBlendSupportTile>(supportTilePath, out _);
             supportTile.name = "TerrainBlendSupportTile";
@@ -134,8 +294,26 @@ namespace TilemapGenerator.TerrainBlend.Editor
                 terrainSet,
                 supportTile,
                 buildingSet,
-                roadTiles.Count > 0);
+                roadTiles.Count > 0,
+                isTopDown);
             AssetDatabase.SaveAssets();
+            if (desiredGeneratedFiles.Any(relativePath => (
+                !AssetDatabase.AssetPathExists($"{generatedRoot}/{relativePath}")
+            )))
+            {
+                Debug.LogError("Tilemap Generator: nie utworzono kompletnego zestawu plików Generated; zachowano poprzedni inventory.");
+                return;
+            }
+            var retainedOwnership = CleanupStaleGeneratedFiles(
+                generatedRoot,
+                existingOwnership,
+                desiredGeneratedFiles);
+            WriteGeneratedOwnership(
+                generatedRoot,
+                ownershipPath,
+                manifestPath,
+                manifest.project.id,
+                retainedOwnership);
             RefreshLoadedMaps(terrainSet);
             RefreshLoadedBuildingMaps(buildingSet);
         }
@@ -262,11 +440,12 @@ namespace TilemapGenerator.TerrainBlend.Editor
         private static void BuildBuildingPalette(
             string generatedRoot,
             TileSettings tile,
-            IReadOnlyList<BuildingDefinition> buildings)
+            IReadOnlyList<BuildingDefinition> buildings,
+            bool isTopDown)
         {
             var paletteRoot = $"{generatedRoot}/Palettes";
             var palettePath = $"{paletteRoot}/Buildings.prefab";
-            if (buildings.Count == 0 && !AssetDatabase.AssetPathExists(palettePath)) return;
+            if (buildings.Count == 0) return;
             EnsureFolder(paletteRoot);
 
             if (!AssetDatabase.AssetPathExists(palettePath))
@@ -274,7 +453,7 @@ namespace TilemapGenerator.TerrainBlend.Editor
                 GridPaletteUtility.CreateNewPalette(
                     paletteRoot,
                     "Buildings",
-                    GridLayout.CellLayout.Isometric,
+                    isTopDown ? GridLayout.CellLayout.Rectangle : GridLayout.CellLayout.Isometric,
                     GridPalette.CellSizing.Manual,
                     new Vector3(
                         tile.widthPx / (float)tile.pixelsPerUnit,
@@ -287,6 +466,17 @@ namespace TilemapGenerator.TerrainBlend.Editor
             var paletteContents = PrefabUtility.LoadPrefabContents(palettePath);
             try
             {
+                var grid = paletteContents.GetComponentInChildren<Grid>();
+                if (grid != null)
+                {
+                    grid.cellLayout = isTopDown
+                        ? GridLayout.CellLayout.Rectangle
+                        : GridLayout.CellLayout.Isometric;
+                    grid.cellSize = new Vector3(
+                        tile.widthPx / (float)tile.pixelsPerUnit,
+                        tile.heightPx / (float)tile.pixelsPerUnit,
+                        1f);
+                }
                 var tilemap = paletteContents.GetComponentInChildren<Tilemap>();
                 if (tilemap == null) return;
                 tilemap.ClearAllTiles();
@@ -304,11 +494,12 @@ namespace TilemapGenerator.TerrainBlend.Editor
             }
         }
 
-        private static IsometricRuleTile BuildRoad(
+        private static RuleTile BuildRoad(
             string exportRoot,
             string roadRoot,
             TileSettings tileSettings,
-            TerrainAsset road)
+            TerrainAsset road,
+            bool isTopDown)
         {
             var sprites = new Dictionary<int, Sprite>();
             var pivotData = road.pivotNormalized;
@@ -330,16 +521,20 @@ namespace TilemapGenerator.TerrainBlend.Editor
             var assetDirectory = $"{roadRoot}/{road.id}";
             EnsureFolder(assetDirectory);
             var ruleTilePath = $"{assetDirectory}/RoadRuleTile.asset";
-            var ruleTile = LoadOrCreate<IsometricRuleTile>(ruleTilePath, out _);
-            ConfigureRoadRuleTile(ruleTile, sprites);
+            var ruleTile = LoadOrCreateRoadRuleTile(ruleTilePath, isTopDown);
+            ConfigureRoadRuleTile(
+                ruleTile,
+                sprites,
+                isTopDown ? TopDownRoadNeighbors : IsometricRoadNeighbors);
             ruleTile.name = string.IsNullOrWhiteSpace(road.name) ? "RoadRuleTile" : road.name;
             EditorUtility.SetDirty(ruleTile);
             return ruleTile;
         }
 
         private static void ConfigureRoadRuleTile(
-            IsometricRuleTile ruleTile,
-            IReadOnlyDictionary<int, Sprite> sprites)
+            RuleTile ruleTile,
+            IReadOnlyDictionary<int, Sprite> sprites,
+            IReadOnlyList<RoadNeighborSpec> roadNeighbors)
         {
             ruleTile.m_DefaultSprite = sprites[0];
             ruleTile.m_DefaultColliderType = Tile.ColliderType.None;
@@ -356,7 +551,7 @@ namespace TilemapGenerator.TerrainBlend.Editor
                 };
                 rule.m_Neighbors.Clear();
                 rule.m_NeighborPositions.Clear();
-                foreach (var neighbor in RoadNeighbors)
+                foreach (var neighbor in roadNeighbors)
                 {
                     rule.m_NeighborPositions.Add(neighbor.Position);
                     rule.m_Neighbors.Add((pair.Key & neighbor.Bit) != 0
@@ -484,7 +679,8 @@ namespace TilemapGenerator.TerrainBlend.Editor
             TerrainBlendSet terrainSet,
             TerrainBlendSupportTile supportTile,
             BuildingSet buildingSet,
-            bool includeRoadTilemap)
+            bool includeRoadTilemap,
+            bool isTopDown)
         {
             var prefabDirectory = $"{generatedRoot}/Prefabs";
             EnsureFolder(prefabDirectory);
@@ -492,7 +688,9 @@ namespace TilemapGenerator.TerrainBlend.Editor
             try
             {
                 var grid = root.GetComponent<Grid>();
-                grid.cellLayout = GridLayout.CellLayout.Isometric;
+                grid.cellLayout = isTopDown
+                    ? GridLayout.CellLayout.Rectangle
+                    : GridLayout.CellLayout.Isometric;
                 grid.cellSize = new Vector3(
                     tile.widthPx / (float)tile.pixelsPerUnit,
                     tile.heightPx / (float)tile.pixelsPerUnit,
@@ -585,6 +783,17 @@ namespace TilemapGenerator.TerrainBlend.Editor
             return asset;
         }
 
+        private static RuleTile LoadOrCreateRoadRuleTile(string assetPath, bool isTopDown)
+        {
+            var existing = AssetDatabase.LoadAssetAtPath<RuleTile>(assetPath);
+            var hasExpectedType = existing != null && (isTopDown
+                ? existing.GetType() == typeof(RuleTile)
+                : existing.GetType() == typeof(IsometricRuleTile));
+            if (existing != null && !hasExpectedType) AssetDatabase.DeleteAsset(assetPath);
+            if (isTopDown) return LoadOrCreate<RuleTile>(assetPath, out _);
+            return LoadOrCreate<IsometricRuleTile>(assetPath, out _);
+        }
+
         private static bool HasMissingScript(ScriptableObject asset)
         {
             var scriptProperty = new SerializedObject(asset).FindProperty("m_Script");
@@ -605,9 +814,300 @@ namespace TilemapGenerator.TerrainBlend.Editor
             }
         }
 
+        private static HashSet<string> PlannedGeneratedFiles(ExportManifest manifest)
+        {
+            var planned = new HashSet<string>(StringComparer.Ordinal);
+            var hasBuilding = false;
+            foreach (var asset in manifest.assets)
+            {
+                if (asset.terrainBlend != null
+                    && !string.IsNullOrWhiteSpace(asset.file)
+                    && !string.IsNullOrWhiteSpace(asset.terrainBlend.atlasFile)
+                    && !string.IsNullOrWhiteSpace(asset.terrainBlend.wallFile))
+                {
+                    foreach (var fileName in TerrainGeneratedFileNames)
+                    {
+                        planned.Add($"Terrains/{asset.id}/{fileName}");
+                    }
+                }
+                if (asset.category == "building" && !string.IsNullOrWhiteSpace(asset.file))
+                {
+                    hasBuilding = true;
+                    foreach (var fileName in BuildingGeneratedFileNames)
+                    {
+                        planned.Add($"Buildings/{asset.id}/{fileName}");
+                    }
+                }
+                if (asset.category == "road_tile" && asset.roadVariants?.Length == 16)
+                {
+                    planned.Add($"Roads/{asset.id}/RoadRuleTile.asset");
+                }
+            }
+            if (planned.Count == 0) return planned;
+            planned.UnionWith(FixedGeneratedFiles);
+            if (hasBuilding) planned.Add("Palettes/Buildings.prefab");
+            return planned;
+        }
+
+        private static bool TryReadGeneratedOwnership(
+            string generatedRoot,
+            string ownershipPath,
+            string expectedManifestPath,
+            string expectedProjectId,
+            out GeneratedOwnership ownership)
+        {
+            ownership = null;
+            if (!File.Exists(ownershipPath))
+            {
+                if (!HasUnownedGeneratedContent(generatedRoot)) return true;
+                Debug.LogError(
+                    $"Tilemap Generator: {generatedRoot} zawiera pliki bez poprawnego inventory własności. Cleanup i przebudowa zostały zablokowane.");
+                return false;
+            }
+            try
+            {
+                ownership = JsonUtility.FromJson<GeneratedOwnership>(File.ReadAllText(ownershipPath));
+            }
+            catch (Exception exception)
+            {
+                Debug.LogError($"Tilemap Generator: inventory {ownershipPath} jest nieczytelne: {exception.Message}");
+                ownership = null;
+                return false;
+            }
+            if (ownership == null
+                || ownership.schemaVersion != GeneratedOwnershipSchemaVersion
+                || ownership.owner != "tilemap-generator-unity-importer"
+                || !Guid.TryParse(ownership.projectId, out _)
+                || !IsSafeManifestAssetPath(ownership.manifestPath)
+                || ownershipPath != $"{NormalizeAssetPath(Path.GetDirectoryName(ownership.manifestPath) ?? "Assets")}/Generated/{GeneratedOwnershipFileName}"
+                || (expectedManifestPath != null && ownership.manifestPath != expectedManifestPath)
+                || (expectedProjectId != null && ownership.projectId != expectedProjectId)
+                || ownership.managedFiles == null
+                || ownership.managedFiles.Any(relativePath => !IsSafeGeneratedRelativePath(relativePath))
+                || ownership.managedFiles.Distinct(StringComparer.Ordinal).Count() != ownership.managedFiles.Length)
+            {
+                Debug.LogError(
+                    $"Tilemap Generator: inventory {ownershipPath} nie potwierdza własności bieżącego manifestu. Cleanup i przebudowa zostały zablokowane.");
+                ownership = null;
+                return false;
+            }
+            return true;
+        }
+
+        private static bool HasUnownedGeneratedContent(string generatedRoot)
+        {
+            if (!Directory.Exists(generatedRoot)) return false;
+            try
+            {
+                return Directory.EnumerateFiles(generatedRoot, "*", SearchOption.AllDirectories)
+                    .Any(filePath => !filePath.EndsWith(".meta", StringComparison.OrdinalIgnoreCase));
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        private static void WriteGeneratedOwnership(
+            string generatedRoot,
+            string ownershipPath,
+            string manifestPath,
+            string projectId,
+            IEnumerable<string> managedFiles)
+        {
+            EnsureFolder(generatedRoot);
+            var ownership = new GeneratedOwnership
+            {
+                schemaVersion = GeneratedOwnershipSchemaVersion,
+                owner = "tilemap-generator-unity-importer",
+                projectId = projectId,
+                manifestPath = manifestPath,
+                managedFiles = managedFiles.OrderBy(pathValue => pathValue, StringComparer.Ordinal).ToArray(),
+            };
+            File.WriteAllText(ownershipPath, JsonUtility.ToJson(ownership, true));
+            AssetDatabase.ImportAsset(ownershipPath, ImportAssetOptions.ForceUpdate);
+        }
+
+        private static HashSet<string> CleanupStaleGeneratedFiles(
+            string generatedRoot,
+            GeneratedOwnership existingOwnership,
+            HashSet<string> desiredFiles)
+        {
+            var retained = new HashSet<string>(desiredFiles, StringComparer.Ordinal);
+            if (existingOwnership == null) return retained;
+            var removed = new List<string>();
+            foreach (var relativePath in existingOwnership.managedFiles)
+            {
+                if (desiredFiles.Contains(relativePath)) continue;
+                if (DeleteOwnedGeneratedFile(generatedRoot, relativePath)) removed.Add(relativePath);
+                else retained.Add(relativePath);
+            }
+            CleanupEmptyGeneratedDirectories(generatedRoot, removed, false);
+            return retained;
+        }
+
+        private static void CleanupGeneratedOwnership(
+            string generatedRoot,
+            string ownershipPath,
+            string manifestPath,
+            string projectId,
+            GeneratedOwnership ownership)
+        {
+            if (ownership == null) return;
+            var remaining = new HashSet<string>(StringComparer.Ordinal);
+            var removed = new List<string>();
+            foreach (var relativePath in ownership.managedFiles)
+            {
+                if (DeleteOwnedGeneratedFile(generatedRoot, relativePath)) removed.Add(relativePath);
+                else remaining.Add(relativePath);
+            }
+            if (remaining.Count > 0)
+            {
+                WriteGeneratedOwnership(
+                    generatedRoot,
+                    ownershipPath,
+                    manifestPath,
+                    projectId,
+                    remaining);
+                CleanupEmptyGeneratedDirectories(generatedRoot, removed, false);
+                return;
+            }
+            if (AssetDatabase.AssetPathExists(ownershipPath)) AssetDatabase.DeleteAsset(ownershipPath);
+            CleanupEmptyGeneratedDirectories(generatedRoot, removed, true);
+        }
+
+        private static bool DeleteOwnedGeneratedFile(string generatedRoot, string relativePath)
+        {
+            if (!IsSafeGeneratedRelativePath(relativePath)) return false;
+            var assetPath = $"{generatedRoot}/{relativePath}";
+            if (!AssetDatabase.AssetPathExists(assetPath)) return true;
+            return AssetDatabase.DeleteAsset(assetPath) && !AssetDatabase.AssetPathExists(assetPath);
+        }
+
+        private static void CleanupEmptyGeneratedDirectories(
+            string generatedRoot,
+            IEnumerable<string> removedFiles,
+            bool includeGeneratedRoot)
+        {
+            var directories = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var relativePath in removedFiles)
+            {
+                var current = NormalizeAssetPath(Path.GetDirectoryName($"{generatedRoot}/{relativePath}") ?? generatedRoot);
+                while (current.StartsWith($"{generatedRoot}/", StringComparison.Ordinal))
+                {
+                    directories.Add(current);
+                    current = NormalizeAssetPath(Path.GetDirectoryName(current) ?? generatedRoot);
+                }
+            }
+            if (includeGeneratedRoot) directories.Add(generatedRoot);
+            foreach (var directoryPath in directories.OrderByDescending(pathValue => pathValue.Count(character => character == '/')))
+            {
+                if (!AssetDatabase.IsValidFolder(directoryPath) || !IsAssetDirectoryEmpty(directoryPath)) continue;
+                AssetDatabase.DeleteAsset(directoryPath);
+            }
+        }
+
+        private static bool IsAssetDirectoryEmpty(string assetDirectory)
+        {
+            if (!Directory.Exists(assetDirectory)) return true;
+            try
+            {
+                return !Directory.EnumerateFileSystemEntries(assetDirectory)
+                    .Any(entry => !entry.EndsWith(".meta", StringComparison.OrdinalIgnoreCase));
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsSafeGeneratedRelativePath(string relativePath)
+        {
+            if (string.IsNullOrWhiteSpace(relativePath)
+                || relativePath.IndexOf('\0') >= 0
+                || relativePath.Contains("\\")
+                || relativePath.Contains(":")
+                || relativePath.StartsWith("/", StringComparison.Ordinal)
+                || relativePath.EndsWith(".meta", StringComparison.OrdinalIgnoreCase)) return false;
+            var segments = relativePath.Split('/');
+            if (segments.Any(segment => (
+                string.IsNullOrEmpty(segment) || segment == "." || segment == ".."
+            ))) return false;
+            if (FixedGeneratedFiles.Contains(relativePath)
+                || relativePath == "Palettes/Buildings.prefab") return true;
+            if (segments.Length != 3 || !Guid.TryParse(segments[1], out _)) return false;
+            if (segments[0] == "Terrains") return TerrainGeneratedFileNames.Contains(segments[2]);
+            if (segments[0] == "Buildings") return BuildingGeneratedFileNames.Contains(segments[2]);
+            return segments[0] == "Roads" && segments[2] == "RoadRuleTile.asset";
+        }
+
+        private static bool IsSafeManifestAssetPath(string manifestPath)
+        {
+            if (string.IsNullOrWhiteSpace(manifestPath)
+                || manifestPath.IndexOf('\0') >= 0
+                || manifestPath.Contains("\\")
+                || manifestPath.Contains(":")
+                || !manifestPath.StartsWith("Assets/", StringComparison.Ordinal)
+                || Path.GetFileName(manifestPath) != ManifestFileName) return false;
+            var segments = manifestPath.Split('/');
+            return segments.Length >= 2
+                && segments[0] == "Assets"
+                && !segments.Any(segment => (
+                    string.IsNullOrEmpty(segment) || segment == "." || segment == ".."
+                ));
+        }
+
         private static string ResolveAssetPath(string root, string relativePath)
         {
-            return NormalizeAssetPath($"{root}/{relativePath.TrimStart('/', '\\')}");
+            return NormalizeAssetPath($"{root}/{relativePath}");
+        }
+
+        private static bool HasSafeOwnedPaths(ExportManifest manifest)
+        {
+            var managedFiles = new HashSet<string>(manifest.managedFiles, StringComparer.Ordinal);
+            if (!managedFiles.Contains(ManifestFileName)
+                || managedFiles.Any(pathValue => !IsSafeManagedPath(pathValue))) return false;
+
+            foreach (var asset in manifest.assets)
+            {
+                if (asset == null
+                    || !Guid.TryParse(asset.id, out _)
+                    || !Guid.TryParse(asset.versionId, out _)) return false;
+                if (!IsOwnedAssetPath(asset.file, managedFiles, asset.category == "road_tile")) return false;
+                if (asset.terrainBlend != null
+                    && (!IsOwnedAssetPath(asset.terrainBlend.atlasFile, managedFiles, false)
+                        || !IsOwnedAssetPath(asset.terrainBlend.wallFile, managedFiles, false))) return false;
+                if (asset.roadVariants == null) continue;
+                if (asset.roadVariants.Any(variant => (
+                    variant == null || !IsOwnedAssetPath(variant.file, managedFiles, false)
+                ))) return false;
+            }
+            return true;
+        }
+
+        private static bool IsOwnedAssetPath(
+            string pathValue,
+            HashSet<string> managedFiles,
+            bool allowEmpty)
+        {
+            return (allowEmpty && string.IsNullOrEmpty(pathValue))
+                || (IsSafeManagedPath(pathValue) && managedFiles.Contains(pathValue));
+        }
+
+        private static bool IsSafeManagedPath(string pathValue)
+        {
+            if (string.IsNullOrWhiteSpace(pathValue)
+                || pathValue.IndexOf('\0') >= 0
+                || pathValue.Contains("\\")
+                || pathValue.Contains(":")
+                || pathValue.StartsWith("/", StringComparison.Ordinal)
+                || pathValue.EndsWith(".meta", StringComparison.OrdinalIgnoreCase)) return false;
+            var segments = pathValue.Split('/');
+            if (segments.Any(segment => (
+                string.IsNullOrEmpty(segment) || segment == "." || segment == ".."
+            ))) return false;
+            return !string.Equals(segments[0], "Generated", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(segments[0], "TilemapGeneratorIntegration", StringComparison.OrdinalIgnoreCase);
         }
 
         private static string NormalizeAssetPath(string pathValue)
@@ -664,8 +1164,27 @@ namespace TilemapGenerator.TerrainBlend.Editor
         private sealed class ExportManifest
         {
             public int schemaVersion;
+            public string[] managedFiles;
+            public ProjectSettings project;
             public TileSettings tile;
             public TerrainAsset[] assets;
+        }
+
+        [Serializable]
+        private sealed class GeneratedOwnership
+        {
+            public int schemaVersion;
+            public string owner;
+            public string projectId;
+            public string manifestPath;
+            public string[] managedFiles;
+        }
+
+        [Serializable]
+        private sealed class ProjectSettings
+        {
+            public string id;
+            public string projection;
         }
 
         [Serializable]
@@ -748,7 +1267,14 @@ namespace TilemapGenerator.TerrainBlend.Editor
             string[] movedAssets,
             string[] movedFromAssetPaths)
         {
-            if (importedAssets.Any(path => Path.GetFileName(path) == "tilemap-assets.json"))
+            foreach (var deletedManifest in deletedAssets
+                .Concat(movedFromAssetPaths)
+                .Where(path => Path.GetFileName(path) == "tilemap-assets.json"))
+            {
+                TerrainBlendImporter.ScheduleDeletedManifestCleanup(deletedManifest);
+            }
+            if (importedAssets.Concat(movedAssets)
+                .Any(path => Path.GetFileName(path) == "tilemap-assets.json"))
             {
                 TerrainBlendImporter.ScheduleRebuild();
             }

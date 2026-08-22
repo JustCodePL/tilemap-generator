@@ -99,7 +99,7 @@ namespace TilemapGenerator.Buildings.Editor
 
         private BuildingPlacementBrush Brush => (BuildingPlacementBrush)target;
 
-        public override string tooltip => "Places generated building prefabs on their shared isometric Grid and reserves their complete footprint.";
+        public override string tooltip => "Places generated building prefabs on their shared project Grid and reserves their complete footprint.";
 
         public override bool canChangeZPosition
         {
@@ -225,13 +225,21 @@ namespace TilemapGenerator.Buildings.Editor
                 var center = gridLayout.LocalToWorld(
                     gridLayout.CellToLocalInterpolated(cell)
                     + gridLayout.CellToLocalInterpolated(new Vector3(0.5f, 0.5f, 0f)));
-                var points = new[]
-                {
-                    center - right,
-                    center + up,
-                    center + right,
-                    center - up,
-                };
+                var points = gridLayout.cellLayout == GridLayout.CellLayout.Rectangle
+                    ? new[]
+                    {
+                        center - right - up,
+                        center - right + up,
+                        center + right + up,
+                        center + right - up,
+                    }
+                    : new[]
+                    {
+                        center - right,
+                        center + up,
+                        center + right,
+                        center - up,
+                    };
                 Handles.color = fill;
                 Handles.DrawAAConvexPolygon(points);
                 Handles.color = outline;

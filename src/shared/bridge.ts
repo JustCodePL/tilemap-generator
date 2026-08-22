@@ -6,8 +6,11 @@ import type {
   ComfyUiHealth,
   CreateProjectInput,
   EnqueueGenerationInput,
+  ExportIntegration,
+  ExportIntegrationDescriptor,
   ExportPreview,
   ExportPreviewInput,
+  ExportRunResult,
   GenerationEvent,
   GenerationJob,
   GenerationLogEntry,
@@ -29,6 +32,7 @@ import type {
 
 export const ipcChannels = {
   projectCreate: 'projects:create',
+  projectChooseStorage: 'projects:choose-storage',
   projectOpen: 'projects:open',
   projectOpenRecent: 'projects:open-recent',
   projectCurrent: 'projects:current',
@@ -59,6 +63,7 @@ export const ipcChannels = {
   styleRestore: 'style:restore',
   styleRebuild: 'style:rebuild',
   exportChooseTarget: 'export:choose-target',
+  exportIntegrations: 'export:integrations',
   exportPreview: 'export:preview',
   exportRun: 'export:run',
   codexHealth: 'codex:health',
@@ -76,7 +81,8 @@ export const ipcChannels = {
 
 export interface TilemapGeneratorApi {
   projects: {
-    create(input: CreateProjectInput): Promise<ProjectInfo | null>;
+    chooseStorageDirectory(): Promise<string | null>;
+    create(input: CreateProjectInput, storageDirectory: string): Promise<ProjectInfo>;
     open(): Promise<ProjectInfo | null>;
     openRecent(rootPath: string): Promise<ProjectInfo>;
     current(): Promise<ProjectInfo | null>;
@@ -116,9 +122,10 @@ export interface TilemapGeneratorApi {
     rebuild(): Promise<void>;
   };
   export: {
-    chooseTarget(): Promise<string | null>;
+    listIntegrations(): Promise<ExportIntegrationDescriptor[]>;
+    chooseTarget(integration: ExportIntegration): Promise<string | null>;
     preview(input: ExportPreviewInput): Promise<ExportPreview>;
-    run(token: string): Promise<{ exported: number; manifestPath: string }>;
+    run(token: string): Promise<ExportRunResult>;
   };
   codex: {
     health(): Promise<CodexHealth>;

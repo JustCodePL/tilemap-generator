@@ -33,11 +33,13 @@ import type {
   AssetVersion,
   CodexHealth,
   ComfyUiHealth,
+  ExportIntegration,
   ExportPreview,
   GenerationJob,
   GenerationLogEntry,
   GenerationMode,
   ProjectInfo,
+  ProjectProjection,
   ProjectReference,
   ProjectSettingsProposal,
   RecentProject,
@@ -53,8 +55,10 @@ import {
   assetPixelSize,
   defaultAssetSizing,
   isRelativeSizeCategory,
+  isRoadAssetCategory,
   isTileAssetCategory,
   roadVariantLabel,
+  tileHeightForProjection,
 } from '../../shared/domain';
 
 type View = 'project' | 'generate' | 'export' | 'diagnostics';
@@ -69,6 +73,17 @@ const statusLabels: Record<VersionStatus, string> = {
   queued: 'W kolejce', generating: 'Generowanie', needs_review: 'Do weryfikacji', approved: 'Zatwierdzony',
   rejected: 'Odrzucony', failed: 'Błąd', cancelled: 'Anulowany', interrupted: 'Przerwany',
 };
+
+const projectionLabels: Record<ProjectProjection, string> = {
+  isometric: 'Izometryczna 2:1',
+  top_down: 'Top-down 1:1',
+};
+
+function assetCategoriesForProjection(projection: ProjectProjection): readonly AssetCategory[] {
+  return projection === 'top_down'
+    ? assetCategories.filter((category) => category !== 'elevated_tile')
+    : assetCategories;
+}
 
 export function App() {
   const queryClient = useQueryClient();
@@ -121,15 +136,28 @@ function Welcome({ onOpened }: { onOpened: (project: ProjectInfo) => void }) {
   const queryClient = useQueryClient();
   const [name, setName] = useState('Nowy świat');
   const [artBrief, setArtBrief] = useState('');
+  const [projection, setProjection] = useState<ProjectProjection>('isometric');
   const [width, setWidth] = useState(256);
+  const [storageDirectory, setStorageDirectory] = useState('');
   const [error, setError] = useState('');
   const recents = useQuery({ queryKey: ['recents'], queryFn: () => window.tilemap.projects.recents() });
+  const chooseStorageDirectory = useMutation({
+    mutationFn: () => window.tilemap.projects.chooseStorageDirectory(),
+    onSuccess: (path) => {
+      if (path) {
+        setStorageDirectory(path);
+        setError('');
+      }
+    },
+    onError: (reason) => setError(errorMessage(reason)),
+  });
   const create = useMutation({
     mutationFn: () => window.tilemap.projects.create({
       name,
       artBrief,
+      projection,
       tileWidthPx: width,
-    }),
+    }, storageDirectory),
     onSuccess: (project) => project && onOpened(project),
     onError: (reason) => setError(errorMessage(reason)),
   });
@@ -160,10 +188,10 @@ function Welcome({ onOpened }: { onOpened: (project: ProjectInfo) => void }) {
         <div className="brand-mark"><Layers3 size={28} /></div>
         <p className="eyebrow">TILEMAP GENERATOR</p>
         <h1>Spójny świat,<br /><span>asset po assecie.</span></h1>
-        <p className="lede">Lokalne studio generowania izometrycznych assetów. Codex i ComfyUI tworzą warianty, Ty wybierasz preferowany, registry pilnuje historii.</p>
+        <p className="lede">Lokalne studio generowania assetów izometrycznych i top-down. Codex i ComfyUI tworzą warianty, Ty wybierasz preferowany, registry pilnuje historii.</p>
         <div className="feature-line"><Sparkles size={17} /> Codex + imagegen oraz ComfyUI</div>
         <div className="feature-line"><Archive size={17} /> Pełna historia, bez kasowania odrzuceń</div>
-        <div className="feature-line"><Download size={17} /> Eksport gotowy dla Unity</div>
+        <div className="feature-line"><Download size={17} /> Eksport przez integracje</div>
       </section>
       <section className="welcome-card">
         <div className="card-heading">
@@ -172,13 +200,22 @@ function Welcome({ onOpened }: { onOpened: (project: ProjectInfo) => void }) {
         </div>
         <label>Nazwa projektu<input value={name} onChange={(event) => setName(event.target.value)} /></label>
         <label>Kierunek artystyczny<textarea rows={4} placeholder="Np. ręcznie malowane kamienie, ciepłe światło, czytelne sylwetki…" value={artBrief} onChange={(event) => setArtBrief(event.target.value)} /></label>
+        <label>Projekcja<select value={projection} onChange={(event) => setProjection(event.target.value as ProjectProjection)}><option value="isometric">Izometryczna 2:1</option><option value="top_down">Top-down 1:1</option></select></label>
         <div className="form-grid two">
-          <label>Bazowa szerokość tile (px)<input type="number" min={16} max={4096} step={2} value={width} onChange={(event) => setWidth(Number(event.target.value))} /></label>
-          <label>Wysokość 2:1<input value={`${width / 2}px`} readOnly /></label>
+          <label>Bazowa szerokość tile (px)<input type="number" min={16} max={4096} step={projection === 'isometric' ? 2 : 1} value={width} onChange={(event) => setWidth(Number(event.target.value))} /></label>
+          <label>{projection === 'isometric' ? 'Wysokość 2:1' : 'Wysokość 1:1'}<input value={`${tileHeightForProjection(projection, width)}px`} readOnly /></label>
         </div>
-        {width % 2 !== 0 && <p className="inline-warning"><AlertTriangle size={15} /> Bazowa szerokość musi być parzysta, aby wysokość 2:1 była całkowita.</p>}
+        <div className="directory-picker">
+          <FolderOpen />
+          <div><small>KATALOG BIBLIOTEKI</small><strong title={storageDirectory}>{storageDirectory || 'Nie wybrano'}</strong></div>
+          <button className="secondary" type="button" disabled={chooseStorageDirectory.isPending} onClick={() => chooseStorageDirectory.mutate()}>
+            {chooseStorageDirectory.isPending ? <LoaderCircle className="spin" /> : <FolderOpen />} Wybierz katalog biblioteki
+          </button>
+        </div>
+        <p className="directory-help">Wybierz pusty katalog. Tutaj aplikacja zapisze registry, historię i wszystkie wersje assetów. Miejsce dla zatwierdzonych plików wybierzesz osobno podczas eksportu.</p>
+        {projection === 'isometric' && width % 2 !== 0 && <p className="inline-warning"><AlertTriangle size={15} /> Bazowa szerokość musi być parzysta, aby wysokość 2:1 była całkowita.</p>}
         {error && <ErrorBox message={error} />}
-        <button className="primary wide" disabled={create.isPending || name.trim().length < 2 || width % 2 !== 0} onClick={() => create.mutate()}>
+        <button className="primary wide" disabled={create.isPending || !storageDirectory || name.trim().length < 2 || (projection === 'isometric' && width % 2 !== 0)} onClick={() => create.mutate()}>
           {create.isPending ? <LoaderCircle className="spin" /> : <ImagePlus />} Utwórz projekt
         </button>
         {!!recents.data?.length && <div className="recents"><span>Ostatnie projekty</span>{recents.data.slice(0, 3).map((recent) => <div className="recent-row" key={recent.rootPath}>
@@ -238,7 +275,7 @@ function Workspace(props: {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <button className={`project-title ${props.view === 'project' ? 'active' : ''}`} aria-label={`Strona główna projektu ${props.project.name}`} onClick={() => props.onView('project')}><div className="brand-mark small"><Layers3 size={20} /></div><div><strong>{props.project.name}</strong><span>baza {props.project.tileWidthPx}×{props.project.tileHeightPx}px · 2:1</span></div><ChevronRight /></button>
+        <button className={`project-title ${props.view === 'project' ? 'active' : ''}`} aria-label={`Strona główna projektu ${props.project.name}`} onClick={() => props.onView('project')}><div className="brand-mark small"><Layers3 size={20} /></div><div><strong>{props.project.name}</strong><span>baza {props.project.tileWidthPx}×{props.project.tileHeightPx}px · {props.project.projection === 'isometric' ? '2:1' : '1:1'}</span></div><ChevronRight /></button>
         <nav>
           <button className={props.view === 'generate' ? 'active' : ''} onClick={() => props.onView('generate')}><Sparkles /> Studio</button>
           <button className={props.view === 'export' ? 'active' : ''} onClick={() => props.onView('export')}><Download /> Eksport</button>
@@ -350,12 +387,12 @@ export function ProjectHome({
     || stableDiffusionCppEnabled !== (project.stableDiffusionCppEnabled ?? false);
   const valid = name.trim().length >= 2
     && tileWidth >= 16
-    && tileWidth % 2 === 0
+    && (project.projection === 'top_down' || tileWidth % 2 === 0)
     && pixelsPerUnit >= 1
     && maxConcurrentJobs >= 1
     && maxConcurrentJobs <= 8
     && (codexGenerationEnabled || comfyUiEnabled || stableDiffusionCppEnabled);
-  const tileHeight = tileWidth / 2;
+  const tileHeight = tileHeightForProjection(project.projection, tileWidth);
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -364,16 +401,21 @@ export function ProjectHome({
 
   return <div className="project-page">
     <div className="section-heading">
-      <div><p className="eyebrow">PROJEKT</p><h2>{project.name}</h2><p>Projekt ustala bazową jednostkę 2:1. Typ i skala należą do każdego assetu.</p></div>
-      <div className="project-geometry-summary"><span><Layers3 /></span><div><strong>Bazowy tile</strong><small>{tileWidth}×{tileHeight}px · 2:1</small></div></div>
+      <div><p className="eyebrow">PROJEKT</p><h2>{project.name}</h2><p>Projekt ustala bazową jednostkę {project.projection === 'isometric' ? 'izometryczną 2:1' : 'top-down 1:1'}. Typ i skala należą do każdego assetu.</p></div>
+      <div className="project-geometry-summary"><span><Layers3 /></span><div><strong>Bazowy tile</strong><small>{tileWidth}×{tileHeight}px · {project.projection === 'isometric' ? '2:1' : '1:1'}</small></div></div>
+    </div>
+    <div className="project-library-path" role="note">
+      <FolderOpen />
+      <div><small>KATALOG BIBLIOTEKI</small><strong title={project.rootPath}>{project.rootPath}</strong><span>Registry, historia i wszystkie wersje assetów.</span></div>
     </div>
     <form className="project-settings-card" onSubmit={submit}>
       <div className="settings-section-heading"><div><p className="eyebrow">USTAWIENIA</p><h3>Bazowa jednostka projektu</h3></div><Settings2 /></div>
       <label>Nazwa projektu<input value={name} onChange={(event) => setName(event.target.value)} /></label>
+      <label>Projekcja projektu<input value={projectionLabels[project.projection]} readOnly /></label>
       <label>Kierunek artystyczny<textarea rows={5} value={artBrief} onChange={(event) => setArtBrief(event.target.value)} placeholder="Paleta, materiały, oświetlenie i reguły stylu projektu…" /></label>
       <div className="form-grid three">
-        <label>Bazowa szerokość tile (px)<input type="number" min={16} max={4096} step={2} value={tileWidth} onChange={(event) => setTileWidth(Number(event.target.value))} /></label>
-        <label>Wysokość rombu 2:1<input value={`${tileHeight}px`} readOnly /></label>
+        <label>Bazowa szerokość tile (px)<input type="number" min={16} max={4096} step={project.projection === 'isometric' ? 2 : 1} value={tileWidth} onChange={(event) => setTileWidth(Number(event.target.value))} /></label>
+        <label>{project.projection === 'isometric' ? 'Wysokość rombu 2:1' : 'Wysokość tile 1:1'}<input value={`${tileHeight}px`} readOnly /></label>
         <label>Pixels per unit<input type="number" min={1} max={4096} value={pixelsPerUnit} onChange={(event) => setPixelsPerUnit(Number(event.target.value))} /></label>
       </div>
       <div className="queue-concurrency-setting">
@@ -401,7 +443,7 @@ export function ProjectHome({
         <StableDiffusionCppSetupPanel />
       </div>
       {!codexGenerationEnabled && !comfyUiEnabled && !stableDiffusionCppEnabled && <p className="inline-warning"><AlertTriangle /> Włącz co najmniej jeden generator.</p>}
-      {tileWidth % 2 !== 0 && <p className="inline-warning"><AlertTriangle /> Bazowa szerokość musi być parzysta.</p>}
+      {project.projection === 'isometric' && tileWidth % 2 !== 0 && <p className="inline-warning"><AlertTriangle /> Bazowa szerokość musi być parzysta.</p>}
       {error && <ErrorBox message={error} />}
       <div className="project-settings-actions"><span>{dirty ? 'Masz niezapisane zmiany.' : 'Ustawienia są aktualne.'}</span><button className="primary" type="submit" disabled={!dirty || !valid || save.isPending}>{save.isPending ? <LoaderCircle className="spin" /> : <Save />} Zapisz ustawienia</button></div>
     </form>
@@ -571,6 +613,7 @@ function GenerationStudio({
   const [footprintX, setFootprintX] = useState(1);
   const [footprintY, setFootprintY] = useState(1);
   const [error, setError] = useState('');
+  const fixedFootprint = isTileAssetCategory(category) || isRoadAssetCategory(category);
   const mutation = useMutation({
     mutationFn: () => window.tilemap.generation.enqueue({
       name,
@@ -580,7 +623,7 @@ function GenerationStudio({
       elevationLevels: category === 'elevated_tile' ? elevationLevels : undefined,
       relativeWidth: isRelativeSizeCategory(category) ? relativeWidth : undefined,
       relativeHeight: isRelativeSizeCategory(category) ? relativeHeight : undefined,
-      footprint: category === 'road_tile' ? { x: 1, y: 1 } : { x: footprintX, y: footprintY },
+      footprint: fixedFootprint ? { x: 1, y: 1 } : { x: footprintX, y: footprintY },
     }),
     onSuccess: () => {
       setName(''); setPrompt(''); setError('');
@@ -613,13 +656,15 @@ function GenerationStudio({
     relativeWidth,
     relativeHeight,
   });
+  const availableCategories = assetCategoriesForProjection(project.projection);
   const changeCategory = (next: AssetCategory) => {
+    if (project.projection === 'top_down' && next === 'elevated_tile') return;
     const defaults = defaultAssetSizing(next);
     setCategory(next);
     setElevationLevels(defaults.elevationLevels || 1);
     setRelativeWidth(defaults.relativeWidth);
     setRelativeHeight(defaults.relativeHeight);
-    if (next === 'road_tile') {
+    if (isTileAssetCategory(next) || isRoadAssetCategory(next)) {
       setFootprintX(1);
       setFootprintY(1);
     }
@@ -629,18 +674,18 @@ function GenerationStudio({
     <div className="section-heading"><div><p className="eyebrow">NOWA GENERACJA</p><h2>Co budujemy?</h2><p>Podaj nazwę assetu. Każdy aktywny generator przygotuje osobny wariant do porównania.</p></div><div className="grid-chip"><span>{project.tileWidthPx}</span><small>×</small><span>{project.tileHeightPx}</span><em>px</em></div></div>
     {!ready && <ErrorBox message={readinessMessage ?? 'Generatory nie są jeszcze gotowe.'} />}
     <div className="request-card">
-      <div className="form-grid two"><label>Nazwa assetu<input placeholder="Kamienna droga" value={name} onChange={(event) => setName(event.target.value)} /></label><label>Typ assetu<select value={category} onChange={(event) => changeCategory(event.target.value as AssetCategory)}>{assetCategories.map((item) => <option key={item} value={item}>{categoryLabels[item]}</option>)}</select></label></div>
+      <div className="form-grid two"><label>Nazwa assetu<input placeholder="Kamienna droga" value={name} onChange={(event) => setName(event.target.value)} /></label><label>Typ assetu<select value={category} onChange={(event) => changeCategory(event.target.value as AssetCategory)}>{availableCategories.map((item) => <option key={item} value={item}>{categoryLabels[item]}</option>)}</select></label></div>
       {category === 'elevated_tile' && <div className="asset-size-settings"><label>Elevation height (poziomy)<input type="number" min={1} max={16} step={1} value={elevationLevels} onChange={(event) => setElevationLevels(Number(event.target.value))} /></label><AssetCanvasSummary size={expectedSize} base={project} detail={`${elevationLevels} × wysokość bazowego rombu`} /></div>}
       {isRelativeSizeCategory(category) && <div className="asset-size-settings"><div className="form-grid two"><label>Szerokość canvasa (× tile)<input type="number" min={0.25} max={16} step={0.25} value={relativeWidth} onChange={(event) => setRelativeWidth(Number(event.target.value))} /></label><label>Wysokość canvasa (× tile)<input type="number" min={0.25} max={16} step={0.25} value={relativeHeight} onChange={(event) => setRelativeHeight(Number(event.target.value))} /></label></div><AssetCanvasSummary size={expectedSize} base={project} detail={`${relativeWidth}× szerokości · ${relativeHeight}× wysokości tile`} /></div>}
-      {category === 'flat_tile' && <AssetCanvasSummary size={expectedSize} base={project} detail="Bazowy romb 2:1" />}
-      {category === 'road_tile' && <div className="road-settings"><RoadSetSummary /><AssetCanvasSummary size={expectedSize} base={project} detail="16 transparentnych nakładek 1×1" /></div>}
+      {category === 'flat_tile' && <AssetCanvasSummary size={expectedSize} base={project} detail={project.projection === 'isometric' ? 'Bazowy romb 2:1' : 'Bazowy kwadrat 1:1'} />}
+      {category === 'road_tile' && <div className="road-settings"><RoadSetSummary projection={project.projection} /><AssetCanvasSummary size={expectedSize} base={project} detail="16 transparentnych nakładek 1×1" /></div>}
       <label>Opis dla agenta (opcjonalnie)<textarea className="hero-textarea" rows={8} placeholder="Możesz doprecyzować wygląd, materiały lub detale…" value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
       <div className="request-footer">
         <div className="footprint-control">
-          <span><strong>Zajęte komórki w Unity (footprint)</strong><small>{category === 'road_tile' ? 1 : footprintX * footprintY} {category !== 'road_tile' && footprintX * footprintY === 1 ? 'pole' : 'pola'} łącznie</small></span>
-          <input aria-label="Footprint X — zajęte komórki" type="number" min={1} max={64} value={category === 'road_tile' ? 1 : footprintX} disabled={category === 'road_tile'} onChange={(event) => setFootprintX(Number(event.target.value))} />
+          <span><strong>Zajęte komórki (footprint)</strong><small>{fixedFootprint ? 1 : footprintX * footprintY} {!fixedFootprint && footprintX * footprintY !== 1 ? 'pola' : 'pole'} łącznie</small></span>
+          <input aria-label="Footprint X — zajęte komórki" type="number" min={1} max={64} value={fixedFootprint ? 1 : footprintX} disabled={fixedFootprint} onChange={(event) => setFootprintX(Number(event.target.value))} />
           <small>×</small>
-          <input aria-label="Footprint Y — zajęte komórki" type="number" min={1} max={64} value={category === 'road_tile' ? 1 : footprintY} disabled={category === 'road_tile'} onChange={(event) => setFootprintY(Number(event.target.value))} />
+          <input aria-label="Footprint Y — zajęte komórki" type="number" min={1} max={64} value={fixedFootprint ? 1 : footprintY} disabled={fixedFootprint} onChange={(event) => setFootprintY(Number(event.target.value))} />
         </div>
         <button className="primary" disabled={!ready || name.trim().length < 2 || mutation.isPending} onClick={() => mutation.mutate()}>{mutation.isPending ? <LoaderCircle className="spin" /> : <Sparkles />} Generuj {generatorCount > 1 ? `${generatorCount} warianty` : 'asset'}</button>
       </div>
@@ -667,10 +712,10 @@ function AssetCanvasSummary({
   return <div className="asset-canvas-summary"><SquareStack /><div><strong>{size.width}×{size.height}px</strong><span>{detail}</span><small>Baza projektu: {base.tileWidthPx}×{base.tileHeightPx}px</small></div></div>;
 }
 
-function RoadSetSummary() {
+function RoadSetSummary({ projection }: { projection: ProjectProjection }) {
   return <div className="road-set-summary">
     <SquareStack />
-    <div><strong>Komplet 16 wariantów</strong><span>1 materiał AI + geometria aplikacji · 4 końce · 2 proste · 4 zakręty · 4 warianty T · skrzyżowanie · izolowany</span></div>
+    <div><strong>Komplet 16 wariantów</strong><span>1 materiał AI + geometria aplikacji · kierunki {projection === 'isometric' ? 'NW/NE/SE/SW' : 'N/E/S/W'} · 4 końce · 2 proste · 4 zakręty · 4 warianty T · skrzyżowanie · izolowany</span></div>
   </div>;
 }
 
@@ -789,13 +834,14 @@ function AssetReview({
           <PreviewZoomControls zoom={previewZoom} onZoom={setPreviewZoom} />
         </div>}
         {version.category === 'road_tile' && version.roadVariants?.length
-          ? <RoadVariantGrid version={version} assetName={asset.name} zoom={singleZoom} />
+          ? <RoadVariantGrid version={version} assetName={asset.name} projection={project.projection} zoom={singleZoom} />
           : repeatTerrain && version.imageUrl
             ? <TerrainSeamPreview
             version={version}
             assetName={asset.name}
             tileWidth={project.tileWidthPx}
             tileHeight={project.tileHeightPx}
+            projection={project.projection}
             spriteHeight={expectedAssetSize?.height}
             zoom={seamZoom}
             onZoom={setSeamZoom}
@@ -855,12 +901,22 @@ function TileOverlay({ version }: { version: AssetVersion }) {
   </div>;
 }
 
-function RoadVariantGrid({ version, assetName, zoom }: { version: AssetVersion; assetName: string; zoom: number }) {
+function RoadVariantGrid({
+  version,
+  assetName,
+  projection,
+  zoom,
+}: {
+  version: AssetVersion;
+  assetName: string;
+  projection: ProjectProjection;
+  zoom: number;
+}) {
   return <div className="road-variant-stage">
     <div className="road-variant-grid" style={{ width: `${zoom}%` }}>
       {version.roadVariants?.map((variant) => <figure className="road-variant-card" key={variant.connectionMask}>
-        <div><img src={variant.imageUrl} alt={`${assetName}: ${roadVariantLabel(variant.connectionMask)}`} /></div>
-        <figcaption><strong>{variant.connectionMask.toString().padStart(2, '0')}</strong><span>{roadVariantLabel(variant.connectionMask)}</span></figcaption>
+        <div><img src={variant.imageUrl} alt={`${assetName}: ${roadVariantLabel(variant.connectionMask, projection)}`} /></div>
+        <figcaption><strong>{variant.connectionMask.toString().padStart(2, '0')}</strong><span>{roadVariantLabel(variant.connectionMask, projection)}</span></figcaption>
       </figure>)}
     </div>
   </div>;
@@ -887,6 +943,7 @@ export function TerrainSeamPreview({
   assetName,
   tileWidth,
   tileHeight,
+  projection = 'isometric',
   spriteHeight,
   zoom = 100,
   onZoom,
@@ -895,6 +952,7 @@ export function TerrainSeamPreview({
   assetName: string;
   tileWidth: number;
   tileHeight: number;
+  projection?: ProjectProjection;
   spriteHeight?: number;
   zoom?: number;
   onZoom: (zoom: number) => void;
@@ -905,6 +963,7 @@ export function TerrainSeamPreview({
   const scaledTileWidth = Math.round(tileWidth * zoom / 100);
   const scaledTileHeight = Math.round(tileHeight * zoom / 100);
   const scaledSpriteHeight = Math.round((spriteHeight ?? tileHeight) * zoom / 100);
+  const topDown = projection === 'top_down';
 
   useEffect(() => setPan({ x: 0, y: 0 }), [version.id]);
 
@@ -975,8 +1034,8 @@ export function TerrainSeamPreview({
     onKeyDown={handleKeyDown}
   >
     <div className="seam-grid" style={{
-      width: `${scaledTileWidth}px`,
-      height: `${scaledTileHeight}px`,
+      width: `${topDown ? scaledTileWidth * 3 : scaledTileWidth}px`,
+      height: `${topDown ? scaledTileHeight * 3 : scaledTileHeight}px`,
       '--preview-pan-x': `${pan.x}px`,
       '--preview-pan-y': `${pan.y}px`,
     } as React.CSSProperties}>
@@ -987,11 +1046,11 @@ export function TerrainSeamPreview({
         alt={`${assetName} — sąsiad ${x + 2},${y + 2}`}
         draggable={false}
         style={{
-          left: `${scaledTileWidth / 2 + (x - y) * (scaledTileWidth / 2)}px`,
-          top: `${scaledTileHeight / 2 + (x + y) * (scaledTileHeight / 2)}px`,
+          left: `${topDown ? (x + 1.5) * scaledTileWidth : scaledTileWidth / 2 + (x - y) * (scaledTileWidth / 2)}px`,
+          top: `${topDown ? (y + 1.5) * scaledTileHeight : scaledTileHeight / 2 + (x + y) * (scaledTileHeight / 2)}px`,
           width: `${scaledTileWidth}px`,
           height: `${scaledSpriteHeight}px`,
-          transform: `translate(-50%, -${scaledTileHeight / 2}px)`,
+          transform: topDown ? 'translate(-50%, -50%)' : `translate(-50%, -${scaledTileHeight / 2}px)`,
         }}
       />)}
     </div>
@@ -1187,6 +1246,8 @@ export function ReviewControls({
   const anotherVersionApproved = asset.versions.some(
     (item) => item.id !== version.id && item.status === 'approved',
   );
+  const versionHasFixedFootprint = isTileAssetCategory(version.category) || isRoadAssetCategory(version.category);
+  const nextHasFixedFootprint = isTileAssetCategory(category) || isRoadAssetCategory(category);
 
   useEffect(() => {
     setCategory(version.category); setTags(version.tags.join(', '));
@@ -1201,7 +1262,7 @@ export function ReviewControls({
       versionId: version.id, decision,
       tags: tags.split(',').map((tag) => tag.trim()).filter(Boolean),
       rejectionReason: decision === 'rejected' ? rejection : undefined,
-      footprint: category === 'road_tile' ? { x: 1, y: 1 } : { x: fx, y: fy }, pivot: { x: px, y: py },
+      footprint: versionHasFixedFootprint ? { x: 1, y: 1 } : { x: fx, y: fy }, pivot: { x: px, y: py },
     }),
     onSuccess: () => { setError(''); onChanged(); },
     onError: (reason) => setError(errorMessage(reason)),
@@ -1213,7 +1274,7 @@ export function ReviewControls({
       elevationLevels: category === 'elevated_tile' ? elevationLevels : undefined,
       relativeWidth: isRelativeSizeCategory(category) ? relativeWidth : undefined,
       relativeHeight: isRelativeSizeCategory(category) ? relativeHeight : undefined,
-      footprint: category === 'road_tile' ? { x: 1, y: 1 } : { x: fx, y: fy },
+      footprint: nextHasFixedFootprint ? { x: 1, y: 1 } : { x: fx, y: fy },
     }),
     onSuccess: (jobs) => { setFeedback(''); setError(''); onChanged(jobs[0]?.versionId); },
     onError: (reason) => setError(errorMessage(reason)),
@@ -1229,7 +1290,9 @@ export function ReviewControls({
     onError: (reason) => setError(errorMessage(reason)),
   });
   const nextExpectedSize = assetPixelSize(project, { category, elevationLevels, relativeWidth, relativeHeight });
+  const availableCategories = assetCategoriesForProjection(project.projection);
   const changeCategory = (next: AssetCategory) => {
+    if (project.projection === 'top_down' && next === 'elevated_tile') return;
     const defaults = next === version.category
       ? { elevationLevels: version.elevationLevels, relativeWidth: version.relativeWidth, relativeHeight: version.relativeHeight }
       : defaultAssetSizing(next);
@@ -1237,7 +1300,7 @@ export function ReviewControls({
     setElevationLevels(defaults.elevationLevels || 1);
     setRelativeWidth(defaults.relativeWidth);
     setRelativeHeight(defaults.relativeHeight);
-    if (next === 'road_tile') {
+    if (isTileAssetCategory(next) || isRoadAssetCategory(next)) {
       setFx(1);
       setFy(1);
     }
@@ -1250,9 +1313,9 @@ export function ReviewControls({
     <label>Tagi AI <input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="kamień, droga, mech" /></label>
     {isRelativeSizeCategory(version.category) && <div className="dimension-explainer" role="note">
       <strong>Canvas obrazu: {version.relativeWidth}×{version.relativeHeight} tile</strong>
-      <span>To rozmiar PNG. Footprint poniżej określa osobno liczbę komórek zajętych na Gridzie w Unity.</span>
+      <span>To rozmiar PNG. Footprint poniżej określa osobno liczbę komórek zajętych na logicznej siatce.</span>
     </div>}
-    <div className="form-grid two"><label>Footprint X — zajęte komórki<input type="number" min={1} max={64} value={fx} disabled={version.category === 'road_tile'} onChange={(event) => setFx(Number(event.target.value))} /></label><label>Footprint Y — zajęte komórki<input type="number" min={1} max={64} value={fy} disabled={version.category === 'road_tile'} onChange={(event) => setFy(Number(event.target.value))} /></label></div>
+    <div className="form-grid two"><label>Footprint X — zajęte komórki<input type="number" min={1} max={64} value={versionHasFixedFootprint ? 1 : fx} disabled={versionHasFixedFootprint} onChange={(event) => setFx(Number(event.target.value))} /></label><label>Footprint Y — zajęte komórki<input type="number" min={1} max={64} value={versionHasFixedFootprint ? 1 : fy} disabled={versionHasFixedFootprint} onChange={(event) => setFy(Number(event.target.value))} /></label></div>
     {version.imageUrl && <div className="form-grid two"><label>Pivot X (propozycja AI)<input type="number" min={0} max={1} step={0.01} value={px} onChange={(event) => setPx(Number(event.target.value))} /></label><label>Pivot Y (propozycja AI)<input type="number" min={0} max={1} step={0.01} value={py} onChange={(event) => setPy(Number(event.target.value))} /></label></div>}
     {version.status === 'needs_review' && <>
       {anotherVersionApproved && <p className="inline-warning"><AlertTriangle /> Najpierw cofnij zatwierdzenie obecnej wersji. Tylko jedna wersja assetu może być zatwierdzona.</p>}
@@ -1267,11 +1330,11 @@ export function ReviewControls({
     </button>}
     {version.imageUrl && <div className="iteration-box">
       <p className="eyebrow">PARAMETRY KOLEJNEJ ITERACJI</p>
-      <label>Typ assetu<select value={category} onChange={(event) => changeCategory(event.target.value as AssetCategory)}>{assetCategories.map((item) => <option key={item} value={item}>{categoryLabels[item]}</option>)}</select></label>
-      {category === 'road_tile' && <RoadSetSummary />}
+      <label>Typ assetu<select value={category} onChange={(event) => changeCategory(event.target.value as AssetCategory)}>{availableCategories.map((item) => <option key={item} value={item}>{categoryLabels[item]}</option>)}</select></label>
+      {category === 'road_tile' && <RoadSetSummary projection={project.projection} />}
       {category === 'elevated_tile' && <label>Elevation height (poziomy)<input type="number" min={1} max={16} step={1} value={elevationLevels} onChange={(event) => setElevationLevels(Number(event.target.value))} /></label>}
       {isRelativeSizeCategory(category) && <div className="form-grid two"><label>Szerokość canvasa (× tile)<input type="number" min={0.25} max={16} step={0.25} value={relativeWidth} onChange={(event) => setRelativeWidth(Number(event.target.value))} /></label><label>Wysokość canvasa (× tile)<input type="number" min={0.25} max={16} step={0.25} value={relativeHeight} onChange={(event) => setRelativeHeight(Number(event.target.value))} /></label></div>}
-      {nextExpectedSize && <AssetCanvasSummary size={nextExpectedSize} base={project} detail={category === 'elevated_tile' ? `Elevation ${elevationLevels}` : category === 'road_tile' ? 'Transparentna nakładka 1×1' : category === 'flat_tile' ? 'Bazowy romb 2:1' : `${relativeWidth}×${relativeHeight} jednostki tile`} />}
+      {nextExpectedSize && <AssetCanvasSummary size={nextExpectedSize} base={project} detail={category === 'elevated_tile' ? `Elevation ${elevationLevels}` : category === 'road_tile' ? 'Transparentna nakładka 1×1' : category === 'flat_tile' ? project.projection === 'isometric' ? 'Bazowy romb 2:1' : 'Bazowy kwadrat 1:1' : `${relativeWidth}×${relativeHeight} jednostki tile`} />}
       <textarea rows={4} placeholder="Opcjonalnie opisz zmianę. Bez opisu możesz wygenerować nowy wariant." value={feedback} onChange={(event) => setFeedback(event.target.value)} />
       <div><button className="secondary" disabled={feedback.trim().length < 3 || iterate.isPending} onClick={() => iterate.mutate('edit')}><RefreshCw /> Edytuj obraz</button><button className="ghost" disabled={iterate.isPending} onClick={() => iterate.mutate('variant')}><SquareStack /> Przegeneruj</button></div>
     </div>}
@@ -1458,31 +1521,84 @@ function ProjectReferenceCard({ reference }: { reference: ProjectReference }) {
 }
 
 function ExportView({ project, assets }: { project: ProjectInfo; assets: AssetSummary[] }) {
-  const [target, setTarget] = useState(project.unityExportPath ?? '');
+  const queryClient = useQueryClient();
+  const integrations = useQuery({
+    queryKey: ['export-integrations'],
+    queryFn: () => window.tilemap.export.listIntegrations(),
+  });
+  const [selectedIntegration, setSelectedIntegration] = useState<ExportIntegration>('unity');
+  const [targets, setTargets] = useState<ProjectInfo['exportTargets']>(project.exportTargets);
   const [preview, setPreview] = useState<ExportPreview | null>(null);
   const [error, setError] = useState('');
   const approvedCount = assets.filter((asset) => asset.currentApprovedVersionId).length;
+  const target = targets[selectedIntegration] ?? '';
+  const selectedDescriptor = integrations.data?.find((integration) => integration.id === selectedIntegration);
+
+  useEffect(() => setTargets(project.exportTargets), [project.exportTargets]);
+
   const choose = useMutation({
-    mutationFn: () => window.tilemap.export.chooseTarget(),
-    onSuccess: (path) => { if (path) { setTarget(path); setPreview(null); } },
+    mutationFn: (integration: ExportIntegration) => window.tilemap.export.chooseTarget(integration),
+    onSuccess: (path, integration) => {
+      if (path) {
+        setTargets((current) => ({ ...current, [integration]: path }));
+        setPreview(null);
+        setError('');
+      }
+    },
     onError: (reason) => setError(errorMessage(reason)),
   });
   const makePreview = useMutation({
-    mutationFn: () => window.tilemap.export.preview({ targetAssetsDirectory: target }),
+    mutationFn: () => window.tilemap.export.preview({ integration: selectedIntegration, targetDirectory: target }),
     onSuccess: (value) => { setPreview(value); setError(''); },
     onError: (reason) => setError(errorMessage(reason)),
   });
   const run = useMutation({
     mutationFn: () => window.tilemap.export.run(preview!.token),
-    onSuccess: (result) => { setError(''); alert(`Wyeksportowano ${result.exported} assetów.\n${result.manifestPath}`); },
+    onSuccess: (result) => {
+      setError('');
+      queryClient.setQueryData<ProjectInfo>(['project'], (current) => current ? {
+        ...current,
+        exportTargets: { ...current.exportTargets, [preview!.integration]: preview!.targetDirectory },
+      } : current);
+      void queryClient.invalidateQueries({ queryKey: ['project'] });
+      alert(`${selectedDescriptor?.label ?? 'Integracja'}: wyeksportowano ${formatPolishCount(result.assetCount, 'zatwierdzony asset', 'zatwierdzone assety', 'zatwierdzonych assetów')}.\nZmienione pliki: ${result.writtenFileCount}/${result.fileCount}.\n${result.manifestPath}`);
+      setPreview(null);
+    },
     onError: (reason) => setError(errorMessage(reason)),
   });
 
   return <div className="export-page">
-    <div className="section-heading"><div><p className="eyebrow">UNITY DELIVERY</p><h2>Eksport zatwierdzonych assetów</h2><p>Pliki PNG i manifest trafią do wydzielonego katalogu. Istniejące pliki .meta pozostaną nietknięte.</p></div><div className="approved-counter"><strong>{approvedCount}</strong><span>zatwierdzonych</span></div></div>
-    <div className="export-target"><FolderOpen /><div><small>KATALOG ASSETS</small><strong>{target || 'Nie wybrano'}</strong></div><button className="secondary" onClick={() => choose.mutate()}>Wybierz</button></div>
-    <button className="primary" disabled={!target || makePreview.isPending || approvedCount === 0} onClick={() => makePreview.mutate()}>{makePreview.isPending ? <LoaderCircle className="spin" /> : <Play />} Przygotuj podgląd</button>
-    {preview && <div className="export-preview"><div className="preview-heading"><h3>Plan eksportu</h3><span>{preview.files.length} plików</span></div>{preview.files.map((file) => <div key={`${file.assetId}-${file.variantMask ?? 'main'}`} className="export-file"><span className={`action ${file.action}`}>{file.action === 'create' ? 'NOWY' : file.action === 'replace' ? 'ZAMIANA' : 'BEZ ZMIAN'}</span><strong>{file.destinationPath}</strong></div>)}<div className="manifest-row"><Archive /><span>{preview.manifestPath}</span></div><button className="approve wide" disabled={run.isPending} onClick={() => run.mutate()}>{run.isPending ? <LoaderCircle className="spin" /> : <Download />} Eksportuj do Unity</button></div>}
+    <div className="section-heading"><div><p className="eyebrow">EKSPORT</p><h2>Integracje eksportu</h2><p>Wybierz format i miejsce docelowe. Plan synchronizuje zatwierdzone wersje i może usunąć wyłącznie nieaktualne pliki zarządzane przez aplikację.</p></div><div className="approved-counter"><strong>{approvedCount}</strong><span>zatwierdzonych</span></div></div>
+    <div className="integration-list" role="list" aria-label="Dostępne integracje eksportu">
+      {integrations.data?.map((integration) => <button
+        key={integration.id}
+        type="button"
+        className={`integration-card ${selectedIntegration === integration.id ? 'active' : ''}`}
+        aria-pressed={selectedIntegration === integration.id}
+        disabled={choose.isPending || makePreview.isPending || run.isPending}
+        onClick={() => {
+          if (selectedIntegration === integration.id) return;
+          setSelectedIntegration(integration.id);
+          setPreview(null);
+          setError('');
+        }}
+      >
+        <span><Box /></span>
+        <div><strong>{integration.label}</strong><small>{integration.description}</small></div>
+        {selectedIntegration === integration.id && <Check />}
+      </button>)}
+      {integrations.isLoading && <div className="integration-loading"><LoaderCircle className="spin" /> Wczytywanie integracji…</div>}
+    </div>
+    {selectedDescriptor && <section className="integration-settings" aria-label={`Ustawienia integracji ${selectedDescriptor.label}`}>
+      <div className="integration-settings-heading"><div><p className="eyebrow">{selectedDescriptor.label.toLocaleUpperCase('pl-PL')}</p><h3>Miejsce eksportu</h3></div><span>{formatPolishCount(preview?.assetCount ?? approvedCount, 'asset', 'assety', 'assetów')}</span></div>
+      <p className="integration-target-help">{selectedIntegration === 'unity'
+        ? <>Wybierz dokładne miejsce wewnątrz katalogu <code>Assets</code> projektu Unity. Trafią tam zatwierdzone pliki i manifest. Narzędzia Unity są instalowane raz, osobno w <code>Assets/TilemapGeneratorIntegration</code>.</>
+        : <>Wybierz dokładny katalog docelowy integracji {selectedDescriptor.label}. Trafią tam wyłącznie zatwierdzone assety.</>}</p>
+      <div className="export-target"><FolderOpen /><div><small>{selectedDescriptor.targetLabel}</small><strong title={target}>{target || 'Nie wybrano'}</strong></div><button className="secondary" type="button" disabled={choose.isPending || makePreview.isPending || run.isPending} onClick={() => choose.mutate(selectedIntegration)}>{choose.isPending ? <LoaderCircle className="spin" /> : <FolderOpen />} Wybierz miejsce eksportu</button></div>
+      <button className="primary" disabled={!target || choose.isPending || makePreview.isPending || run.isPending} onClick={() => makePreview.mutate()}>{makePreview.isPending ? <LoaderCircle className="spin" /> : <Play />} Przygotuj podgląd</button>
+    </section>}
+    {preview && <div className="export-preview"><div className="preview-heading"><h3>Plan eksportu</h3><span>{formatPolishCount(preview.assetCount, 'asset', 'assety', 'assetów')} · {formatPolishCount(preview.files.length, 'plik', 'pliki', 'plików')}</span></div>{preview.files.map((file) => <div key={`${file.destinationPath}-${file.variantMask ?? 'main'}`} className="export-file"><span className={`action ${file.action}`}>{file.action === 'create' ? 'NOWY' : file.action === 'replace' ? 'ZAMIANA' : file.action === 'delete' ? 'USUNIĘCIE' : 'BEZ ZMIAN'}</span><strong>{file.destinationPath}</strong></div>)}<div className="manifest-row"><Archive /><span>{preview.manifestPath}</span></div><button className="approve wide" disabled={choose.isPending || makePreview.isPending || run.isPending} onClick={() => run.mutate()}>{run.isPending ? <LoaderCircle className="spin" /> : <Download />} Eksportuj przez {selectedDescriptor?.label ?? preview.integration}</button></div>}
+    {integrations.error && <ErrorBox message={errorMessage(integrations.error)} />}
     {error && <ErrorBox message={error} />}
   </div>;
 }
@@ -1629,6 +1745,17 @@ function errorMessage(reason: unknown): string {
     return 'Proces główny aplikacji jest w starszej wersji. Zamknij całkowicie Tilemap Generator i uruchom go ponownie.';
   }
   return message;
+}
+function formatPolishCount(value: number, singular: string, few: string, many: string): string {
+  const absolute = Math.abs(value);
+  const lastDigit = absolute % 10;
+  const lastTwoDigits = absolute % 100;
+  const form = absolute === 1
+    ? singular
+    : lastDigit >= 2 && lastDigit <= 4 && (lastTwoDigits < 12 || lastTwoDigits > 14)
+      ? few
+      : many;
+  return `${value} ${form}`;
 }
 function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return '0 B';

@@ -4,7 +4,11 @@ import type { GenerationEvent } from '../shared/domain';
 
 const api: TilemapGeneratorApi = {
   projects: {
-    create: (input) => ipcRenderer.invoke(ipcChannels.projectCreate, input),
+    chooseStorageDirectory: () => ipcRenderer.invoke(ipcChannels.projectChooseStorage),
+    create: (input, storageDirectory) => ipcRenderer.invoke(
+      ipcChannels.projectCreate,
+      { input, storageDirectory },
+    ),
     open: () => ipcRenderer.invoke(ipcChannels.projectOpen),
     openRecent: (rootPath) => ipcRenderer.invoke(ipcChannels.projectOpenRecent, rootPath),
     current: () => ipcRenderer.invoke(ipcChannels.projectCurrent),
@@ -48,7 +52,8 @@ const api: TilemapGeneratorApi = {
     rebuild: () => ipcRenderer.invoke(ipcChannels.styleRebuild),
   },
   export: {
-    chooseTarget: () => ipcRenderer.invoke(ipcChannels.exportChooseTarget),
+    listIntegrations: () => ipcRenderer.invoke(ipcChannels.exportIntegrations),
+    chooseTarget: (integration) => ipcRenderer.invoke(ipcChannels.exportChooseTarget, integration),
     preview: (input) => ipcRenderer.invoke(ipcChannels.exportPreview, input),
     run: (token) => ipcRenderer.invoke(ipcChannels.exportRun, token),
   },

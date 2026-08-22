@@ -35,6 +35,7 @@ it('generuje top-only atlas 8x6 i zachowuje pivot elevated tile', async () => {
   expect(wallMetadata.width).toBe(64);
   expect(wallMetadata.height).toBe(64);
   expect(result.manifest.variants).toHaveLength(47);
+  expect(result.manifest).toMatchObject({ schemaVersion: 7, projection: 'isometric' });
   expect(result.manifest.pivotNormalized).toEqual({ x: 0.5, y: 0.75 });
   expect(result.manifest.variants[0].rect).toEqual({ x: 0, y: 320, width: 64, height: 64 });
 
@@ -67,4 +68,67 @@ it('generuje top-only atlas 8x6 i zachowuje pivot elevated tile', async () => {
   const cached = await ensureTerrainBlendAtlas({ sourcePath, tileWidthPx: 64, tileHeightPx: 32 });
   expect(readFileSync(cached.atlasPath).equals(readFileSync(result.atlasPath))).toBe(true);
   expect(readFileSync(cached.wallPath).equals(readFileSync(result.wallPath))).toBe(true);
+});
+
+it('generuje prostokątny blob47 dla kwadratowego terenu top-down bez ścian', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'terrain-blend-top-down-'));
+  directories.push(directory);
+  const sourcePath = path.join(directory, 'grass.png');
+  await sharp({
+    create: {
+      width: 32,
+      height: 32,
+      channels: 4,
+      background: { r: 64, g: 128, b: 48, alpha: 1 },
+    },
+  }).png().toFile(sourcePath);
+
+  const result = await ensureTerrainBlendAtlas({
+    sourcePath,
+    tileWidthPx: 32,
+    tileHeightPx: 32,
+    projection: 'top_down',
+  });
+  expect(result.manifest).toMatchObject({
+    schemaVersion: 7,
+    projection: 'top_down',
+    atlasWidthPx: 256,
+    atlasHeightPx: 192,
+    spriteWidthPx: 32,
+    spriteHeightPx: 32,
+    surfaceHeightPx: 32,
+    pivotNormalized: { x: 0.5, y: 0.5 },
+  });
+
+  const atlas = await sharp(result.atlasPath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const solidVariant = result.manifest.variants.find((variant) => variant.mask === 255)!;
+  const emptyVariant = result.manifest.variants.find((variant) => variant.mask === 0)!;
+  const rawTop = (variant: typeof solidVariant) => result.manifest.atlasHeightPx
+    - variant.rect.y - variant.rect.height;
+  const alphaAt = (variant: typeof solidVariant, x: number, y: number) => atlas.data[
+    ((((rawTop(variant) + y) * atlas.info.width) + variant.rect.x + x) * 4) + 3
+  ];
+  expect(alphaAt(solidVariant, 0, 0)).toBe(255);
+  expect(alphaAt(solidVariant, 31, 31)).toBe(255);
+  expect(alphaAt(emptyVariant, 0, 0)).toBeLessThan(10);
+  expect(alphaAt(emptyVariant, 16, 16)).toBe(255);
+
+  const walls = await sharp(result.wallPath).ensureAlpha().raw().toBuffer();
+  expect(walls.every((channel) => channel === 0)).toBe(true);
+
+  const elevatedPath = path.join(directory, 'elevated.png');
+  await sharp({
+    create: {
+      width: 32,
+      height: 64,
+      channels: 4,
+      background: { r: 64, g: 128, b: 48, alpha: 1 },
+    },
+  }).png().toFile(elevatedPath);
+  await expect(ensureTerrainBlendAtlas({
+    sourcePath: elevatedPath,
+    tileWidthPx: 32,
+    tileHeightPx: 32,
+    projection: 'top_down',
+  })).rejects.toThrow(/kwadratowy canvas/);
 });

@@ -9,6 +9,7 @@ vi.mock('electron', () => ({
 }));
 
 import { ProjectManager } from '../main/services/project-manager';
+import { dialog } from 'electron';
 
 let temporaryDirectory = '';
 
@@ -42,4 +43,46 @@ it('zachowuje nieistniejący ostatni projekt, sprawdza go przed otwarciem i usuw
   };
   expect(settings.recentProjects.map((recent) => recent.rootPath)).toEqual([existingRoot]);
   expect(existsSync(existingRoot)).toBe(true);
+});
+
+it('tworzy bibliotekę bezpośrednio we wskazanym pustym katalogu', async () => {
+  const storageDirectory = path.join(temporaryDirectory, 'moja-biblioteka');
+  mkdirSync(storageDirectory);
+  vi.mocked(dialog.showOpenDialog).mockResolvedValue({
+    canceled: false,
+    filePaths: [storageDirectory],
+  });
+  const manager = new ProjectManager();
+
+  const selected = await manager.chooseStorageDirectory();
+  expect(selected).toBe(storageDirectory);
+  expect(dialog.showOpenDialog).toHaveBeenCalledWith(expect.objectContaining({
+    title: 'Wybierz katalog biblioteki assetów',
+    properties: ['openDirectory', 'createDirectory'],
+  }));
+
+  const database = manager.create({
+    name: 'Moja gra', artBrief: '', projection: 'top_down', tileWidthPx: 64,
+  }, storageDirectory);
+  expect(database.rootPath).toBe(storageDirectory);
+  expect(existsSync(path.join(storageDirectory, 'tilemap-project.json'))).toBe(true);
+  expect(existsSync(path.join(storageDirectory, 'moja-gra'))).toBe(false);
+  manager.close();
+});
+
+it('odrzuca niewybrany albo niepusty katalog biblioteki', async () => {
+  const ungrantedDirectory = path.join(temporaryDirectory, 'bez-grantu');
+  mkdirSync(ungrantedDirectory);
+  const manager = new ProjectManager();
+  expect(() => manager.create({ name: 'Bez grantu', artBrief: '', tileWidthPx: 64 }, ungrantedDirectory))
+    .toThrow(/nie został wybrany przez dialog/);
+
+  const nonEmptyDirectory = path.join(temporaryDirectory, 'niepusty');
+  mkdirSync(nonEmptyDirectory);
+  writeFileSync(path.join(nonEmptyDirectory, 'keep.txt'), 'keep', 'utf8');
+  vi.mocked(dialog.showOpenDialog).mockResolvedValue({
+    canceled: false,
+    filePaths: [nonEmptyDirectory],
+  });
+  await expect(manager.chooseStorageDirectory()).rejects.toThrow(/nie jest pusty/);
 });

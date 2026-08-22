@@ -4,6 +4,7 @@ import {
   addProjectReferenceSchema,
   createProjectSchema,
   enqueueGenerationSchema,
+  exportIntegrationSchema,
   exportPreviewSchema,
   installStableDiffusionCppSchema,
   reviewProjectSettingsProposalSchema,
@@ -18,19 +19,23 @@ import { CodexService } from '../codex/codex-service';
 import { ComfyService } from '../comfy/comfy-service';
 import { StableDiffusionCppService } from '../stable-diffusion/stable-diffusion-cpp-service';
 import { GenerationQueue } from '../services/generation-queue';
+import { ExportService } from '../services/export-service';
 import { ProjectManager } from '../services/project-manager';
-import { UnityExporter } from '../services/unity-exporter';
 import type { Logger } from '../services/app-logger';
 
 const uuidSchema = z.string().uuid();
 const projectPathSchema = z.string().trim().min(1).max(32_767);
+const createProjectRequestSchema = z.object({
+  input: z.unknown(),
+  storageDirectory: projectPathSchema,
+});
 
 export function registerIpc(mainWindow: BrowserWindow, projects: ProjectManager, logger: Logger): () => Promise<void> {
   const codex = new CodexService(logger);
   const comfy = new ComfyService(logger);
   const stableDiffusionCpp = new StableDiffusionCppService(logger);
   const queue = new GenerationQueue(codex, logger, comfy, stableDiffusionCpp);
-  const exporter = new UnityExporter();
+  const exporter = new ExportService();
 
   queue.on('event', (event) => {
     if (!mainWindow.isDestroyed()) mainWindow.webContents.send(ipcChannels.generationEvent, event);
@@ -52,9 +57,13 @@ export function registerIpc(mainWindow: BrowserWindow, projects: ProjectManager,
     queue.attach(database);
   };
 
+  register(ipcChannels.projectChooseStorage, () => projects.chooseStorageDirectory());
   register(ipcChannels.projectCreate, async (payload) => {
-    const database = await projects.create(createProjectSchema.parse(payload));
-    if (!database) return null;
+    const request = createProjectRequestSchema.parse(payload);
+    const database = projects.create(
+      createProjectSchema.parse(request.input),
+      request.storageDirectory,
+    );
     await activate();
     return database.getProject();
   });
@@ -148,10 +157,13 @@ export function registerIpc(mainWindow: BrowserWindow, projects: ProjectManager,
   register(ipcChannels.styleRestore, (payload) => requireProject(projects).restoreStyleRevision(uuidSchema.parse(payload)));
   register(ipcChannels.styleRebuild, () => queue.rebuildStyle());
 
-  register(ipcChannels.exportChooseTarget, () => projects.chooseUnityAssetsDirectory());
+  register(ipcChannels.exportIntegrations, () => exporter.listIntegrations());
+  register(ipcChannels.exportChooseTarget, (payload) => (
+    exporter.chooseTarget(requireProject(projects), exportIntegrationSchema.parse(payload))
+  ));
   register(ipcChannels.exportPreview, (payload) => {
     const input = exportPreviewSchema.parse(payload);
-    return exporter.preview(requireProject(projects), input, (candidate) => projects.isGrantedDirectory(candidate));
+    return exporter.preview(requireProject(projects), input);
   });
   register(ipcChannels.exportRun, (payload) => exporter.run(requireProject(projects), uuidSchema.parse(payload)));
 

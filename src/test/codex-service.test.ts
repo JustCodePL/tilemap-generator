@@ -1,5 +1,33 @@
 import { expect, it, vi } from 'vitest';
-import { CodexService, generationResponseSchema } from '../main/codex/codex-service';
+import {
+  CodexService,
+  generationResponseSchema,
+  resolveCodexExecutable,
+} from '../main/codex/codex-service';
+
+it('preferuje jawnie wskazane binarium Codexa', () => {
+  expect(resolveCodexExecutable({
+    platform: 'darwin',
+    environment: { TILEMAP_CODEX_EXE: '/custom/bin/codex' },
+    fileExists: (candidate) => candidate === '/custom/bin/codex',
+  })).toBe('/custom/bin/codex');
+
+  expect(() => resolveCodexExecutable({
+    platform: 'darwin',
+    environment: { TILEMAP_CODEX_EXE: '/missing/codex' },
+    fileExists: () => false,
+  })).toThrow('TILEMAP_CODEX_EXE wskazuje nieistniejący plik');
+});
+
+it('znajduje Codexa dołączonego do ChatGPT przy ograniczonym PATH Findera', () => {
+  const bundled = '/Applications/ChatGPT.app/Contents/Resources/codex';
+  expect(resolveCodexExecutable({
+    platform: 'darwin',
+    environment: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
+    homeDirectory: '/Users/tester',
+    fileExists: (candidate) => candidate === bundled,
+  })).toBe(bundled);
+});
 
 it('replaces a persisted asset thread so newly registered dynamic tools are available', async () => {
   const setAssetThread = vi.fn();

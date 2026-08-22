@@ -2,7 +2,7 @@
   "name": "tilemap-generator",
   "productName": "Tilemap Generator",
   "version": "0.1.1",
-  "description": "Desktopowa fabryka izometrycznych assetów dla Unity",
+  "description": "Desktopowa fabryka assetów izometrycznych i top-down z integracjami eksportu",
   "main": ".vite/build/main.js",
   "author": "Tilemap Generator",
   "license": "UNLICENSED",

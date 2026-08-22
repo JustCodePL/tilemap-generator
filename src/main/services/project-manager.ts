@@ -1,5 +1,5 @@
 import { app, dialog } from 'electron';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { CreateProjectInput, RecentProject, UpdateProjectSettingsInput } from '../../shared/domain';
 import { ProjectDatabase } from '../db/project-database';
@@ -10,26 +10,44 @@ interface SettingsFile {
 
 export class ProjectManager {
   private database: ProjectDatabase | null = null;
-  private readonly grantedDirectories = new Set<string>();
+  private readonly grantedStorageDirectories = new Set<string>();
 
   get current(): ProjectDatabase | null {
     return this.database;
   }
 
-  async create(input: CreateProjectInput): Promise<ProjectDatabase | null> {
+  async chooseStorageDirectory(): Promise<string | null> {
     const selection = await dialog.showOpenDialog({
-      title: 'Wybierz katalog nadrzędny projektu',
+      title: 'Wybierz katalog biblioteki assetów',
       properties: ['openDirectory', 'createDirectory'],
-      buttonLabel: 'Utwórz tutaj',
+      buttonLabel: 'Wybierz katalog',
     });
     if (selection.canceled || !selection.filePaths[0]) return null;
-    const rootPath = path.join(selection.filePaths[0], slugify(input.name));
-    if (existsSync(rootPath) && readdirSync(rootPath).length > 0) {
-      throw new Error(`Katalog ${rootPath} już istnieje i nie jest pusty.`);
+    const storageDirectory = path.resolve(selection.filePaths[0]);
+    if (!existsSync(storageDirectory) || !statSync(storageDirectory).isDirectory()) {
+      throw new Error(`Katalog biblioteki nie istnieje: ${storageDirectory}`);
     }
-    mkdirSync(rootPath, { recursive: true });
+    if (readdirSync(storageDirectory).length > 0) {
+      throw new Error(`Katalog biblioteki ${storageDirectory} nie jest pusty.`);
+    }
+    this.grantedStorageDirectories.add(storageDirectory);
+    return storageDirectory;
+  }
+
+  create(input: CreateProjectInput, storageDirectory: string): ProjectDatabase {
+    const rootPath = path.resolve(storageDirectory);
+    if (!this.grantedStorageDirectories.has(rootPath)) {
+      throw new Error('Katalog biblioteki nie został wybrany przez dialog aplikacji.');
+    }
+    if (!existsSync(rootPath) || !statSync(rootPath).isDirectory()) {
+      throw new Error(`Katalog biblioteki nie istnieje: ${rootPath}`);
+    }
+    if (readdirSync(rootPath).length > 0) {
+      throw new Error(`Katalog biblioteki ${rootPath} nie jest pusty.`);
+    }
     this.close();
     this.database = ProjectDatabase.create(rootPath, input);
+    this.grantedStorageDirectories.delete(rootPath);
     this.addRecent(this.database.getProject().name, rootPath);
     return this.database;
   }
@@ -72,21 +90,6 @@ export class ProjectManager {
     this.database = null;
   }
 
-  async chooseUnityAssetsDirectory(): Promise<string | null> {
-    const selection = await dialog.showOpenDialog({
-      title: 'Wybierz katalog Assets projektu Unity',
-      properties: ['openDirectory'],
-      buttonLabel: 'Wybierz Assets',
-    });
-    if (selection.canceled || !selection.filePaths[0]) return null;
-    const selected = path.resolve(selection.filePaths[0]);
-    if (path.basename(selected).toLocaleLowerCase() !== 'assets') {
-      throw new Error('Wybierz bezpośrednio katalog Assets projektu Unity.');
-    }
-    this.grantedDirectories.add(selected.toLocaleLowerCase());
-    return selected;
-  }
-
   async chooseReferenceImage(): Promise<string | null> {
     const selection = await dialog.showOpenDialog({
       title: 'Wybierz obraz referencyjny',
@@ -95,12 +98,6 @@ export class ProjectManager {
       filters: [{ name: 'Obrazy', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
     });
     return selection.canceled ? null : selection.filePaths[0] ?? null;
-  }
-
-  isGrantedDirectory(directory: string): boolean {
-    const resolved = path.resolve(directory).toLocaleLowerCase();
-    const saved = this.database?.getProject().unityExportPath?.toLocaleLowerCase();
-    return this.grantedDirectories.has(resolved) || saved === resolved;
   }
 
   recents(): RecentProject[] {

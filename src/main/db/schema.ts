@@ -16,7 +16,6 @@ export const projects = sqliteTable('projects', {
   stableDiffusionCppEnabled: integer('stable_diffusion_cpp_enabled', { mode: 'boolean' }).notNull().default(false),
   activeStyleSummaryId: text('active_style_summary_id'),
   styleSummaryStale: integer('style_summary_stale', { mode: 'boolean' }).notNull().default(false),
-  unityExportPath: text('unity_export_path'),
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),
 });
@@ -156,8 +155,15 @@ export const styleSummaryRevisions = sqliteTable('style_summary_revisions', {
   createdAt: text('created_at').notNull(),
 });
 
+export const exportTargets = sqliteTable('export_targets', {
+  integration: text('integration').primaryKey(),
+  targetPath: text('target_path').notNull(),
+  updatedAt: text('updated_at').notNull(),
+});
+
 export const exportRecords = sqliteTable('export_records', {
   id: text('id').primaryKey(),
+  integration: text('integration').notNull().default('unity'),
   targetPath: text('target_path').notNull(),
   manifestPath: text('manifest_path').notNull(),
   assetCount: integer('asset_count').notNull(),

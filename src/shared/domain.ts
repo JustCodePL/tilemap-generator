@@ -16,12 +16,41 @@ export const assetCategories = [
 export const assetCategorySchema = z.enum(assetCategories);
 export type AssetCategory = z.infer<typeof assetCategorySchema>;
 
+export const projectProjections = ['isometric', 'top_down'] as const;
+export const projectProjectionSchema = z.enum(projectProjections);
+export type ProjectProjection = z.infer<typeof projectProjectionSchema>;
+
+export interface RoadConnectionDirection {
+  id: 'north_west' | 'north_east' | 'south_east' | 'south_west' | 'north' | 'east' | 'south' | 'west';
+  bit: 1 | 2 | 4 | 8;
+  shortLabel: 'NW' | 'NE' | 'SE' | 'SW' | 'N' | 'E' | 'S' | 'W';
+  x: number;
+  y: number;
+}
+
 export const roadConnectionDirections = [
   { id: 'north_west', bit: 1, shortLabel: 'NW', x: 0.25, y: 0.25 },
   { id: 'north_east', bit: 2, shortLabel: 'NE', x: 0.75, y: 0.25 },
   { id: 'south_east', bit: 4, shortLabel: 'SE', x: 0.75, y: 0.75 },
   { id: 'south_west', bit: 8, shortLabel: 'SW', x: 0.25, y: 0.75 },
-] as const;
+] as const satisfies readonly RoadConnectionDirection[];
+
+export const topDownRoadConnectionDirections = [
+  { id: 'north', bit: 1, shortLabel: 'N', x: 0.5, y: 0 },
+  { id: 'east', bit: 2, shortLabel: 'E', x: 1, y: 0.5 },
+  { id: 'south', bit: 4, shortLabel: 'S', x: 0.5, y: 1 },
+  { id: 'west', bit: 8, shortLabel: 'W', x: 0, y: 0.5 },
+] as const satisfies readonly RoadConnectionDirection[];
+
+export function roadConnectionDirectionsForProjection(
+  projection: ProjectProjection = 'isometric',
+): readonly RoadConnectionDirection[] {
+  return projection === 'top_down' ? topDownRoadConnectionDirections : roadConnectionDirections;
+}
+
+export function tileHeightForProjection(projection: ProjectProjection, tileWidthPx: number): number {
+  return projection === 'top_down' ? tileWidthPx : tileWidthPx / 2;
+}
 
 export const roadVariantMasks = Array.from({ length: 16 }, (_, mask) => mask);
 export const roadCanonicalVariantMasks = [0, 1, 3, 5, 6, 7, 15] as const;
@@ -57,15 +86,16 @@ export function hasRoadConnection(mask: number, bit: number): boolean {
   return (mask & bit) === bit;
 }
 
-export function roadConnectionLabels(mask: number): string[] {
-  return roadConnectionDirections
+export function roadConnectionLabels(mask: number, projection: ProjectProjection = 'isometric'): string[] {
+  return roadConnectionDirectionsForProjection(projection)
     .filter((direction) => hasRoadConnection(mask, direction.bit))
     .map((direction) => direction.shortLabel);
 }
 
-export function roadVariantLabel(mask: number): string {
-  const directions = roadConnectionLabels(mask).join('–');
-  const connectionCount = roadConnectionDirections.filter((direction) => hasRoadConnection(mask, direction.bit)).length;
+export function roadVariantLabel(mask: number, projection: ProjectProjection = 'isometric'): string {
+  const connectionDirections = roadConnectionDirectionsForProjection(projection);
+  const directions = roadConnectionLabels(mask, projection).join('–');
+  const connectionCount = connectionDirections.filter((direction) => hasRoadConnection(mask, direction.bit)).length;
   if (connectionCount === 0) return 'Izolowany';
   if (connectionCount === 1) return `Koniec · ${directions}`;
   if (connectionCount === 2) return `${mask === 5 || mask === 10 ? 'Prosta' : 'Zakręt'} · ${directions}`;
@@ -95,6 +125,17 @@ export const generatorProviders = ['codex', 'comfyui', 'stable_diffusion_cpp'] a
 export const generatorProviderSchema = z.enum(generatorProviders);
 export type GeneratorProvider = z.infer<typeof generatorProviderSchema>;
 
+export const exportIntegrations = ['unity'] as const;
+export const exportIntegrationSchema = z.enum(exportIntegrations);
+export type ExportIntegration = z.infer<typeof exportIntegrationSchema>;
+
+export interface ExportIntegrationDescriptor {
+  id: ExportIntegration;
+  label: string;
+  description: string;
+  targetLabel: string;
+}
+
 export const comfyUiProfiles = ['z_image_turbo'] as const;
 export const comfyUiProfileSchema = z.enum(comfyUiProfiles);
 export type ComfyUiProfile = z.infer<typeof comfyUiProfileSchema>;
@@ -102,15 +143,27 @@ export type ComfyUiProfile = z.infer<typeof comfyUiProfileSchema>;
 export const createProjectSchema = z.object({
   name: z.string().trim().min(2).max(80),
   artBrief: z.string().trim().max(12_000).default(''),
-  tileWidthPx: z.number().int().min(16).max(4096).multipleOf(2).default(256),
+  projection: projectProjectionSchema.default('isometric'),
+  tileWidthPx: z.number().int().min(16).max(4096).default(256),
   pixelsPerUnit: z.number().int().min(1).max(4096).optional(),
+}).superRefine((project, context) => {
+  if (project.projection === 'isometric' && project.tileWidthPx % 2 !== 0) {
+    context.addIssue({
+      code: 'custom',
+      path: ['tileWidthPx'],
+      message: 'Bazowa szerokość izometrycznego tile musi być parzysta.',
+    });
+  }
 });
-export type CreateProjectInput = z.infer<typeof createProjectSchema>;
+type ParsedCreateProjectInput = z.infer<typeof createProjectSchema>;
+export type CreateProjectInput = Omit<ParsedCreateProjectInput, 'projection'> & {
+  projection?: ProjectProjection;
+};
 
 export const updateProjectSettingsSchema = z.object({
   name: z.string().trim().min(2).max(80),
   artBrief: z.string().trim().max(12_000),
-  tileWidthPx: z.number().int().min(16).max(4096).multipleOf(2),
+  tileWidthPx: z.number().int().min(16).max(4096),
   pixelsPerUnit: z.number().int().min(1).max(4096),
   maxConcurrentJobs: z.number().int().min(1).max(8),
   aiVerificationEnabled: z.boolean(),
@@ -182,7 +235,7 @@ export type UpdateProjectReferenceInput = z.infer<typeof updateProjectReferenceS
 
 export const proposedProjectSettingsSchema = z.object({
   artBrief: z.string().trim().max(12_000).optional(),
-  tileWidthPx: z.number().int().min(16).max(4096).multipleOf(2).optional(),
+  tileWidthPx: z.number().int().min(16).max(4096).optional(),
   pixelsPerUnit: z.number().int().min(1).max(4096).optional(),
   codexGenerationEnabled: z.boolean().optional(),
   comfyUiEnabled: z.boolean().optional(),
@@ -206,7 +259,8 @@ export const reviewProjectSettingsProposalSchema = z.object({
 export type ReviewProjectSettingsProposalInput = z.infer<typeof reviewProjectSettingsProposalSchema>;
 
 export const exportPreviewSchema = z.object({
-  targetAssetsDirectory: z.string().min(1),
+  integration: exportIntegrationSchema,
+  targetDirectory: z.string().trim().min(1),
   assetIds: z.array(z.string().uuid()).optional(),
 });
 export type ExportPreviewInput = z.infer<typeof exportPreviewSchema>;
@@ -216,7 +270,7 @@ export interface ProjectInfo {
   rootPath: string;
   name: string;
   artBrief: string;
-  projection: 'isometric';
+  projection: ProjectProjection;
   tileWidthPx: number;
   tileHeightPx: number;
   pixelsPerUnit: number;
@@ -228,7 +282,7 @@ export interface ProjectInfo {
   stableDiffusionCppEnabled?: boolean;
   styleSummary: string;
   styleSummaryStale: boolean;
-  unityExportPath: string | null;
+  exportTargets: Partial<Record<ExportIntegration, string>>;
   createdAt: string;
   updatedAt: string;
 }
@@ -514,20 +568,29 @@ export interface StableDiffusionCppInstallEvent {
 }
 
 export interface ExportFilePreview {
-  assetId: string;
-  versionId: string;
-  sourcePath: string;
+  assetId: string | null;
+  versionId: string | null;
+  sourcePath: string | null;
   destinationPath: string;
   variantMask?: number;
-  role?: 'asset' | 'road_variant' | 'terrain_blend_atlas' | 'terrain_wall' | 'unity_support';
-  action: 'create' | 'replace' | 'unchanged';
+  role?: 'asset' | 'road_variant' | 'terrain_blend_atlas' | 'terrain_wall' | 'integration_support';
+  action: 'create' | 'replace' | 'unchanged' | 'delete';
 }
 
 export interface ExportPreview {
   token: string;
-  targetAssetsDirectory: string;
+  integration: ExportIntegration;
+  targetDirectory: string;
   manifestPath: string;
+  assetCount: number;
   files: ExportFilePreview[];
+}
+
+export interface ExportRunResult {
+  assetCount: number;
+  fileCount: number;
+  writtenFileCount: number;
+  manifestPath: string;
 }
 
 export interface RecentProject {

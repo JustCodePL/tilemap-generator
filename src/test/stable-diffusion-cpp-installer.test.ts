@@ -28,6 +28,7 @@ it('rekomenduje Q4_K dla karty 6 GB i rozpoznaje istniejący profil BF16', async
   ];
   const installer = new StableDiffusionCppInstaller(undefined, {
     rootPath: path.join(root, 'managed'),
+    platform: 'win32',
     catalog,
     hardwareDetector: async () => ({ gpuName: 'NVIDIA GeForce GTX 1660', vramMb: 6144 }),
   });
@@ -71,6 +72,7 @@ it('pobiera runtime i model, weryfikuje SHA-256 oraz zapisuje wybór', async () 
   const events: StableDiffusionCppInstallEvent[] = [];
   const installer = new StableDiffusionCppInstaller(undefined, {
     rootPath: path.join(root, 'managed'),
+    platform: 'win32',
     catalog,
     hardwareDetector: async () => ({ gpuName: null, vramMb: 4096 }),
     fetcher: vi.fn(async (input: string | URL | Request) => {
@@ -103,6 +105,34 @@ it('pobiera runtime i model, weryfikuje SHA-256 oraz zapisuje wybór', async () 
     llmPath: expect.stringMatching(/llm\.gguf$/),
     vaePath: expect.stringMatching(/vae\.safetensors$/),
   });
+});
+
+it('na macOS wykrywa ręczne sd-cli z PATH i odrzuca zarządzaną instalację Windows', async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-sd-macos-'));
+  temporaryDirectories.push(root);
+  const binDirectory = path.join(root, 'bin');
+  const executablePath = path.join(binDirectory, 'sd-cli');
+  mkdirSync(binDirectory, { recursive: true });
+  writeFileSync(executablePath, 'test executable');
+  vi.stubEnv('PATH', binDirectory);
+  vi.stubEnv('TILEMAP_SD_CPP_EXE', '');
+  const releaseResolver = vi.fn();
+  const catalog: StableDiffusionCppModelDefinition[] = [
+    createTestModel('z_image_turbo_q4_k', 'Q4_K', createTestFiles('q4', root, false)),
+  ];
+  const installer = new StableDiffusionCppInstaller(undefined, {
+    rootPath: path.join(root, 'managed'),
+    platform: 'darwin',
+    catalog,
+    releaseResolver,
+    hardwareDetector: async () => ({ gpuName: null, vramMb: null }),
+  });
+
+  expect(installer.resolveSelectedPaths().executablePath).toBe(executablePath);
+  await expect(installer.install('z_image_turbo_q4_k')).rejects.toThrow(
+    'Zarządzana instalacja stable-diffusion.cpp jest dostępna tylko na Windows',
+  );
+  expect(releaseResolver).not.toHaveBeenCalled();
 });
 
 function createTestModel(

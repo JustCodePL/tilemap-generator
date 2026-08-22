@@ -2,9 +2,12 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
-import { terrainBlendVariantMasks } from '../../shared/domain';
+import {
+  terrainBlendVariantMasks,
+  type ProjectProjection,
+} from '../../shared/domain';
 
-const schemaVersion = 6;
+const schemaVersion = 7;
 const atlasColumns = 8;
 const atlasRows = 6;
 const blendWidthNormalized = 0.22;
@@ -20,6 +23,7 @@ export interface TerrainBlendVariantManifest {
 export interface TerrainBlendAtlasManifest {
   schemaVersion: number;
   mode: 'blob47_top_overlay';
+  projection: ProjectProjection;
   sourceSha256: string;
   columns: number;
   rows: number;
@@ -44,7 +48,9 @@ export async function ensureTerrainBlendAtlas(input: {
   sourcePath: string;
   tileWidthPx: number;
   tileHeightPx: number;
+  projection?: ProjectProjection;
 }): Promise<TerrainBlendAtlasResult> {
+  const projection = input.projection ?? 'isometric';
   const source = await sharp(input.sourcePath, { failOn: 'error' }).ensureAlpha().raw()
     .toBuffer({ resolveWithObject: true });
   if (source.info.width !== input.tileWidthPx) {
@@ -52,6 +58,12 @@ export async function ensureTerrainBlendAtlas(input: {
   }
   if (source.info.height < input.tileHeightPx) {
     throw new Error(`Teren ${input.sourcePath} jest niższy niż górna płaszczyzna ${input.tileHeightPx}px.`);
+  }
+  if (projection === 'top_down' && input.tileHeightPx !== input.tileWidthPx) {
+    throw new Error('Projekt top-down wymaga kwadratowej komórki terenu.');
+  }
+  if (projection === 'top_down' && source.info.height !== input.tileHeightPx) {
+    throw new Error(`Teren top-down ${input.sourcePath} musi mieć kwadratowy canvas ${input.tileWidthPx}x${input.tileHeightPx}px.`);
   }
 
   const derivedDirectory = path.join(path.dirname(input.sourcePath), 'derived');
@@ -64,6 +76,7 @@ export async function ensureTerrainBlendAtlas(input: {
     source.info.width,
     source.info.height,
     input.tileHeightPx,
+    projection,
   );
 
   if (existsSync(atlasPath) && existsSync(wallPath) && cacheManifestMatches(cacheManifestPath, manifest)) {
@@ -71,7 +84,13 @@ export async function ensureTerrainBlendAtlas(input: {
   }
 
   mkdirSync(derivedDirectory, { recursive: true });
-  const atlas = buildAtlas(source.data, source.info.width, source.info.height, input.tileHeightPx);
+  const atlas = buildAtlas(
+    source.data,
+    source.info.width,
+    source.info.height,
+    input.tileHeightPx,
+    projection,
+  );
   const temporaryAtlas = `${atlasPath}.tmp`;
   await sharp(atlas, {
     raw: {
@@ -82,7 +101,13 @@ export async function ensureTerrainBlendAtlas(input: {
   }).png({ compressionLevel: 9 }).toFile(temporaryAtlas);
   renameSync(temporaryAtlas, atlasPath);
 
-  const walls = buildWallSprite(source.data, source.info.width, source.info.height, input.tileHeightPx);
+  const walls = buildWallSprite(
+    source.data,
+    source.info.width,
+    source.info.height,
+    input.tileHeightPx,
+    projection,
+  );
   const temporaryWall = `${wallPath}.tmp`;
   await sharp(walls, {
     raw: {
@@ -104,6 +129,7 @@ function buildManifest(
   spriteWidthPx: number,
   spriteHeightPx: number,
   surfaceHeightPx: number,
+  projection: ProjectProjection,
 ): TerrainBlendAtlasManifest {
   const atlasWidthPx = spriteWidthPx * atlasColumns;
   const atlasHeightPx = spriteHeightPx * atlasRows;
@@ -124,6 +150,7 @@ function buildManifest(
   return {
     schemaVersion,
     mode: 'blob47_top_overlay',
+    projection,
     sourceSha256,
     columns: atlasColumns,
     rows: atlasRows,
@@ -147,6 +174,7 @@ function cacheManifestMatches(cacheManifestPath: string, expected: TerrainBlendA
     const actual = JSON.parse(readFileSync(cacheManifestPath, 'utf8')) as TerrainBlendAtlasManifest;
     return actual.schemaVersion === expected.schemaVersion
       && actual.sourceSha256 === expected.sourceSha256
+      && actual.projection === expected.projection
       && actual.spriteWidthPx === expected.spriteWidthPx
       && actual.spriteHeightPx === expected.spriteHeightPx
       && actual.surfaceHeightPx === expected.surfaceHeightPx
@@ -157,7 +185,13 @@ function cacheManifestMatches(cacheManifestPath: string, expected: TerrainBlendA
   }
 }
 
-function buildAtlas(source: Buffer, width: number, height: number, surfaceHeight: number): Buffer {
+function buildAtlas(
+  source: Buffer,
+  width: number,
+  height: number,
+  surfaceHeight: number,
+  projection: ProjectProjection,
+): Buffer {
   const atlasWidth = width * atlasColumns;
   const atlasHeight = height * atlasRows;
   const atlas = Buffer.alloc(atlasWidth * atlasHeight * 4);
@@ -172,15 +206,13 @@ function buildAtlas(source: Buffer, width: number, height: number, surfaceHeight
     const renderHeight = Math.min(height, surfaceHeight);
     for (let y = 0; y < renderHeight; y += 1) {
       for (let x = 0; x < width; x += 1) {
-        const diamondX = (x + 0.5) / width;
-        const diamondY = (y + 0.5) / surfaceHeight;
-        const u = diamondY + diamondX - 0.5;
-        const v = diamondY - diamondX + 0.5;
+        const { u, v } = surfaceCoordinates(x, y, width, surfaceHeight, projection);
         // Equal terrain cells meet on a sub-pixel diagonal in Scene View. Extending only
         // connected edges by a few source pixels prevents the lower layer from leaking
         // through when the Tilemap is rendered at a non-integer zoom level.
-        if (u < -seamTolerance || u > 1 + seamTolerance
-          || v < -seamTolerance || v > 1 + seamTolerance) continue;
+        if (projection === 'isometric'
+          && (u < -seamTolerance || u > 1 + seamTolerance
+            || v < -seamTolerance || v > 1 + seamTolerance)) continue;
 
         const sourceOffset = findSurfacePixel(source, width, surfaceHeight, x, y);
         if (sourceOffset < 0) continue;
@@ -200,7 +232,14 @@ function buildAtlas(source: Buffer, width: number, height: number, surfaceHeight
   return atlas;
 }
 
-function buildWallSprite(source: Buffer, width: number, height: number, surfaceHeight: number): Buffer {
+function buildWallSprite(
+  source: Buffer,
+  width: number,
+  height: number,
+  surfaceHeight: number,
+  projection: ProjectProjection,
+): Buffer {
+  if (projection === 'top_down') return Buffer.alloc(width * height * 4);
   const walls = Buffer.from(source);
   const tolerance = 2 / Math.min(width, surfaceHeight);
   for (let y = 0; y < Math.min(surfaceHeight, height); y += 1) {
@@ -214,6 +253,25 @@ function buildWallSprite(source: Buffer, width: number, height: number, surfaceH
     }
   }
   return walls;
+}
+
+function surfaceCoordinates(
+  x: number,
+  y: number,
+  width: number,
+  surfaceHeight: number,
+  projection: ProjectProjection,
+): { u: number; v: number } {
+  const normalizedX = (x + 0.5) / width;
+  const normalizedY = (y + 0.5) / surfaceHeight;
+  if (projection === 'top_down') {
+    // Keep the blob bits clockwise: N, NE, E, SE, S, SW, W, NW.
+    return { u: normalizedY, v: 1 - normalizedX };
+  }
+  return {
+    u: normalizedY + normalizedX - 0.5,
+    v: normalizedY - normalizedX + 0.5,
+  };
 }
 
 function findSurfacePixel(

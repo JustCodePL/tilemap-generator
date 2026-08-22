@@ -11,7 +11,14 @@ import {
 import path from 'node:path';
 import { drizzle, type BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import sharp from 'sharp';
-import { defaultAssetSizing } from '../../shared/domain';
+import {
+  defaultAssetSizing,
+  exportIntegrationSchema,
+  isRoadAssetCategory,
+  isTileAssetCategory,
+  projectProjectionSchema,
+  tileHeightForProjection,
+} from '../../shared/domain';
 import type {
   AiVerificationStatus,
   AssetCategory,
@@ -21,6 +28,7 @@ import type {
   CreateProjectSettingsProposalInput,
   CreateProjectInput,
   EnqueueGenerationInput,
+  ExportIntegration,
   GenerationJob,
   GenerationLogEntry,
   GenerationLogLevel,
@@ -40,7 +48,7 @@ import * as schema from './schema';
 
 const MANIFEST_NAME = 'tilemap-project.json';
 const DATABASE_NAME = 'registry.sqlite';
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 
 type Row = Record<string, unknown>;
 
@@ -103,6 +111,11 @@ export class ProjectDatabase {
   readonly orm: BetterSQLite3Database<typeof schema>;
 
   static create(rootPath: string, input: CreateProjectInput): ProjectDatabase {
+    const projection = projectProjectionSchema.parse(input.projection ?? 'isometric');
+    if (projection === 'isometric' && input.tileWidthPx % 2 !== 0) {
+      throw new Error('Bazowa szerokość izometrycznego tile musi być parzysta.');
+    }
+    const tileHeightPx = tileHeightForProjection(projection, input.tileWidthPx);
     mkdirSync(rootPath, { recursive: true });
     for (const directory of ['assets', 'staging', 'references', 'backups']) {
       mkdirSync(path.join(rootPath, directory), { recursive: true });
@@ -114,6 +127,7 @@ export class ProjectDatabase {
       schemaVersion: 1,
       id: projectId,
       name: input.name,
+      projection,
       database: DATABASE_NAME,
     }, null, 2), 'utf8');
 
@@ -122,13 +136,14 @@ export class ProjectDatabase {
       INSERT INTO projects (
         id, name, art_brief, projection, tile_width_px, tile_height_px,
         pixels_per_unit, style_summary_stale, created_at, updated_at
-      ) VALUES (?, ?, ?, 'isometric', ?, ?, ?, 0, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
     `).run(
       projectId,
       input.name,
       input.artBrief,
+      projection,
       input.tileWidthPx,
-      input.tileWidthPx / 2,
+      tileHeightPx,
       input.pixelsPerUnit ?? input.tileWidthPx,
       now,
       now,
@@ -182,7 +197,7 @@ export class ProjectDatabase {
            comfyui_profile TEXT NOT NULL DEFAULT 'z_image_turbo',
            stable_diffusion_cpp_enabled INTEGER NOT NULL DEFAULT 0,
            active_style_summary_id TEXT, style_summary_stale INTEGER NOT NULL DEFAULT 0,
-          unity_export_path TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS assets (
           id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
@@ -263,8 +278,12 @@ export class ProjectDatabase {
           id TEXT PRIMARY KEY, summary TEXT NOT NULL, previous_id TEXT,
           based_on_version_id TEXT, source TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS export_targets (
+          integration TEXT PRIMARY KEY, target_path TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS export_records (
-          id TEXT PRIMARY KEY, target_path TEXT NOT NULL, manifest_path TEXT NOT NULL,
+          id TEXT PRIMARY KEY, integration TEXT NOT NULL DEFAULT 'unity',
+          target_path TEXT NOT NULL, manifest_path TEXT NOT NULL,
           asset_count INTEGER NOT NULL, created_at TEXT NOT NULL
         );
       `);
@@ -313,6 +332,10 @@ export class ProjectDatabase {
       const jobColumns = this.sqlite.pragma('table_info(generation_jobs)') as Array<{ name: string }>;
       if (!jobColumns.some((column) => column.name === 'generator_provider')) {
         this.sqlite.exec("ALTER TABLE generation_jobs ADD COLUMN generator_provider TEXT NOT NULL DEFAULT 'codex';");
+      }
+      const exportRecordColumns = this.sqlite.pragma('table_info(export_records)') as Array<{ name: string }>;
+      if (!exportRecordColumns.some((column) => column.name === 'integration')) {
+        this.sqlite.exec("ALTER TABLE export_records ADD COLUMN integration TEXT NOT NULL DEFAULT 'unity';");
       }
       const assetHadGeometry = assetColumns.some((column) => column.name === 'terrain_geometry');
       const versionHadGeometry = versionColumns.some((column) => column.name === 'terrain_geometry');
@@ -434,9 +457,16 @@ export class ProjectDatabase {
       FROM projects p LEFT JOIN style_summary_revisions s ON s.id = p.active_style_summary_id LIMIT 1
     `).get() as Row | undefined;
     if (!row) throw new Error('Projekt nie zawiera rekordu konfiguracyjnego.');
+    const exportTargets = (this.sqlite.prepare(`
+      SELECT integration, target_path FROM export_targets ORDER BY integration
+    `).all() as Row[]).reduce<Partial<Record<ExportIntegration, string>>>((result, target) => {
+      const integration = exportIntegrationSchema.parse(target.integration);
+      result[integration] = String(target.target_path);
+      return result;
+    }, {});
     return {
       id: String(row.id), rootPath: this.rootPath, name: String(row.name),
-      artBrief: String(row.art_brief), projection: 'isometric',
+      artBrief: String(row.art_brief), projection: projectProjectionSchema.parse(row.projection),
       tileWidthPx: Number(row.tile_width_px), tileHeightPx: Number(row.tile_height_px),
       pixelsPerUnit: Number(row.pixels_per_unit),
       maxConcurrentJobs: Number(row.max_concurrent_jobs),
@@ -447,7 +477,7 @@ export class ProjectDatabase {
       stableDiffusionCppEnabled: Boolean(row.stable_diffusion_cpp_enabled),
       styleSummary: String(row.style_summary),
       styleSummaryStale: Boolean(row.style_summary_stale),
-      unityExportPath: row.unity_export_path ? String(row.unity_export_path) : null,
+      exportTargets,
       createdAt: String(row.created_at), updatedAt: String(row.updated_at),
     };
   }
@@ -456,7 +486,10 @@ export class ProjectDatabase {
     const current = this.getProject();
     const now = new Date().toISOString();
     const styleSummaryStale = current.styleSummaryStale || current.artBrief !== input.artBrief;
-    const tileHeightPx = input.tileWidthPx / 2;
+    if (current.projection === 'isometric' && input.tileWidthPx % 2 !== 0) {
+      throw new Error('Bazowa szerokość izometrycznego tile musi być parzysta.');
+    }
+    const tileHeightPx = tileHeightForProjection(current.projection, input.tileWidthPx);
     this.sqlite.prepare(`
       UPDATE projects SET name = ?, art_brief = ?, tile_width_px = ?, tile_height_px = ?,
         pixels_per_unit = ?, max_concurrent_jobs = ?, ai_verification_enabled = ?,
@@ -499,6 +532,13 @@ export class ProjectDatabase {
       : undefined;
     if (input.assetId && !existingAsset) throw new Error('Nie znaleziono assetu dla iteracji.');
     const category = input.category ?? (existingAsset ? String(existingAsset.category) as AssetCategory : 'other');
+    if (this.getProject().projection === 'top_down' && category === 'elevated_tile') {
+      throw new Error('Elevated tile nie jest obsługiwany w projekcie top-down.');
+    }
+    if ((isTileAssetCategory(category) || isRoadAssetCategory(category))
+      && (input.footprint.x !== 1 || input.footprint.y !== 1)) {
+      throw new Error('Terrain tile i road tile muszą zachować footprint 1×1.');
+    }
     const defaults = defaultAssetSizing(category);
     const preserveSizing = existingAsset && String(existingAsset.category) === category;
     const elevationLevels = category === 'elevated_tile'
@@ -511,9 +551,6 @@ export class ProjectDatabase {
       ? input.relativeHeight ?? (preserveSizing ? Number(existingAsset.relative_height) : defaults.relativeHeight)
       : 1;
     const roadConnections = category === 'road_tile' ? 15 : 0;
-    if (category === 'road_tile' && (input.footprint.x !== 1 || input.footprint.y !== 1)) {
-      throw new Error('Road tile musi mieć footprint 1×1. Sieć powstaje z połączeń między pojedynczymi komórkami.');
-    }
     // The queued version needs a database value, but the asset worker replaces it
     // with a recommendation derived from the final PNG before review starts.
     const tileType = category === 'flat_tile' || category === 'elevated_tile' || category === 'road_tile';
@@ -845,6 +882,11 @@ export class ProjectDatabase {
       }
     }
     const project = this.getProject();
+    if (project.projection === 'isometric'
+      && input.settings.tileWidthPx !== undefined
+      && input.settings.tileWidthPx % 2 !== 0) {
+      throw new Error('Bazowa szerokość izometrycznego tile musi być parzysta.');
+    }
     const before: ProjectSettingsSnapshot = {
       artBrief: project.artBrief,
       tileWidthPx: project.tileWidthPx,
@@ -887,6 +929,9 @@ export class ProjectDatabase {
       if (decision === 'approved') {
         const current = this.getProject();
         const nextTileWidth = proposal.proposed.tileWidthPx ?? current.tileWidthPx;
+        if (current.projection === 'isometric' && nextTileWidth % 2 !== 0) {
+          throw new Error('Bazowa szerokość izometrycznego tile musi być parzysta.');
+        }
         const nextCodexEnabled = proposal.proposed.codexGenerationEnabled ?? current.codexGenerationEnabled;
         const nextComfyEnabled = proposal.proposed.comfyUiEnabled ?? current.comfyUiEnabled;
         const nextStableDiffusionCppEnabled = proposal.proposed.stableDiffusionCppEnabled
@@ -902,7 +947,7 @@ export class ProjectDatabase {
         `).run(
           proposal.proposed.artBrief ?? current.artBrief,
           nextTileWidth,
-          nextTileWidth / 2,
+          tileHeightForProjection(current.projection, nextTileWidth),
           proposal.proposed.pixelsPerUnit ?? current.pixelsPerUnit,
           nextCodexEnabled ? 1 : 0,
           nextComfyEnabled ? 1 : 0,
@@ -956,8 +1001,10 @@ export class ProjectDatabase {
     if (!['needs_review', 'approved', 'rejected'].includes(String(row.status))) {
       throw new Error('Ta wersja nie jest gotowa do review.');
     }
-    if (String(row.category) === 'road_tile' && (input.footprint.x !== 1 || input.footprint.y !== 1)) {
-      throw new Error('Road tile musi zachować footprint 1×1.');
+    const category = String(row.category) as AssetCategory;
+    if ((isTileAssetCategory(category) || isRoadAssetCategory(category))
+      && (input.footprint.x !== 1 || input.footprint.y !== 1)) {
+      throw new Error('Terrain tile i road tile muszą zachować footprint 1×1.');
     }
     const now = new Date().toISOString();
     const assetId = String(row.asset_id);
@@ -1150,15 +1197,56 @@ export class ProjectDatabase {
       .run(new Date().toISOString());
   }
 
-  setUnityExportPath(target: string): void {
-    this.sqlite.prepare('UPDATE projects SET unity_export_path = ?, updated_at = ?')
-      .run(target, new Date().toISOString());
+  setExportTarget(integration: ExportIntegration, target: string): void {
+    const parsedIntegration = exportIntegrationSchema.parse(integration);
+    const now = new Date().toISOString();
+    this.sqlite.transaction(() => {
+      this.sqlite.prepare(`
+        INSERT INTO export_targets (integration, target_path, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(integration) DO UPDATE SET target_path = excluded.target_path, updated_at = excluded.updated_at
+      `).run(parsedIntegration, target, now);
+      this.sqlite.prepare('UPDATE projects SET updated_at = ?').run(now);
+    })();
   }
 
-  recordExport(targetPath: string, manifestPath: string, assetCount: number): void {
+  recordExport(
+    integration: ExportIntegration,
+    targetPath: string,
+    manifestPath: string,
+    assetCount: number,
+  ): void {
     this.sqlite.prepare(`
-      INSERT INTO export_records (id, target_path, manifest_path, asset_count, created_at) VALUES (?, ?, ?, ?, ?)
-    `).run(randomUUID(), targetPath, manifestPath, assetCount, new Date().toISOString());
+      INSERT INTO export_records (id, integration, target_path, manifest_path, asset_count, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      randomUUID(),
+      exportIntegrationSchema.parse(integration),
+      targetPath,
+      manifestPath,
+      assetCount,
+      new Date().toISOString(),
+    );
+  }
+
+  commitExport(
+    integration: ExportIntegration,
+    targetPath: string,
+    manifestPath: string,
+    assetCount: number,
+  ): void {
+    const parsedIntegration = exportIntegrationSchema.parse(integration);
+    const now = new Date().toISOString();
+    this.sqlite.transaction(() => {
+      this.sqlite.prepare(`
+        INSERT INTO export_targets (integration, target_path, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(integration) DO UPDATE SET target_path = excluded.target_path, updated_at = excluded.updated_at
+      `).run(parsedIntegration, targetPath, now);
+      this.sqlite.prepare('UPDATE projects SET updated_at = ?').run(now);
+      this.sqlite.prepare(`
+        INSERT INTO export_records (id, integration, target_path, manifest_path, asset_count, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(randomUUID(), parsedIntegration, targetPath, manifestPath, assetCount, now);
+    })();
   }
 
   approvedAssets(assetIds?: string[]): Array<{ asset: AssetSummary; version: AssetVersion; absolutePath: string }> {
