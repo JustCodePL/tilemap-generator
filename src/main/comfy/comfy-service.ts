@@ -1,0 +1,556 @@
+import { createHash, randomInt, randomUUID } from 'node:crypto';
+import { copyFileSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import sharp from 'sharp';
+import type { AssetCategory, ComfyUiHealth, ComfyUiProfile } from '../../shared/domain';
+import { nullLogger, type Logger } from '../services/app-logger';
+
+const DEFAULT_ENDPOINT = 'http://127.0.0.1:8188';
+const PROFILE: ComfyUiProfile = 'z_image_turbo';
+const PROFILE_MODEL = 'z_image_turbo_bf16.safetensors';
+const PROFILE_CLIP = 'qwen_3_4b.safetensors';
+const PROFILE_VAE = 'ae.safetensors';
+const BACKGROUND_MODEL = 'birefnet.safetensors';
+const WORKFLOW_VERSION = 'z-image-turbo-transparent-v1';
+const OUTPUT_NODE_ID = '14';
+const REQUIRED_NODES = [
+  'UNETLoader',
+  'CLIPLoader',
+  'VAELoader',
+  'ModelSamplingAuraFlow',
+  'CLIPTextEncode',
+  'ConditioningZeroOut',
+  'EmptySD3LatentImage',
+  'KSampler',
+  'VAEDecode',
+  'LoadBackgroundRemovalModel',
+  'RemoveBackground',
+  'InvertMask',
+  'JoinImageWithAlpha',
+  'SaveImage',
+] as const;
+
+export interface ComfyGenerationRequest {
+  assetName: string;
+  category: AssetCategory;
+  prompt: string;
+  feedback: string;
+  artBrief: string;
+  styleSummary: string;
+  outputPath: string;
+  outputSize: { width: number; height: number } | null;
+  roadAtlas: boolean;
+  attempt: number;
+  verificationFeedback: string;
+  signal: AbortSignal;
+  onProgress?: (message: string) => void;
+}
+
+export interface ComfyGenerationResult {
+  finalPath: string;
+  promptId: string;
+  model: string;
+  workflowHash: string;
+  metadata: Record<string, unknown>;
+}
+
+interface ComfyImageDescriptor {
+  filename: string;
+  subfolder?: string;
+  type?: string;
+}
+
+export class ComfyService {
+  private healthValue: ComfyUiHealth;
+  private endpointValue: string;
+  private readonly autoDetectEndpoint: boolean;
+
+  constructor(private readonly logger: Logger = nullLogger, endpoint?: string) {
+    const configuredEndpoint = endpoint ?? process.env.TILEMAP_COMFY_URL ?? DEFAULT_ENDPOINT;
+    this.endpointValue = normalizeLoopbackEndpoint(configuredEndpoint);
+    this.autoDetectEndpoint = endpoint === undefined && !process.env.TILEMAP_COMFY_URL;
+    this.healthValue = checkingHealth(this.endpointValue);
+  }
+
+  get endpoint(): string {
+    return this.endpointValue;
+  }
+
+  health(): ComfyUiHealth {
+    return this.healthValue;
+  }
+
+  async refresh(): Promise<ComfyUiHealth> {
+    this.healthValue = checkingHealth(this.endpoint);
+    const installation = detectDesktopInstallation();
+    try {
+      let system: Record<string, unknown>;
+      try {
+        system = await this.requestJson('/system_stats', { timeoutMs: 3_000 }) as Record<string, unknown>;
+      } catch (initialError) {
+        const detectedEndpoint = this.autoDetectEndpoint
+          ? await findRunningComfyEndpoint(this.endpoint)
+          : null;
+        if (!detectedEndpoint) throw initialError;
+        this.endpointValue = detectedEndpoint;
+        system = await this.requestJson('/system_stats', { timeoutMs: 3_000 }) as Record<string, unknown>;
+      }
+      const [missingNodes, missingModels] = await Promise.all([
+        this.findMissingNodes(),
+        this.findMissingModels(),
+      ]);
+      const systemInfo = system.system as Record<string, unknown> | undefined;
+      const version = typeof systemInfo?.comfyui_version === 'string' ? systemInfo.comfyui_version : null;
+      const ready = missingNodes.length === 0 && missingModels.length === 0;
+      this.healthValue = {
+        state: ready ? 'ready' : 'detected',
+        installed: true,
+        server: true,
+        endpoint: this.endpoint,
+        version,
+        profile: PROFILE,
+        model: PROFILE_MODEL,
+        missingNodes,
+        missingModels,
+        message: ready
+          ? `ComfyUI i profil Z-Image Turbo są gotowe pod ${this.endpoint}.`
+          : `ComfyUI odpowiada, ale profil Z-Image Turbo jest niekompletny: ${[
+            missingNodes.length ? `brak node'ów: ${missingNodes.join(', ')}` : '',
+            missingModels.length ? `brak modeli: ${missingModels.join(', ')}` : '',
+          ].filter(Boolean).join('; ')}.`,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.healthValue = {
+        state: installation.installed ? 'detected' : 'unavailable',
+        installed: installation.installed,
+        server: false,
+        endpoint: this.endpoint,
+        version: installation.version,
+        profile: PROFILE,
+        model: PROFILE_MODEL,
+        missingNodes: [],
+        missingModels: installation.missingModels,
+        message: installation.installed
+          ? `Wykryto Comfy Desktop${installation.updating ? ' (aktualizacja w toku)' : ''}, ale lokalny serwer nie odpowiada pod ${this.endpoint}.`
+          : `Nie wykryto działającego ComfyUI pod ${this.endpoint}.`,
+      };
+      this.logger.warn('comfy.health.unavailable', { endpoint: this.endpoint, message });
+    }
+    this.logger.info('comfy.health', {
+      state: this.healthValue.state,
+      endpoint: this.endpoint,
+      model: PROFILE_MODEL,
+      missingNodes: this.healthValue.missingNodes,
+      missingModels: this.healthValue.missingModels,
+    });
+    return this.healthValue;
+  }
+
+  async generate(request: ComfyGenerationRequest): Promise<ComfyGenerationResult> {
+    if (this.healthValue.state !== 'ready') {
+      throw new Error(this.healthValue.message || 'ComfyUI nie jest gotowe.');
+    }
+    const seed = randomInt(0, 0x7fffffff);
+    const steps = 8;
+    const cfg = 1;
+    const sampler = 'res_multistep';
+    const scheduler = 'simple';
+    const generationSize = chooseGenerationSize(request.outputSize);
+    const prompt = buildPrompt(request);
+    const workflow = buildWorkflow({
+      prompt,
+      width: generationSize.width,
+      height: generationSize.height,
+      seed,
+      steps,
+      cfg,
+      sampler,
+      scheduler,
+      filenamePrefix: `TilemapGenerator/${randomUUID()}`,
+      transparent: !request.roadAtlas,
+    });
+    const workflowHash = createHash('sha256').update(WORKFLOW_VERSION).digest('hex');
+    request.onProgress?.('ComfyUI przyjęło workflow Z-Image Turbo.');
+
+    let promptId = '';
+    try {
+      const queued = await this.requestJson('/prompt', {
+        method: 'POST',
+        body: JSON.stringify({ client_id: randomUUID(), prompt: workflow }),
+        signal: request.signal,
+        timeoutMs: 30_000,
+      }) as Record<string, unknown>;
+      promptId = typeof queued.prompt_id === 'string' ? queued.prompt_id : '';
+      if (!promptId) {
+        const nodeErrors = queued.node_errors ? JSON.stringify(queued.node_errors) : 'brak prompt_id';
+        throw new Error(`ComfyUI odrzuciło workflow: ${nodeErrors}`);
+      }
+      request.onProgress?.(`ComfyUI generuje wariant (${promptId.slice(0, 8)}).`);
+      const image = await this.waitForOutput(promptId, request.signal, request.onProgress);
+      const query = new URLSearchParams({
+        filename: image.filename,
+        subfolder: image.subfolder ?? '',
+        type: image.type ?? 'output',
+      });
+      const response = await this.fetch(`/view?${query.toString()}`, {
+        signal: request.signal,
+        timeoutMs: 60_000,
+      });
+      const rawPath = `${request.outputPath}.comfy-raw.png`;
+      writeFileSync(rawPath, Buffer.from(await response.arrayBuffer()));
+      if (request.outputSize && !request.roadAtlas) {
+        await sharp(rawPath)
+          .ensureAlpha()
+          .resize(request.outputSize.width, request.outputSize.height, {
+            fit: 'contain',
+            background: { r: 0, g: 0, b: 0, alpha: 0 },
+          })
+          .png()
+          .toFile(request.outputPath);
+      } else {
+        copyFileSync(rawPath, request.outputPath);
+      }
+      return {
+        finalPath: request.outputPath,
+        promptId,
+        model: PROFILE_MODEL,
+        workflowHash,
+        metadata: {
+          profile: PROFILE,
+          model: PROFILE_MODEL,
+          clip: PROFILE_CLIP,
+          vae: PROFILE_VAE,
+          backgroundRemovalModel: BACKGROUND_MODEL,
+          seed,
+          steps,
+          cfg,
+          sampler,
+          scheduler,
+          generationWidth: generationSize.width,
+          generationHeight: generationSize.height,
+          endpoint: this.endpoint,
+          comfyUiVersion: this.healthValue.version,
+          workflowVersion: WORKFLOW_VERSION,
+        },
+      };
+    } catch (error) {
+      if (request.signal.aborted && promptId) {
+        void this.requestJson('/interrupt', { method: 'POST', body: '{}', timeoutMs: 5_000 }).catch(() => undefined);
+      }
+      throw error;
+    }
+  }
+
+  private async findMissingNodes(): Promise<string[]> {
+    const results = await Promise.all(REQUIRED_NODES.map(async (node) => {
+      try {
+        const value = await this.requestJson(`/object_info/${encodeURIComponent(node)}`, { timeoutMs: 5_000 });
+        return value && typeof value === 'object' && Object.keys(value as object).length > 0 ? null : node;
+      } catch {
+        return node;
+      }
+    }));
+    return results.filter((node): node is Exclude<typeof node, null> => node !== null);
+  }
+
+  private async findMissingModels(): Promise<string[]> {
+    const requirements = [
+      ['diffusion_models', PROFILE_MODEL],
+      ['text_encoders', PROFILE_CLIP],
+      ['vae', PROFILE_VAE],
+      ['background_removal', BACKGROUND_MODEL],
+    ] as const;
+    const missing: string[] = [];
+    await Promise.all(requirements.map(async ([folder, model]) => {
+      try {
+        const values = await this.requestJson(`/models/${folder}`, { timeoutMs: 5_000 });
+        if (!Array.isArray(values) || !values.some((value) => String(value).replaceAll('\\', '/') === model)) missing.push(model);
+      } catch {
+        missing.push(model);
+      }
+    }));
+    return missing.sort();
+  }
+
+  private async waitForOutput(
+    promptId: string,
+    signal: AbortSignal,
+    onProgress?: (message: string) => void,
+  ): Promise<ComfyImageDescriptor> {
+    const deadline = Date.now() + 25 * 60_000;
+    let lastNode = '';
+    while (Date.now() < deadline) {
+      if (signal.aborted) throw abortError();
+      const history = await this.requestJson(`/history/${encodeURIComponent(promptId)}`, {
+        signal,
+        timeoutMs: 15_000,
+      }) as Record<string, unknown>;
+      const entry = (history[promptId] ?? history) as Record<string, unknown>;
+      const status = entry.status as Record<string, unknown> | undefined;
+      if (status?.status_str === 'error' || status?.completed === false && status?.status_str === 'failed') {
+        throw new Error(`ComfyUI zakończyło workflow błędem: ${JSON.stringify(status)}`);
+      }
+      const outputs = entry.outputs as Record<string, unknown> | undefined;
+      const image = findOutputImage(outputs?.[OUTPUT_NODE_ID] ?? outputs);
+      if (image) return image;
+      const node = typeof status?.status_str === 'string' ? status.status_str : '';
+      if (node && node !== lastNode) {
+        lastNode = node;
+        onProgress?.(`ComfyUI: ${node}.`);
+      }
+      await abortableDelay(750, signal);
+    }
+    throw new Error('Generacja ComfyUI przekroczyła limit 25 minut.');
+  }
+
+  private async requestJson(relativeUrl: string, options: RequestInit & { timeoutMs?: number } = {}): Promise<unknown> {
+    const response = await this.fetch(relativeUrl, options);
+    const text = await response.text();
+    if (!text) return {};
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      throw new Error(`ComfyUI zwróciło niepoprawny JSON dla ${relativeUrl}.`);
+    }
+  }
+
+  private async fetch(relativeUrl: string, options: RequestInit & { timeoutMs?: number } = {}): Promise<Response> {
+    const timeoutController = new AbortController();
+    const timeout = setTimeout(() => timeoutController.abort(), options.timeoutMs ?? 10_000);
+    const signal = combineSignals(options.signal, timeoutController.signal);
+    try {
+      const response = await fetch(`${this.endpoint}${relativeUrl}`, {
+        ...options,
+        headers: options.body ? { 'Content-Type': 'application/json', ...options.headers } : options.headers,
+        signal,
+      });
+      if (!response.ok) {
+        const detail = (await response.text()).slice(0, 4_000);
+        throw new Error(`ComfyUI ${response.status} dla ${relativeUrl}: ${detail || response.statusText}`);
+      }
+      return response;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+function buildWorkflow(input: {
+  prompt: string;
+  width: number;
+  height: number;
+  seed: number;
+  steps: number;
+  cfg: number;
+  sampler: string;
+  scheduler: string;
+  filenamePrefix: string;
+  transparent: boolean;
+}): Record<string, { class_type: string; inputs: Record<string, unknown> }> {
+  const workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }> = {
+    '1': { class_type: 'UNETLoader', inputs: { unet_name: PROFILE_MODEL, weight_dtype: 'default' } },
+    '2': { class_type: 'CLIPLoader', inputs: { clip_name: PROFILE_CLIP, type: 'lumina2', device: 'default' } },
+    '3': { class_type: 'VAELoader', inputs: { vae_name: PROFILE_VAE } },
+    '4': { class_type: 'ModelSamplingAuraFlow', inputs: { model: ['1', 0], shift: 3 } },
+    '5': { class_type: 'CLIPTextEncode', inputs: { clip: ['2', 0], text: input.prompt } },
+    '6': { class_type: 'ConditioningZeroOut', inputs: { conditioning: ['5', 0] } },
+    '7': { class_type: 'EmptySD3LatentImage', inputs: { width: input.width, height: input.height, batch_size: 1 } },
+    '8': {
+      class_type: 'KSampler',
+      inputs: {
+        model: ['4', 0], positive: ['5', 0], negative: ['6', 0], latent_image: ['7', 0],
+        seed: input.seed, steps: input.steps, cfg: input.cfg,
+        sampler_name: input.sampler, scheduler: input.scheduler, denoise: 1,
+      },
+    },
+    '9': { class_type: 'VAEDecode', inputs: { samples: ['8', 0], vae: ['3', 0] } },
+  };
+  if (input.transparent) {
+    workflow['10'] = { class_type: 'LoadBackgroundRemovalModel', inputs: { bg_removal_name: BACKGROUND_MODEL } };
+    workflow['11'] = { class_type: 'RemoveBackground', inputs: { image: ['9', 0], bg_removal_model: ['10', 0] } };
+    workflow['12'] = { class_type: 'InvertMask', inputs: { mask: ['11', 0] } };
+    workflow['13'] = { class_type: 'JoinImageWithAlpha', inputs: { image: ['9', 0], alpha: ['12', 0] } };
+  }
+  workflow[OUTPUT_NODE_ID] = {
+    class_type: 'SaveImage',
+    inputs: { images: [input.transparent ? '13' : '9', 0], filename_prefix: input.filenamePrefix },
+  };
+  return workflow;
+}
+
+function buildPrompt(request: ComfyGenerationRequest): string {
+  const typeInstruction = request.roadAtlas
+    ? 'Create one full-frame, opaque, edge-to-edge material sample for an isometric road surface. Show only the road material texture: no road shape, no tile, no atlas, no transparency, no border and no background.'
+    : request.category === 'flat_tile'
+      ? 'Create one seamless 2:1 isometric terrain diamond that reaches all four canvas edges and tiles without gaps.'
+      : request.category === 'elevated_tile'
+        ? 'Create one elevated 2:1 isometric terrain tile with a readable top diamond and vertical walls.'
+        : 'Create one isolated game asset in a fixed isometric view.';
+  return [
+    `Asset: ${request.assetName}`,
+    `Category: ${request.category}`,
+    typeInstruction,
+    request.prompt ? `User request: ${request.prompt}` : '',
+    request.feedback ? `Iteration feedback: ${request.feedback}` : '',
+    request.artBrief ? `Project art direction: ${request.artBrief}` : '',
+    request.styleSummary ? `Established project style: ${request.styleSummary}` : '',
+    request.verificationFeedback ? `The previous attempt failed deterministic validation. Correct this exact issue: ${request.verificationFeedback}` : '',
+    'Centered composition, orthographic isometric camera, no text, no frame, no UI, no cast shadow outside the object.',
+    request.roadAtlas
+      ? 'Fill the entire frame with useful opaque material. Do not add a background or leave empty margins.'
+      : 'Use a simple high-contrast background so the configured BiRefNet stage can extract a clean alpha silhouette.',
+  ].filter(Boolean).join('\n\n');
+}
+
+function chooseGenerationSize(target: { width: number; height: number } | null): { width: number; height: number } {
+  if (!target) return { width: 1024, height: 1024 };
+  const longest = Math.max(target.width, target.height);
+  const scale = longest < 1024 ? 1024 / longest : longest > 1536 ? 1536 / longest : 1;
+  return {
+    width: clamp(roundTo64(target.width * scale), 256, 1536),
+    height: clamp(roundTo64(target.height * scale), 256, 1536),
+  };
+}
+
+function findOutputImage(value: unknown): ComfyImageDescriptor | null {
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  if (Array.isArray(record.images)) {
+    const image = record.images.find((candidate) => candidate && typeof candidate === 'object') as Record<string, unknown> | undefined;
+    if (image && typeof image.filename === 'string') {
+      return {
+        filename: image.filename,
+        subfolder: typeof image.subfolder === 'string' ? image.subfolder : '',
+        type: typeof image.type === 'string' ? image.type : 'output',
+      };
+    }
+  }
+  for (const nested of Object.values(record)) {
+    const found = findOutputImage(nested);
+    if (found) return found;
+  }
+  return null;
+}
+
+function detectDesktopInstallation(): { installed: boolean; updating: boolean; version: string | null; missingModels: string[] } {
+  if (process.platform !== 'win32') return { installed: false, updating: false, version: null, missingModels: [] };
+  const appData = process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming');
+  const localAppData = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local');
+  const installationsPath = path.join(appData, 'Comfy Desktop', 'installations.json');
+  let installPath = '';
+  let version: string | null = null;
+  try {
+    const installations = JSON.parse(readFileSync(installationsPath, 'utf8')) as Array<Record<string, unknown>>;
+    const local = installations.find((item) => typeof item.installPath === 'string');
+    installPath = typeof local?.installPath === 'string' ? local.installPath : '';
+    const comfyVersion = local?.comfyVersion as Record<string, unknown> | undefined;
+    version = typeof comfyVersion?.baseTag === 'string' ? comfyVersion.baseTag : null;
+  } catch {
+    // The process/file probes below still detect a manually installed Desktop build.
+  }
+  const desktopExecutable = path.join(process.env.ProgramFiles ?? 'C:\\Program Files', 'Comfy Desktop', 'Comfy Desktop.exe');
+  const installed = Boolean(installPath) || existsSync(desktopExecutable);
+  const updating = Boolean(installPath && existsSync(path.join(installPath, '.comfyui-op-in-progress.json')));
+  const sharedModels = path.join(localAppData, 'Comfy-Desktop', 'ComfyUI-Shared', 'models');
+  const requirements = [
+    path.join(sharedModels, 'diffusion_models', PROFILE_MODEL),
+    path.join(sharedModels, 'text_encoders', PROFILE_CLIP),
+    path.join(sharedModels, 'vae', PROFILE_VAE),
+    path.join(sharedModels, 'background_removal', BACKGROUND_MODEL),
+  ];
+  const missingModels = requirements
+    .filter((file) => !existsSync(file) || fileSize(file) === 0)
+    .map((file) => path.basename(file));
+  return { installed, updating, version, missingModels };
+}
+
+function fileSize(filePath: string): number {
+  try {
+    return statSync(filePath).size;
+  } catch {
+    return 0;
+  }
+}
+
+function checkingHealth(endpoint: string): ComfyUiHealth {
+  return {
+    state: 'checking', installed: false, server: false, endpoint, version: null,
+    profile: PROFILE, model: PROFILE_MODEL, missingNodes: [], missingModels: [],
+    message: 'Sprawdzanie lokalnego ComfyUI…',
+  };
+}
+
+function normalizeLoopbackEndpoint(value: string): string {
+  const url = new URL(value);
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Endpoint ComfyUI musi używać HTTP lub HTTPS.');
+  if (!['127.0.0.1', 'localhost', '::1', '[::1]'].includes(url.hostname)) {
+    throw new Error('Ze względów bezpieczeństwa Tilemap Generator łączy się tylko z lokalnym ComfyUI.');
+  }
+  return url.toString().replace(/\/$/, '');
+}
+
+async function findRunningComfyEndpoint(currentEndpoint: string): Promise<string | null> {
+  const candidates = Array.from(
+    { length: 11 },
+    (_, index) => `http://127.0.0.1:${8188 + index}`,
+  ).filter((candidate) => candidate !== currentEndpoint);
+  const results = await Promise.all(candidates.map(async (candidate) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1_200);
+    try {
+      const response = await fetch(`${candidate}/system_stats`, { signal: controller.signal });
+      if (!response.ok) return null;
+      const value = await response.json() as Record<string, unknown>;
+      return value.system && typeof value.system === 'object' ? candidate : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }));
+  return results.find((candidate): candidate is string => candidate !== null) ?? null;
+}
+
+function combineSignals(first: AbortSignal | null | undefined, second: AbortSignal): AbortSignal {
+  if (!first) return second;
+  if (typeof AbortSignal.any === 'function') return AbortSignal.any([first, second]);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (first.aborted || second.aborted) abort();
+  else {
+    first.addEventListener('abort', abort, { once: true });
+    second.addEventListener('abort', abort, { once: true });
+  }
+  return controller.signal;
+}
+
+function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', abort);
+      resolve();
+    }, milliseconds);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+function abortError(): Error {
+  const error = new Error('Generacja ComfyUI została anulowana.');
+  error.name = 'AbortError';
+  return error;
+}
+
+function roundTo64(value: number): number {
+  return Math.max(64, Math.round(value / 64) * 64);
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.max(minimum, Math.min(maximum, value));
+}

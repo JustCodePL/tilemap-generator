@@ -1,0 +1,13 @@
+{
+  "name": "TilemapGenerator.TerrainBlend.Editor",
+  "references": [
+    "TilemapGenerator.TerrainBlend.Runtime",
+    "Unity.2D.Tilemap.Editor",
+    "Unity.2D.Tilemap.Extras",
+    "Unity.2D.Sprite.Editor"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "autoReferenced": true
+}

@@ -1,0 +1,7 @@
+{
+  "name": "TilemapGenerator.TerrainBlend.Runtime",
+  "references": [
+    "Unity.2D.Tilemap.Extras"
+  ],
+  "autoReferenced": true
+}
