@@ -1115,6 +1115,75 @@ it('samodzielnie ponawia postać po needs_user_decision i odrzuceniu źródła b
   database.close();
 });
 
+it('odzyskuje alfę z nieprzezroczystego arkusza postaci bez kosztownego retry', async () => {
+  const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-character-alpha-recovery-')), 'project');
+  temporaryDirectories.push(path.dirname(root));
+  mkdirSync(root);
+  const database = ProjectDatabase.create(root, {
+    name: 'Odzyskanie alfa postaci', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+    characterFramesPerDirection: CHARACTER_FIXTURE_FRAMES,
+  });
+  let generationTurns = 0;
+  let analysisTurns = 0;
+  const fakeCodex = {
+    health: () => ({ state: 'ready', message: 'Gotowy' }),
+    runExclusive: async <T>(operation: () => Promise<T>) => operation(),
+    ensureAssetThread: async () => 'thread-character-alpha-recovery',
+    startUtilityThread: async () => 'thread-character-alpha-analysis',
+    skillPath: () => '/Applications/ChatGPT.app/imagegen/SKILL.md',
+    interruptActiveTurn: async () => undefined,
+    runTurn: async (_threadId: string, input: Array<Record<string, unknown>>) => {
+      if (!input.some((item) => item.type === 'skill')) {
+        analysisTurns += 1;
+        return {
+          turnId: 'turn-character-alpha-analysis', items: [],
+          finalMessage: JSON.stringify(passedMovementAnalysis(['north', 'east', 'south', 'west'])),
+        };
+      }
+      generationTurns += 1;
+      const prompt = String(input[0].text);
+      const outputPath = prompt.match(/exactly (.+?final\.png)/i)?.[1];
+      if (!outputPath) throw new Error('Test nie znalazł final.png w prompcie odzyskania alfa.');
+      await writeOpaqueCharacterSheet(outputPath, 32, 32);
+      return {
+        turnId: 'turn-character-alpha-generation', items: [],
+        finalMessage: JSON.stringify({
+          status: 'completed', finalPath: outputPath, category: 'character', tags: ['goblin'],
+          pivot: { x: 0.5, y: 0 }, description: 'Goblin na wypalonym tle', message: '',
+        }),
+      };
+    },
+  } as unknown as CodexService;
+  const queue = new GenerationQueue(fakeCodex);
+  queue.attach(database);
+  const terminal = waitForGenerationTerminal(queue);
+  const job = queue.enqueue({
+    name: 'Goblin bez alfa', prompt: '', mode: 'generate', category: 'character',
+    relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
+    characterAnimation: { action: 'walk', framesPerDirection: CHARACTER_FIXTURE_FRAMES, framesPerSecond: 8 },
+  });
+
+  await expect(terminal).resolves.toMatchObject({ type: 'completed', jobId: job.id });
+  expect(generationTurns).toBe(1);
+  expect(analysisTurns).toBe(1);
+  expect(database.listGenerationLogs(job.assetId).some((entry) => (
+    entry.message.includes('Bezpiecznie odzyskano kanał alfa')
+  ))).toBe(true);
+  expect(database.listGenerationLogs(job.assetId).some((entry) => entry.stage === 'retry')).toBe(false);
+  expect(database.getAsset(job.assetId)?.versions[0].generationMetadata).toMatchObject({
+    characterTransparencyRecovery: {
+      method: 'light-neutral-border',
+      borderConfidence: expect.any(Number),
+      backgroundPixels: expect.any(Number),
+      foregroundPixels: expect.any(Number),
+    },
+  });
+  expect(await sharp(path.join(root, 'assets', job.assetId, job.versionId, 'final.png')).metadata())
+    .toMatchObject({ hasAlpha: true });
+  await queue.shutdown();
+  database.close();
+});
+
 it('wybiera najlepszy wynik imagegen, normalizuje go i kończy bez zbędnego retry', async () => {
   const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-character-source-selection-')), 'project');
   temporaryDirectories.push(path.dirname(root));
@@ -1433,6 +1502,31 @@ async function writeCharacterSheet(
       background: { r: 0, g: 0, b: 0, alpha: 0 },
     },
   }).composite(composites).png().toFile(filePath);
+}
+
+async function writeOpaqueCharacterSheet(
+  filePath: string,
+  frameWidth: number,
+  frameHeight: number,
+): Promise<void> {
+  const transparentPath = path.join(path.dirname(filePath), 'transparent-character-source.png');
+  await writeCharacterSheet(transparentPath, frameWidth, frameHeight);
+  const width = frameWidth * (CHARACTER_FIXTURE_FRAMES + 1);
+  const height = frameHeight * 4;
+  const tile = 12;
+  const background = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`
+    + Array.from({ length: Math.ceil(height / tile) }, (_, row) => (
+      Array.from({ length: Math.ceil(width / tile) }, (_, column) => (
+        `<rect x="${column * tile}" y="${row * tile}" width="${tile}" height="${tile}" fill="${(row + column) % 2 ? '#ffffff' : '#d8d8d8'}"/>`
+      )).join('')
+    )).join('')
+    + '</svg>';
+  await sharp(Buffer.from(background))
+    .composite([{ input: transparentPath }])
+    .removeAlpha()
+    .png()
+    .toFile(filePath);
+  rmSync(transparentPath, { force: true });
 }
 
 async function writeStaticCharacterSheet(

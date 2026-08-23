@@ -38,6 +38,8 @@ import { nullLogger, type Logger } from './app-logger';
 import {
   inspectCharacterAnimationSource,
   normalizeCharacterAnimationSource,
+  recoverCharacterAnimationTransparency,
+  type CharacterAnimationTransparencyRecovery,
 } from './character-animation-source';
 import {
   createCharacterAnimationAnalysisArtifacts,
@@ -730,7 +732,7 @@ export class GenerationQueue extends EventEmitter {
           } else {
             try {
               if (characterVerification) {
-                characterSourcePath = await resolveCharacterGeneratedFile(
+                const resolvedCharacterSource = await resolveCharacterGeneratedFile(
                   database,
                   attemptPath,
                   response.finalPath,
@@ -738,7 +740,35 @@ export class GenerationQueue extends EventEmitter {
                   characterAnimationSheetSize(project, context, context.characterAnimation!),
                   context.characterAnimation!.framesPerDirection,
                 );
+                characterSourcePath = resolvedCharacterSource.path;
                 stagedFinal = characterSourcePath;
+                if (resolvedCharacterSource.transparencyRecovery) {
+                  const recovery = resolvedCharacterSource.transparencyRecovery;
+                  generationMetadata = {
+                    ...generationMetadata,
+                    characterTransparencyRecovery: {
+                      method: recovery.method,
+                      borderConfidence: recovery.borderConfidence,
+                      backgroundPixels: recovery.backgroundPixels,
+                      foregroundPixels: recovery.foregroundPixels,
+                    },
+                  };
+                  database.addArtifact(
+                    job.id,
+                    `native-character-source-attempt-${activeAttempt}`,
+                    database.relative(resolvedCharacterSource.nativeSourcePath),
+                    'image/png',
+                  );
+                  this.log(
+                    database,
+                    job.id,
+                    'verification',
+                    'success',
+                    activeAttempt,
+                    `Bezpiecznie odzyskano kanał alfa z tła połączonego z krawędzią obrazu `
+                    + `(pewność ${(recovery.borderConfidence * 100).toFixed(1)}%).`,
+                  );
+                }
               } else {
                 stagedFinal = resolveGeneratedFile(database, attemptPath, response.finalPath, resultItems);
               }
@@ -1458,7 +1488,7 @@ function buildGenerationPrompt(
     ].join('\n')
     : context.category === 'character'
       ? [
-        'Use exactly one built-in image generation call in this application attempt. The generated PNG is a native-resolution source sheet; the application owns alpha inspection, exact sizing, deterministic composition and retry.',
+        'Use exactly one built-in image generation call in this application attempt. The generated PNG is a native-resolution source sheet; the application owns alpha inspection, guarded edge-connected background removal, exact sizing, deterministic composition and retry.',
         `Copy the best native PNG unchanged to exactly ${path.join(stagingPath, 'final.png')}, even when the generator chose a different canvas size or omitted alpha. Do not make a second image-generation/edit call to remove a background or checkerboard in this turn.`,
         'Inspect transparency numerically from PNG metadata and alpha values, never from the preview or from RGB values hidden under alpha=0. If a real alpha channel and transparent pixels exist, accept that source without background removal.',
         `In the final JSON use ${path.join(stagingPath, 'final.png')} as finalPath. The application will preserve the source, normalize all ${(context.characterAnimation!.framesPerDirection + 1) * 4} cells and reject or retry it when necessary.`,
@@ -1483,7 +1513,9 @@ function buildGenerationPrompt(
       ? 'Constraints for the source swatch: opaque edge-to-edge material; no text; no watermark; no frame; no objects. The application, not imagegen, makes the final road variants transparent.'
       : opaqueTopDownTerrain
         ? 'Constraints: final deliverable must be a full-canvas terrain PNG with all four corners covered; no text; no watermark; no frame; no unrelated props.'
-        : 'Constraints: final deliverable must be a transparent PNG with transparent corners; no text; no watermark; no frame; no unrelated props.',
+        : context.category === 'character'
+          ? 'Constraints: prefer real PNG transparency. If native alpha is unavailable, use one perfectly uniform #ff00ff background across the whole sheet so the application can remove it deterministically. Never draw a checkerboard, grid, floor, cast shadow, frame, text, watermark or unrelated props.'
+          : 'Constraints: final deliverable must be a transparent PNG with transparent corners; no text; no watermark; no frame; no unrelated props.',
     isRoadAssetCategory(context.category)
       ? 'Use the built-in image generation workflow. This source intentionally does not request transparency, so do not enter the imagegen transparent-output workflow.'
       : opaqueTopDownTerrain
@@ -1579,7 +1611,7 @@ function buildCharacterAnimationInstructions(
     `Keep exactly the same character identity, face, outfit, colors, proportions, scale, lighting and silhouette language in all ${cells} cells.`,
     'Each row must face and visually move in its declared direction. Keep the root and shared ground-contact pivot fixed in every frame; animate limbs without foot sliding, body teleportation or camera movement.',
     `Walk frame W${walkFrames} must connect smoothly back to W1. Keep baseline, centroid, occupied area and transparent padding stable; do not crop the character or create extra/missing limbs.`,
-    'Leave every cell background transparent, including all four cell corners. Held or worn equipment explicitly belonging to the character is allowed but must stay inside its cell. Do not draw a floor, cast shadow, unrelated props, arrows, text, direction names or a surrounding scene.',
+    'Leave every cell background transparent, including all four cell corners. If the generator cannot emit real alpha, use one perfectly uniform #ff00ff background across the entire canvas; never simulate transparency with a checkerboard. Held or worn equipment explicitly belonging to the character is allowed but must stay inside its cell. Do not draw a grid, floor, cast shadow, unrelated props, arrows, text, direction names or a surrounding scene.',
   ].join('\n');
 }
 
@@ -1641,7 +1673,7 @@ function buildCharacterRetryPrompt(
     hasPreviousCandidate
       ? 'Inspect the failed sheet before editing. Correct every reported direction and loop issue; do not merely copy the failed frames or hide motion defects with blur, shadows or duplicated poses.'
       : 'Create a fresh sheet that corrects every reported contract or animation defect; do not hide motion defects with blur, shadows or duplicated poses.',
-    'Use exactly one built-in image generation/edit call for this application retry. Never switch to CLI/API or request OPENAI_API_KEY. Do not launch a second generative background-removal pass; the application validates alpha numerically and controls further retries.',
+    'Use exactly one built-in image generation/edit call for this application retry. Prefer real PNG alpha; if unavailable, use one perfectly uniform #ff00ff canvas background and never draw a checkerboard. Never switch to CLI/API or request OPENAI_API_KEY. Do not launch a second generative background-removal pass; the application validates alpha numerically, can remove an unambiguous edge-connected background deterministically, and controls further retries.',
     `Copy the best native repaired PNG unchanged to exactly ${path.join(stagingPath, 'final.png')}, even if its native canvas dimensions differ from the delivery dimensions.`,
     buildPivotInstruction('character', tileHeight, 0, frameSize.height, true),
     'Finish with JSON matching the supplied schema, return category exactly as character, and put that actual PNG path in finalPath.',
@@ -1823,7 +1855,11 @@ async function resolveCharacterGeneratedFile(
   items: Array<Record<string, unknown>>,
   expectedSize: { width: number; height: number },
   framesPerDirection: number,
-): Promise<string> {
+): Promise<{
+  path: string;
+  nativeSourcePath: string;
+  transparencyRecovery: CharacterAnimationTransparencyRecovery | null;
+}> {
   const candidates: string[] = [];
   const reported = reportedPath
     ? (path.isAbsolute(reportedPath) ? reportedPath : path.resolve(stagingPath, reportedPath))
@@ -1857,17 +1893,34 @@ async function resolveCharacterGeneratedFile(
   }
   const projection = database.getProject().projection;
   let selected = allowed[0];
+  let selectedPrepared = allowed[0];
+  let selectedRecovery: CharacterAnimationTransparencyRecovery | null = null;
   let selectedScore = -1;
   for (const [index, candidate] of allowed.entries()) {
     let score = 0;
     const evaluationPath = path.join(stagingPath, `.candidate-evaluation-${index}.png`);
+    const recoveredPath = path.join(stagingPath, `.candidate-recovered-${index}.png`);
+    let preparedCandidate = candidate;
+    let recovery: CharacterAnimationTransparencyRecovery | null = null;
     try {
-      const inspection = await inspectCharacterAnimationSource(candidate, framesPerDirection);
+      let inspection = await inspectCharacterAnimationSource(candidate, framesPerDirection);
+      const onlyTransparencyMissing = inspection.issues.length > 0 && inspection.issues.every((issue) => (
+        issue.includes('nie ma kanału alfa') || issue.includes('nie zawiera rzeczywiście przezroczystych pikseli')
+      ));
+      if (onlyTransparencyMissing) {
+        recovery = await recoverCharacterAnimationTransparency({
+          sourcePath: candidate,
+          outputPath: recoveredPath,
+          framesPerDirection,
+        });
+        preparedCandidate = recoveredPath;
+        inspection = recovery.output;
+      }
       if (inspection.usable) {
         score = inspection.width === expectedSize.width && inspection.height === expectedSize.height ? 2 : 1;
         try {
           await normalizeCharacterAnimationSource({
-            sourcePath: candidate,
+            sourcePath: preparedCandidate,
             outputPath: evaluationPath,
             frameWidthPx,
             frameHeightPx,
@@ -1891,13 +1944,24 @@ async function resolveCharacterGeneratedFile(
     }
     if (score > selectedScore) {
       selected = candidate;
+      selectedPrepared = preparedCandidate;
+      selectedRecovery = recovery;
       selectedScore = score;
     }
   }
 
   const stagedSource = path.join(stagingPath, 'selected-source.png');
-  if (path.resolve(selected) !== path.resolve(stagedSource)) copyFileSync(selected, stagedSource);
-  return stagedSource;
+  const stagedNativeSource = path.join(stagingPath, 'native-source.png');
+  if (path.resolve(selected) !== path.resolve(stagedNativeSource)) copyFileSync(selected, stagedNativeSource);
+  if (path.resolve(selectedPrepared) !== path.resolve(stagedSource)) copyFileSync(selectedPrepared, stagedSource);
+  for (let index = 0; index < allowed.length; index += 1) {
+    rmSync(path.join(stagingPath, `.candidate-recovered-${index}.png`), { force: true });
+  }
+  return {
+    path: stagedSource,
+    nativeSourcePath: stagedNativeSource,
+    transparencyRecovery: selectedRecovery,
+  };
 }
 
 function resolveGeneratedFile(

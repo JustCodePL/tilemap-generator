@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   inspectCharacterAnimationSource,
   normalizeCharacterAnimationSource,
+  recoverCharacterAnimationTransparency,
 } from '../main/services/character-animation-source';
 
 const directories: string[] = [];
@@ -79,6 +80,62 @@ describe('inspectCharacterAnimationSource', () => {
     expect(result.usable).toBe(false);
     expect(result.cells).toHaveLength((FIXTURE_FRAMES_PER_DIRECTION + 1) * 4);
     expect(result.issues).toContain('Komórka 4×3 źródła animacji postaci jest pusta.');
+  });
+});
+
+describe('recoverCharacterAnimationTransparency', () => {
+  it('odzyskuje prawdziwą alfę z jasnego checkerboardu bez zmiany źródła', async () => {
+    const directory = temp();
+    const source = path.join(directory, 'opaque-checkerboard.png');
+    const output = path.join(directory, 'recovered.png');
+    await createOpaqueSheet(source, 200, 128, 'checkerboard');
+    const sourceHash = digest(source);
+
+    const recovery = await recoverCharacterAnimationTransparency({
+      sourcePath: source,
+      outputPath: output,
+      framesPerDirection: FIXTURE_FRAMES_PER_DIRECTION,
+    });
+
+    expect(recovery.method).toBe('light-neutral-border');
+    expect(recovery.borderConfidence).toBeGreaterThanOrEqual(0.8);
+    expect(recovery.output).toMatchObject({ hasAlpha: true, usable: true });
+    expect(recovery.output.transparentPixels).toBeGreaterThan(0);
+    expect(recovery.output.cells).toHaveLength((FIXTURE_FRAMES_PER_DIRECTION + 1) * 4);
+    expect(digest(source)).toBe(sourceHash);
+  });
+
+  it('odzyskuje alfę z jednoznacznego tła chroma key', async () => {
+    const directory = temp();
+    const source = path.join(directory, 'opaque-magenta.png');
+    const output = path.join(directory, 'recovered.png');
+    await createOpaqueSheet(source, 200, 128, 'magenta');
+
+    const recovery = await recoverCharacterAnimationTransparency({
+      sourcePath: source,
+      outputPath: output,
+      framesPerDirection: FIXTURE_FRAMES_PER_DIRECTION,
+    });
+
+    expect(recovery.method).toBe('uniform-border-color');
+    expect(recovery.output.usable).toBe(true);
+  });
+
+  it('odmawia usunięcia niejednoznacznego wielokolorowego tła', async () => {
+    const directory = temp();
+    const source = path.join(directory, 'ambiguous.png');
+    const output = path.join(directory, 'recovered.png');
+    const svg = '<svg width="200" height="128" xmlns="http://www.w3.org/2000/svg">'
+      + '<defs><linearGradient id="g"><stop stop-color="#1020c0"/><stop offset=".5" stop-color="#ef3020"/><stop offset="1" stop-color="#10b040"/></linearGradient></defs>'
+      + '<rect width="200" height="128" fill="url(#g)"/></svg>';
+    await sharp(Buffer.from(svg)).removeAlpha().png().toFile(source);
+
+    await expect(recoverCharacterAnimationTransparency({
+      sourcePath: source,
+      outputPath: output,
+      framesPerDirection: FIXTURE_FRAMES_PER_DIRECTION,
+    })).rejects.toThrow(/Nie można bezpiecznie odseparować tła/);
+    expect(existsSync(output)).toBe(false);
   });
 });
 
@@ -224,6 +281,32 @@ async function createTransparentSheet(
   await sharp({
     create: { width, height, channels: 4, background: { ...background, alpha: 0 } },
   }).composite(composites).png().toFile(filePath);
+}
+
+async function createOpaqueSheet(
+  filePath: string,
+  width: number,
+  height: number,
+  background: 'checkerboard' | 'magenta',
+): Promise<void> {
+  const transparentPath = path.join(path.dirname(filePath), `.transparent-${path.basename(filePath)}`);
+  await createTransparentSheet(transparentPath, width, height);
+  const tile = 12;
+  const backgroundSvg = background === 'magenta'
+    ? `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="#ff00ff"/></svg>`
+    : `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`
+      + Array.from({ length: Math.ceil(height / tile) }, (_, row) => (
+        Array.from({ length: Math.ceil(width / tile) }, (_, column) => (
+          `<rect x="${column * tile}" y="${row * tile}" width="${tile}" height="${tile}" fill="${(row + column) % 2 ? '#ffffff' : '#d8d8d8'}"/>`
+        )).join('')
+      )).join('')
+      + '</svg>';
+  await sharp(Buffer.from(backgroundSvg))
+    .composite([{ input: transparentPath }])
+    .removeAlpha()
+    .png()
+    .toFile(filePath);
+  rmSync(transparentPath, { force: true });
 }
 
 async function alphaBounds(
