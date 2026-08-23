@@ -17,8 +17,10 @@ const state = vi.hoisted(() => {
     hidden = false;
     focused = false;
     destroyed = false;
+    readonly options: Record<string, unknown>;
 
-    constructor() {
+    constructor(options: Record<string, unknown>) {
+      this.options = options;
       windows.push(this);
     }
 
@@ -57,6 +59,9 @@ const state = vi.hoisted(() => {
     autoUpdater: {
       on: vi.fn((event: string, listener: Listener) => autoUpdaterListeners.set(event, listener)),
     },
+    screen: {
+      getPrimaryDisplay: vi.fn(() => ({ workAreaSize: { width: 900, height: 650 } })),
+    },
   };
 });
 
@@ -69,6 +74,7 @@ vi.mock('electron', () => ({
     registerSchemesAsPrivileged: vi.fn(),
     handle: vi.fn(),
   },
+  screen: state.screen,
 }));
 vi.mock('../main/ipc/register-ipc', () => ({ registerIpc: state.registerIpc }));
 vi.mock('../main/services/app-logger', () => ({ AppLogger: class AppLogger {} }));
@@ -98,6 +104,7 @@ it('na macOS ukrywa zamknięte okno i ponownie je pokazuje bez duplikowania IPC'
   await import('../main/index');
   await vi.waitFor(() => expect(state.windows).toHaveLength(1));
   const window = state.windows[0];
+  expect(window.options).toMatchObject({ width: 900, height: 650, minWidth: 720, minHeight: 560 });
   expect(state.registerIpc).toHaveBeenCalledTimes(1);
 
   const closeEvent = { preventDefault: vi.fn() };

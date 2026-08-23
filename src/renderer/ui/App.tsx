@@ -352,7 +352,7 @@ function Workspace(props: {
           <button className={props.view === 'export' ? 'active' : ''} onClick={() => props.onView('export')}><Download /> Eksport</button>
           <button className={props.view === 'diagnostics' ? 'active' : ''} onClick={() => props.onView('diagnostics')}><Settings2 /> Diagnostyka</button>
         </nav>
-        <div className="top-actions"><HealthPill health={health.data} /><ComfyHealthPill health={comfyHealth.data} /><StableDiffusionCppHealthPill health={stableDiffusionCppHealth.data} /><button className="ghost" onClick={props.onClose}><X /> Zamknij</button></div>
+        <div className="top-actions"><HealthPill health={health.data} /><ComfyHealthPill health={comfyHealth.data} /><StableDiffusionCppHealthPill health={stableDiffusionCppHealth.data} /><button className="ghost close-project" aria-label="Zamknij projekt" title="Zamknij projekt" onClick={props.onClose}><X /> <span>Zamknij</span></button></div>
       </header>
       <div className="workspace-grid">
         <aside className="asset-sidebar">

@@ -1,4 +1,4 @@
-import { app, autoUpdater, BrowserWindow, net, protocol } from 'electron';
+import { app, autoUpdater, BrowserWindow, net, protocol, screen } from 'electron';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { registerIpc } from './ipc/register-ipc';
@@ -39,11 +39,16 @@ async function createWindowOnce(): Promise<void> {
     await previousCleanup();
   }
 
+  const { width: workAreaWidth, height: workAreaHeight } = screen.getPrimaryDisplay().workAreaSize;
+  const preferredWidth = Number(process.env.TILEMAP_WINDOW_WIDTH ?? 1540);
+  const preferredHeight = Number(process.env.TILEMAP_WINDOW_HEIGHT ?? 960);
+  const minWidth = Math.min(720, workAreaWidth);
+  const minHeight = Math.min(560, workAreaHeight);
   const window = new BrowserWindow({
-    width: 1540,
-    height: 960,
-    minWidth: 1120,
-    minHeight: 720,
+    width: Math.min(Math.max(Number.isFinite(preferredWidth) ? preferredWidth : 1540, minWidth), workAreaWidth),
+    height: Math.min(Math.max(Number.isFinite(preferredHeight) ? preferredHeight : 960, minHeight), workAreaHeight),
+    minWidth,
+    minHeight,
     backgroundColor: '#0b0e12',
     title: 'Tilemap Generator',
     autoHideMenuBar: true,
