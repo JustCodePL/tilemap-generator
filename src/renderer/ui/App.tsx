@@ -2211,7 +2211,7 @@ function ExportView({ project, assets }: { project: ProjectInfo; assets: AssetSu
           setError('');
         }}
       >
-        <span>{integration.id === 'phaser' ? <Gamepad2 /> : <Box />}</span>
+        <span>{integration.id === 'phaser' ? <Gamepad2 /> : integration.id === 'godot' ? <SquareStack /> : <Box />}</span>
         <div><strong>{integration.label}</strong><small>{integration.description}</small></div>
         {selectedIntegration === integration.id && <Check />}
       </button>)}
@@ -2223,6 +2223,8 @@ function ExportView({ project, assets }: { project: ProjectInfo; assets: AssetSu
         ? <>Wybierz dokładne miejsce wewnątrz katalogu <code>Assets</code> projektu Unity. Trafią tam zatwierdzone pliki i manifest. Narzędzia Unity są instalowane raz, osobno w <code>Assets/TilemapGeneratorIntegration</code>.</>
         : selectedIntegration === 'phaser'
           ? <>Wybierz dokładny katalog docelowy używany przez grę Phaser. Trafią tam wyłącznie zatwierdzone assety oraz natywny manifest Phaser File Pack <code>tilemap-assets.phaser.json</code>.</>
+          : selectedIntegration === 'godot'
+            ? <>Wybierz katalog wewnątrz projektu Godot zawierającego <code>project.godot</code>. Assety otrzymają ścieżki <code>res://</code>, a obok nich powstanie manifest <code>tilemap-assets.godot.json</code>.</>
         : <>Wybierz dokładny katalog docelowy integracji {selectedDescriptor.label}. Trafią tam wyłącznie zatwierdzone assety.</>}</p>
       <div className="export-target"><FolderOpen /><div><small>{selectedDescriptor.targetLabel}</small><strong title={target}>{target || 'Nie wybrano'}</strong></div><button className="secondary" type="button" disabled={choose.isPending || makePreview.isPending || run.isPending} onClick={() => choose.mutate(selectedIntegration)}>{choose.isPending ? <LoaderCircle className="spin" /> : <FolderOpen />} Wybierz miejsce eksportu</button></div>
       <button className="primary" disabled={!target || choose.isPending || makePreview.isPending || run.isPending} onClick={() => makePreview.mutate()}>{makePreview.isPending ? <LoaderCircle className="spin" /> : <Play />} Przygotuj podgląd</button>

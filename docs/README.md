@@ -8,7 +8,7 @@ Tilemap Generator to desktopowa aplikacja do tworzenia, weryfikowania, wersjonow
 - [Instrukcja użytkownika](user-guide.md) — praca od utworzenia projektu do zatwierdzenia i eksportu.
 - [Generowanie i walidacja](generation-validation.md) — providery, kolejka, retry, walidatory i obowiązkowa analiza postaci.
 - [Architektura techniczna](architecture.md) — procesy Electron, dane projektu, IPC, kolejka, MCP i bezpieczeństwo.
-- [Integracje eksportu](export-integrations.md) — wspólny model eksportu, Unity oraz Phaser 3.
+- [Integracje eksportu](export-integrations.md) — wspólny model eksportu, Unity, Phaser 3 oraz Godot 4.
 - [Uruchamianie i rozwój na macOS](development-macos.md) — środowisko, testy, pakowanie i diagnostyka modułów natywnych.
 - [Wydania macOS i kanały aktualizacji](releasing.md) — podpis, notarization, workflow beta/stable oraz publiczny feed GitHub Pages.
 - [MCP dla Codexa](codex-mcp.md) — podłączenie innej lokalnej rozmowy Codexa do uruchomionej aplikacji.

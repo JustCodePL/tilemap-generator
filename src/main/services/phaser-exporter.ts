@@ -40,16 +40,49 @@ import {
   type TerrainBlendAtlasResult,
 } from './terrain-blend-generator';
 
-const PHASER_SCHEMA_VERSION = 1;
-const PHASER_PACK_SECTION = 'tilemap-generator';
-const MANIFEST_NAME = 'tilemap-assets.phaser.json';
+const RUNTIME_SCHEMA_VERSION = 1;
+const RUNTIME_MANIFEST_SECTION = 'tilemap-generator';
 const PREVIEW_TTL_MS = 10 * 60_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-type PhaserPackFile = {
+interface RuntimeExporterConfig {
+  integration: Extract<ExportIntegration, 'phaser' | 'godot'>;
+  engine: 'phaser3' | 'godot4';
+  label: string;
+  description: string;
+  manifestName: string;
+  targetDialogTitle: string;
+  targetDialogButtonLabel: string;
+  requireGodotProject: boolean;
+}
+
+const PHASER_CONFIG: RuntimeExporterConfig = {
+  integration: 'phaser',
+  engine: 'phaser3',
+  label: 'Phaser 3',
+  description: 'PNG, spritesheety i natywny File Pack z metadanymi dla Phaser 3.',
+  manifestName: 'tilemap-assets.phaser.json',
+  targetDialogTitle: 'Wybierz katalog docelowy integracji Phaser',
+  targetDialogButtonLabel: 'Wybierz katalog',
+  requireGodotProject: false,
+};
+
+const GODOT_CONFIG: RuntimeExporterConfig = {
+  integration: 'godot',
+  engine: 'godot4',
+  label: 'Godot 4',
+  description: 'PNG, spritesheety i manifest runtime ze ścieżkami res:// dla Godot 4.',
+  manifestName: 'tilemap-assets.godot.json',
+  targetDialogTitle: 'Wybierz katalog docelowy integracji Godot',
+  targetDialogButtonLabel: 'Wybierz katalog Godot',
+  requireGodotProject: true,
+};
+
+type RuntimeResourceFile = {
   type: 'image' | 'spritesheet';
   key: string;
   url: string;
+  resourcePath?: string;
   frameConfig?: {
     frameWidth: number;
     frameHeight: number;
@@ -64,6 +97,7 @@ interface ExistingDelivery {
 }
 
 interface PendingExport {
+  config: RuntimeExporterConfig;
   projectId: string;
   projectRoot: string;
   assetIds?: string[];
@@ -92,30 +126,38 @@ interface FilesystemCommit {
   rollback(): void;
 }
 
-export class PhaserExporter {
-  readonly integration: ExportIntegration = 'phaser';
-  readonly descriptor: ExportIntegrationDescriptor = {
-    id: 'phaser',
-    label: 'Phaser 3',
-    description: 'PNG, spritesheety i natywny File Pack z metadanymi dla Phaser 3.',
-    targetLabel: 'Katalog docelowy',
-  };
-  readonly targetDialog = {
-    title: 'Wybierz katalog docelowy integracji Phaser',
-    buttonLabel: 'Wybierz katalog',
-  };
+class RuntimeManifestExporter {
+  readonly integration: ExportIntegration;
+  readonly descriptor: ExportIntegrationDescriptor;
+  readonly targetDialog: { title: string; buttonLabel: string };
   private readonly pending = new Map<string, PendingExport>();
 
+  constructor(private readonly config: RuntimeExporterConfig) {
+    this.integration = config.integration;
+    this.descriptor = {
+      id: config.integration,
+      label: config.label,
+      description: config.description,
+      targetLabel: config.requireGodotProject ? 'Katalog wewnątrz projektu Godot' : 'Katalog docelowy',
+    };
+    this.targetDialog = {
+      title: config.targetDialogTitle,
+      buttonLabel: config.targetDialogButtonLabel,
+    };
+  }
+
   validateTarget(targetDirectory: string): string {
-    return resolveTarget(targetDirectory);
+    return resolveTarget(targetDirectory, this.config);
   }
 
   async preview(database: ProjectDatabase, input: ExportPreviewInput): Promise<ExportPreview> {
-    if (input.integration !== this.integration) throw new Error('Nieprawidłowa integracja eksportu Phaser.');
-    const targetDirectory = resolveTarget(input.targetDirectory);
+    if (input.integration !== this.integration) {
+      throw new Error(`Nieprawidłowa integracja eksportu ${this.config.label}.`);
+    }
+    const targetDirectory = resolveTarget(input.targetDirectory, this.config);
     const project = database.getProject();
-    const manifestPath = path.join(targetDirectory, MANIFEST_NAME);
-    const existing = readExistingDelivery(targetDirectory, manifestPath, project.id);
+    const manifestPath = path.join(targetDirectory, this.config.manifestName);
+    const existing = readExistingDelivery(targetDirectory, manifestPath, project.id, this.config);
     const approved = database.approvedAssets(input.assetIds);
     if (project.projection === 'top_down'
       && approved.some(({ version }) => version.category === 'elevated_tile')) {
@@ -154,7 +196,7 @@ export class PhaserExporter {
     }
 
     const files: ExportFilePreview[] = [];
-    const packFiles: PhaserPackFile[] = [];
+    const packFiles: RuntimeResourceFile[] = [];
     const assetEntries: Array<Record<string, unknown>> = [];
     const ownedFiles = existing?.managedFiles ?? new Set<string>();
 
@@ -163,7 +205,7 @@ export class PhaserExporter {
       const directory = path.join(targetDirectory, 'assets', version.category);
       const stem = `${slugify(asset.name)}--${asset.id.slice(0, 8)}`;
       let mainFile: ExportFilePreview | null = null;
-      let mainLoader: PhaserPackFile | null = null;
+      let mainLoader: RuntimeResourceFile | null = null;
 
       if (version.category !== 'road_tile') {
         const destinationPath = path.join(directory, `${stem}.png`);
@@ -214,7 +256,7 @@ export class PhaserExporter {
             loader,
             widthPx: variant.width,
             heightPx: variant.height,
-            origin: phaserOrigin(version.pivot),
+            origin: topLeftOrigin(version.pivot),
           };
         })
         : null;
@@ -235,7 +277,7 @@ export class PhaserExporter {
           destinationPath: atlasDestination,
           role: 'terrain_blend_atlas',
         });
-        const atlasLoader: PhaserPackFile = {
+        const atlasLoader: RuntimeResourceFile = {
           type: 'spritesheet',
           key: atlasKey,
           url: relativeUrl(targetDirectory, atlasDestination),
@@ -282,7 +324,7 @@ export class PhaserExporter {
           frameHeightPx: blend.manifest.spriteHeightPx,
           surfaceHeightPx: blend.manifest.surfaceHeightPx,
           sourcePivotNormalized: blend.manifest.pivotNormalized,
-          origin: phaserOrigin(blend.manifest.pivotNormalized),
+          origin: topLeftOrigin(blend.manifest.pivotNormalized),
           variants: blend.manifest.variants.map((variant, frameIndex) => ({
             mask: variant.mask,
             frameIndex,
@@ -306,6 +348,9 @@ export class PhaserExporter {
         category: version.category,
         textureKey: mainLoader?.key ?? null,
         file: mainUrl,
+        ...(this.config.integration === 'godot' && mainUrl
+          ? { resourcePath: godotResourcePath(this.config, targetDirectory, mainUrl) }
+          : {}),
         loader: mainLoader,
         widthPx: version.width,
         heightPx: version.height,
@@ -316,7 +361,7 @@ export class PhaserExporter {
         footprintCells: version.footprint,
         tags: version.tags,
         sourcePivotNormalized: version.pivot,
-        origin: phaserOrigin(version.pivot),
+        origin: topLeftOrigin(version.pivot),
         elevationLevels: version.elevationLevels,
         roadVariants,
         terrainBlend,
@@ -352,14 +397,20 @@ export class PhaserExporter {
     }
 
     const managedFiles = [...desiredManagedFiles]
-      .map((filePath) => relativeManagedPath(targetDirectory, filePath))
+      .map((filePath) => relativeManagedPath(targetDirectory, filePath, this.config))
       .sort();
     const generatedAt = new Date().toISOString();
+    const manifestFiles = packFiles.map((file) => ({
+      ...file,
+      ...(this.config.integration === 'godot'
+        ? { resourcePath: godotResourcePath(this.config, targetDirectory, file.url) }
+        : {}),
+    }));
     const section = {
-      schemaVersion: PHASER_SCHEMA_VERSION,
-      engine: 'phaser3',
+      schemaVersion: RUNTIME_SCHEMA_VERSION,
+      engine: this.config.engine,
       generatedAt,
-      files: packFiles,
+      files: manifestFiles,
       managedFiles,
       project: {
         id: project.id,
@@ -372,10 +423,16 @@ export class PhaserExporter {
         tileHeightPx: project.tileHeightPx,
         pixelsPerUnit: project.pixelsPerUnit,
       },
+      ...(this.config.integration === 'godot' ? {
+        godot: {
+          resourceRoot: godotResourcePath(this.config, targetDirectory, ''),
+          manifestPath: godotResourcePath(this.config, targetDirectory, this.config.manifestName),
+        },
+      } : {}),
       assets: assetEntries,
     };
     const manifest: Record<string, unknown> = {
-      [PHASER_PACK_SECTION]: section,
+      [RUNTIME_MANIFEST_SECTION]: section,
       meta: {
         app: 'Tilemap Generator',
         version: '1.0',
@@ -392,6 +449,7 @@ export class PhaserExporter {
       files,
     };
     this.pending.set(token, {
+      config: this.config,
       projectId: project.id,
       projectRoot: project.rootPath,
       ...(input.assetIds ? { assetIds: [...input.assetIds].sort() } : {}),
@@ -423,8 +481,8 @@ export class PhaserExporter {
       this.pending.delete(token);
       throw new Error('Projekt lub zatwierdzone assety zmieniły się od przygotowania podglądu. Przygotuj eksport ponownie.');
     }
-    if (resolveTarget(pending.preview.targetDirectory) !== pending.targetDirectory) {
-      throw new Error('Katalog docelowy Phaser zmienił się od przygotowania podglądu. Przygotuj eksport ponownie.');
+    if (resolveTarget(pending.preview.targetDirectory, pending.config) !== pending.targetDirectory) {
+      throw new Error(`Katalog docelowy ${pending.config.label} zmienił się od przygotowania podglądu. Przygotuj eksport ponownie.`);
     }
     assertSourceSnapshots(pending);
     assertDestinationSnapshots(pending);
@@ -463,6 +521,18 @@ export class PhaserExporter {
   }
 }
 
+export class PhaserExporter extends RuntimeManifestExporter {
+  constructor() {
+    super(PHASER_CONFIG);
+  }
+}
+
+export class GodotExporter extends RuntimeManifestExporter {
+  constructor() {
+    super(GODOT_CONFIG);
+  }
+}
+
 function planCopy(input: {
   targetDirectory: string;
   existing: ExistingDelivery | null;
@@ -495,11 +565,11 @@ function planCopy(input: {
   return file;
 }
 
-function imagePackFile(key: string, url: string): PhaserPackFile {
+function imagePackFile(key: string, url: string): RuntimeResourceFile {
   return { type: 'image', key, url };
 }
 
-function characterPackFile(key: string, url: string, version: AssetVersion): PhaserPackFile {
+function characterPackFile(key: string, url: string, version: AssetVersion): RuntimeResourceFile {
   const animation = version.characterAnimation;
   if (!animation) throw new Error('Postać nie zawiera arkusza animacji.');
   const columns = animation.settings.framesPerDirection + 1;
@@ -529,7 +599,7 @@ function characterAnimationManifest(
     label: direction.shortLabel,
     row,
     screenDelta: direction.screenDelta,
-    // Phaser Tilemap uses screen-style tile coordinates: Y grows downwards.
+    // Oba runtime'y używają współrzędnych ekranu: Y rośnie w dół.
     gridDelta: project.projection === 'top_down' ? direction.screenDelta : direction.gridDelta,
   }));
   return {
@@ -572,7 +642,7 @@ function characterAnimationManifest(
       },
     ]),
     sourcePivotNormalized: version.pivot,
-    origin: phaserOrigin(version.pivot),
+    origin: topLeftOrigin(version.pivot),
     movementAnalysis: animation.movementAnalysis,
   };
 }
@@ -580,7 +650,7 @@ function characterAnimationManifest(
 function assertExportableRoadVariants(project: ProjectInfo, version: AssetVersion): void {
   const variants = version.roadVariants;
   if (!variants || variants.length !== 16) {
-    throw new Error('Droga Phaser wymaga dokładnie 16 wariantów masek 0–15.');
+    throw new Error('Eksport drogi wymaga dokładnie 16 wariantów masek 0–15.');
   }
   const masks = new Set<number>();
   for (const variant of variants) {
@@ -588,17 +658,17 @@ function assertExportableRoadVariants(project: ProjectInfo, version: AssetVersio
       || variant.connectionMask < 0
       || variant.connectionMask > 15
       || masks.has(variant.connectionMask)) {
-      throw new Error('Droga Phaser zawiera niepełny albo powtórzony zestaw masek 0–15.');
+      throw new Error('Droga zawiera niepełny albo powtórzony zestaw masek 0–15.');
     }
     if (variant.width !== project.tileWidthPx || variant.height !== project.tileHeightPx) {
       throw new Error(
-        `Warianty drogi Phaser muszą mieć dokładnie ${project.tileWidthPx}×${project.tileHeightPx}px.`,
+        `Warianty drogi muszą mieć dokładnie ${project.tileWidthPx}×${project.tileHeightPx}px.`,
       );
     }
     masks.add(variant.connectionMask);
   }
   if (Array.from({ length: 16 }, (_, mask) => mask).some((mask) => !masks.has(mask))) {
-    throw new Error('Droga Phaser wymaga pełnego zestawu masek 0–15.');
+    throw new Error('Eksport drogi wymaga pełnego zestawu masek 0–15.');
   }
 }
 
@@ -660,7 +730,7 @@ function sameCharacterDirections(
   });
 }
 
-function phaserOrigin(pivot: { x: number; y: number }): { x: number; y: number } {
+function topLeftOrigin(pivot: { x: number; y: number }): { x: number; y: number } {
   return { x: pivot.x, y: Number((1 - pivot.y).toFixed(6)) };
 }
 
@@ -693,22 +763,59 @@ function exportStateFingerprint(
   return createHash('sha256').update(JSON.stringify(state)).digest('hex');
 }
 
-function resolveTarget(targetDirectory: string): string {
+function resolveTarget(targetDirectory: string, config: RuntimeExporterConfig): string {
   const resolved = path.resolve(targetDirectory);
   if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
-    throw new Error('Katalog docelowy integracji Phaser nie istnieje.');
+    throw new Error(`Katalog docelowy integracji ${config.label} nie istnieje.`);
   }
   const info = lstatSync(resolved);
   if (!info.isDirectory() || info.isSymbolicLink()) {
-    throw new Error('Katalog docelowy integracji Phaser nie może być symlinkiem.');
+    throw new Error(`Katalog docelowy integracji ${config.label} nie może być symlinkiem.`);
   }
-  return realpathSync.native(resolved);
+  const target = realpathSync.native(resolved);
+  if (config.requireGodotProject) findGodotProjectRoot(target);
+  return target;
+}
+
+function findGodotProjectRoot(targetDirectory: string): string {
+  let current = targetDirectory;
+  while (true) {
+    const marker = path.join(current, 'project.godot');
+    if (existsSync(marker)) {
+      const info = lstatSync(marker);
+      if (!info.isFile() || info.isSymbolicLink()) {
+        throw new Error('Plik project.godot nie może być symlinkiem ani plikiem specjalnym.');
+      }
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      throw new Error('Katalog docelowy Godot musi znajdować się wewnątrz projektu zawierającego project.godot.');
+    }
+    current = parent;
+  }
+}
+
+function godotResourcePath(
+  config: RuntimeExporterConfig,
+  targetDirectory: string,
+  relativePath: string,
+): string | null {
+  if (config.integration !== 'godot') return null;
+  const projectRoot = findGodotProjectRoot(targetDirectory);
+  const absolutePath = path.resolve(targetDirectory, ...relativePath.split('/').filter(Boolean));
+  if (!isContainedPath(projectRoot, absolutePath)) {
+    throw new Error('Ścieżka zasobu Godot wykracza poza katalog projektu.');
+  }
+  const projectRelative = path.relative(projectRoot, absolutePath).split(path.sep).join('/');
+  return projectRelative ? `res://${projectRelative}` : 'res://';
 }
 
 function readExistingDelivery(
   targetDirectory: string,
   manifestPath: string,
   projectId: string,
+  config: RuntimeExporterConfig,
 ): ExistingDelivery | null {
   if (!existsSync(manifestPath)) return null;
   assertSafeManagedFile(targetDirectory, manifestPath, true);
@@ -716,35 +823,35 @@ function readExistingDelivery(
   try {
     parsed = JSON.parse(readFileSync(manifestPath, 'utf8')) as unknown;
   } catch {
-    throw new Error('Manifest Phaser jest nieczytelny; eksport został zablokowany, aby nie nadpisać obcych plików.');
+    throw new Error(`Manifest ${config.label} jest nieczytelny; eksport został zablokowany, aby nie nadpisać obcych plików.`);
   }
   const root = asRecord(parsed, 'root');
-  const section = asRecord(root[PHASER_PACK_SECTION], PHASER_PACK_SECTION);
-  if (section.schemaVersion !== PHASER_SCHEMA_VERSION || section.engine !== 'phaser3') {
-    throw new Error('Manifest Phaser ma nieobsługiwany schemat; automatyczna synchronizacja została zablokowana.');
+  const section = asRecord(root[RUNTIME_MANIFEST_SECTION], RUNTIME_MANIFEST_SECTION);
+  if (section.schemaVersion !== RUNTIME_SCHEMA_VERSION || section.engine !== config.engine) {
+    throw new Error(`Manifest ${config.label} ma nieobsługiwany schemat; automatyczna synchronizacja została zablokowana.`);
   }
   const manifestProject = asRecord(section.project, 'project');
   if (typeof manifestProject.id !== 'string'
     || !UUID_PATTERN.test(manifestProject.id)
     || manifestProject.id !== projectId) {
-    throw new Error('Manifest Phaser należy do innego projektu. Wybierz inny katalog docelowy.');
+    throw new Error(`Manifest ${config.label} należy do innego projektu. Wybierz inny katalog docelowy.`);
   }
-  if (!Array.isArray(section.managedFiles)) throw new Error('Manifest Phaser nie zawiera listy managedFiles.');
-  const relativeFiles = section.managedFiles.map(validateManagedRelativePath);
-  if (!relativeFiles.includes(MANIFEST_NAME)) throw new Error('Manifest Phaser nie deklaruje własnego pliku.');
+  if (!Array.isArray(section.managedFiles)) throw new Error(`Manifest ${config.label} nie zawiera listy managedFiles.`);
+  const relativeFiles = section.managedFiles.map((candidate) => validateManagedRelativePath(candidate, config));
+  if (!relativeFiles.includes(config.manifestName)) throw new Error(`Manifest ${config.label} nie deklaruje własnego pliku.`);
   if (new Set(relativeFiles).size !== relativeFiles.length) {
-    throw new Error('Manifest Phaser zawiera powtórzone ścieżki managedFiles.');
+    throw new Error(`Manifest ${config.label} zawiera powtórzone ścieżki managedFiles.`);
   }
-  if (!Array.isArray(section.files)) throw new Error('Manifest Phaser nie zawiera natywnej listy File Pack.');
+  if (!Array.isArray(section.files)) throw new Error(`Manifest ${config.label} nie zawiera listy plików runtime.`);
   const loaderFiles = section.files.map((candidate, index) => {
     const loader = asRecord(candidate, `files[${index}]`);
-    return validateManagedRelativePath(loader.url);
+    return validateManagedRelativePath(loader.url, config);
   });
-  if (loaderFiles.some((relativePath) => relativePath === MANIFEST_NAME)
+  if (loaderFiles.some((relativePath) => relativePath === config.manifestName)
     || new Set(loaderFiles).size !== loaderFiles.length
     || relativeFiles.length !== loaderFiles.length + 1
     || loaderFiles.some((relativePath) => !relativeFiles.includes(relativePath))) {
-    throw new Error('Manifest Phaser ma niespójną deklarację File Pack i managedFiles.');
+    throw new Error(`Manifest ${config.label} ma niespójną deklarację plików runtime i managedFiles.`);
   }
   return {
     manifestPath,
@@ -754,7 +861,10 @@ function readExistingDelivery(
   };
 }
 
-function validateManagedRelativePath(candidate: unknown): string {
+function validateManagedRelativePath(
+  candidate: unknown,
+  config: RuntimeExporterConfig = PHASER_CONFIG,
+): string {
   if (typeof candidate !== 'string'
     || !candidate
     || candidate.includes('\0')
@@ -762,14 +872,14 @@ function validateManagedRelativePath(candidate: unknown): string {
     || candidate.includes(':')
     || path.posix.isAbsolute(candidate)
     || path.win32.isAbsolute(candidate)) {
-    throw new Error('Manifest Phaser zawiera niebezpieczną ścieżkę managedFiles.');
+    throw new Error(`Manifest ${config.label} zawiera niebezpieczną ścieżkę managedFiles.`);
   }
   const segments = candidate.split('/');
   if (segments.some((segment) => !segment || segment === '.' || segment === '..')) {
-    throw new Error('Manifest Phaser zawiera niebezpieczny segment ścieżki managedFiles.');
+    throw new Error(`Manifest ${config.label} zawiera niebezpieczny segment ścieżki managedFiles.`);
   }
-  if (candidate !== MANIFEST_NAME && segments[0] !== 'assets') {
-    throw new Error('Manifest Phaser może zarządzać wyłącznie własnym manifestem i katalogiem assets.');
+  if (candidate !== config.manifestName && segments[0] !== 'assets') {
+    throw new Error(`Manifest ${config.label} może zarządzać wyłącznie własnym manifestem i katalogiem assets.`);
   }
   return candidate;
 }
@@ -787,7 +897,7 @@ function fileAction(
   }
   assertSafeManagedFile(targetDirectory, destinationPath, true);
   if (!hasManifest || !ownedFiles.has(destinationPath)) {
-    throw new Error(`Plik ${destinationPath} już istnieje, ale manifest Phaser nie potwierdza własności generatora.`);
+    throw new Error(`Plik ${destinationPath} już istnieje, ale manifest integracji nie potwierdza własności generatora.`);
   }
   return digest(sourcePath) === digest(destinationPath) ? 'unchanged' : 'replace';
 }
@@ -796,9 +906,13 @@ function relativeUrl(targetDirectory: string, filePath: string): string {
   return relativeManagedPath(targetDirectory, filePath);
 }
 
-function relativeManagedPath(targetDirectory: string, filePath: string): string {
+function relativeManagedPath(
+  targetDirectory: string,
+  filePath: string,
+  config: RuntimeExporterConfig = PHASER_CONFIG,
+): string {
   const relative = path.relative(targetDirectory, filePath).split(path.sep).join('/');
-  return validateManagedRelativePath(relative);
+  return validateManagedRelativePath(relative, config);
 }
 
 function snapshotSources(files: ExportFilePreview[]): Map<string, string> {
@@ -807,7 +921,7 @@ function snapshotSources(files: ExportFilePreview[]): Map<string, string> {
     if (file.action === 'delete' || !file.sourcePath) continue;
     const info = lstatSync(file.sourcePath);
     if (!info.isFile() || info.isSymbolicLink()) {
-      throw new Error(`Plik źródłowy eksportu Phaser nie jest zwykłym plikiem: ${file.sourcePath}`);
+      throw new Error(`Plik źródłowy eksportu nie jest zwykłym plikiem: ${file.sourcePath}`);
     }
     snapshots.set(file.sourcePath, digest(file.sourcePath));
   }
@@ -839,10 +953,10 @@ function snapshotDestination(targetDirectory: string, filePath: string): string 
 function assertSourceSnapshots(pending: PendingExport): void {
   for (const [filePath, expected] of pending.sourceSnapshots) {
     assertSafeSource(pending.projectRoot, filePath);
-    if (!existsSync(filePath)) throw new Error('Źródła eksportu Phaser zmieniły się od przygotowania podglądu.');
+    if (!existsSync(filePath)) throw new Error('Źródła eksportu zmieniły się od przygotowania podglądu.');
     const info = lstatSync(filePath);
     if (!info.isFile() || info.isSymbolicLink() || digest(filePath) !== expected) {
-      throw new Error('Źródła eksportu Phaser zmieniły się od przygotowania podglądu.');
+      throw new Error('Źródła eksportu zmieniły się od przygotowania podglądu.');
     }
   }
 }
@@ -851,30 +965,30 @@ function assertSafeSource(projectRoot: string, filePath: string): void {
   const lexicalRoot = path.resolve(projectRoot);
   const lexicalFile = path.resolve(filePath);
   if (!isContainedPath(lexicalRoot, lexicalFile)) {
-    throw new Error('Plik źródłowy eksportu Phaser wykracza poza bibliotekę projektu.');
+    throw new Error('Plik źródłowy eksportu wykracza poza bibliotekę projektu.');
   }
   const segments = path.relative(lexicalRoot, lexicalFile).split(path.sep).filter(Boolean);
   let current = lexicalRoot;
   for (let index = 0; index < segments.length; index += 1) {
     current = path.join(current, segments[index]);
-    if (!existsSync(current)) throw new Error(`Plik źródłowy eksportu Phaser nie istnieje: ${filePath}`);
+    if (!existsSync(current)) throw new Error(`Plik źródłowy eksportu nie istnieje: ${filePath}`);
     const component = lstatSync(current);
     if (component.isSymbolicLink()) {
-      throw new Error(`Ścieżka źródłowa eksportu Phaser zawiera symlink: ${current}`);
+      throw new Error(`Ścieżka źródłowa eksportu zawiera symlink: ${current}`);
     }
     if (index < segments.length - 1 && !component.isDirectory()) {
-      throw new Error(`Element ścieżki źródłowej Phaser nie jest katalogiem: ${current}`);
+      throw new Error(`Element ścieżki źródłowej eksportu nie jest katalogiem: ${current}`);
     }
   }
-  if (!existsSync(filePath)) throw new Error(`Plik źródłowy eksportu Phaser nie istnieje: ${filePath}`);
+  if (!existsSync(filePath)) throw new Error(`Plik źródłowy eksportu nie istnieje: ${filePath}`);
   const info = lstatSync(filePath);
   if (!info.isFile() || info.isSymbolicLink()) {
-    throw new Error(`Plik źródłowy eksportu Phaser nie jest zwykłym plikiem: ${filePath}`);
+    throw new Error(`Plik źródłowy eksportu nie jest zwykłym plikiem: ${filePath}`);
   }
   const realRoot = realpathSync.native(projectRoot);
   const realFile = realpathSync.native(filePath);
   if (!isContainedPath(realRoot, realFile)) {
-    throw new Error('Plik źródłowy eksportu Phaser wykracza poza bibliotekę projektu.');
+    throw new Error('Plik źródłowy eksportu wykracza poza bibliotekę projektu.');
   }
 }
 
@@ -906,11 +1020,11 @@ function assertDestinationSnapshots(pending: PendingExport): void {
   for (const [filePath, expected] of pending.destinationSnapshots) {
     if (!existsSync(filePath)) {
       if (expected === null) continue;
-      throw new Error('Cel eksportu Phaser zmienił się od przygotowania podglądu.');
+      throw new Error('Cel eksportu zmienił się od przygotowania podglądu.');
     }
     assertSafeManagedFile(pending.targetDirectory, filePath, true);
     if (expected === null || digest(filePath) !== expected) {
-      throw new Error('Cel eksportu Phaser zmienił się od przygotowania podglądu.');
+      throw new Error('Cel eksportu zmienił się od przygotowania podglądu.');
     }
   }
 }
@@ -925,7 +1039,7 @@ function commitFilesystem(pending: PendingExport): FilesystemCommit {
   try {
     for (const file of pending.preview.files) {
       if (file.action === 'delete' || file.action === 'unchanged') continue;
-      if (!file.sourcePath) throw new Error('Plan eksportu Phaser nie zawiera pliku źródłowego.');
+      if (!file.sourcePath) throw new Error('Plan eksportu nie zawiera pliku źródłowego.');
       stagedWrites.push(stageCopy(
         pending.targetDirectory,
         file.sourcePath,
@@ -954,7 +1068,7 @@ function commitFilesystem(pending: PendingExport): FilesystemCommit {
     for (const destinationPath of backupCandidates) {
       const expected = pending.destinationSnapshots.get(destinationPath);
       if (!expected || snapshotDestination(pending.targetDirectory, destinationPath) !== expected) {
-        throw new Error('Cel eksportu Phaser zmienił się podczas przygotowywania plików.');
+        throw new Error('Cel eksportu zmienił się podczas przygotowywania plików.');
       }
       assertSafeManagedFile(pending.targetDirectory, destinationPath, true);
       const backupPath = temporarySibling(destinationPath, pending.preview.token, 'rollback');
@@ -962,7 +1076,7 @@ function commitFilesystem(pending: PendingExport): FilesystemCommit {
       renameSync(destinationPath, backupPath);
       backups.push({ destinationPath, backupPath });
       if (digest(backupPath) !== expected) {
-        throw new Error('Cel eksportu Phaser zmienił się podczas zabezpieczania pliku.');
+        throw new Error('Cel eksportu zmienił się podczas zabezpieczania pliku.');
       }
       if (pending.preview.files.some((file) => (
         file.action === 'delete' && pathKey(file.destinationPath) === pathKey(destinationPath)
@@ -1006,7 +1120,7 @@ function commitFilesystem(pending: PendingExport): FilesystemCommit {
       createdDirectories,
     });
     if (errors.length) {
-      throw new Error(`Eksport Phaser nie powiódł się, a rollback był niepełny: ${errors.join('; ')}. ${errorMessage(error)}`);
+      throw new Error(`Eksport nie powiódł się, a rollback był niepełny: ${errors.join('; ')}. ${errorMessage(error)}`);
     }
     throw error;
   }
@@ -1026,7 +1140,7 @@ function stageCopy(
   try {
     copyFileSync(sourcePath, stagedPath, constants.COPYFILE_EXCL);
     if (!expectedDigest || digest(stagedPath) !== expectedDigest) {
-      throw new Error('Źródło eksportu Phaser zmieniło się podczas kopiowania.');
+      throw new Error('Źródło eksportu zmieniło się podczas kopiowania.');
     }
   } catch (error) {
     cleanupTemporaryFile(stagedPath);
@@ -1098,25 +1212,25 @@ function ensureDestinationDirectory(
   directoryPath: string,
   createdDirectories: Set<string>,
 ): void {
-  if (!isContainedPath(targetDirectory, directoryPath)) throw new Error('Katalog eksportu wykracza poza cel Phaser.');
+  if (!isContainedPath(targetDirectory, directoryPath)) throw new Error('Katalog eksportu wykracza poza wybrany cel.');
   const missing: string[] = [];
   let current = directoryPath;
   while (!existsSync(current)) {
     missing.push(current);
     if (pathKey(current) === pathKey(targetDirectory)) break;
     const parent = path.dirname(current);
-    if (parent === current) throw new Error('Nie można bezpiecznie utworzyć katalogu eksportu Phaser.');
+    if (parent === current) throw new Error('Nie można bezpiecznie utworzyć katalogu eksportu.');
     current = parent;
   }
   if (existsSync(current)) {
     const info = lstatSync(current);
-    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Ścieżka eksportu Phaser nie jest bezpiecznym katalogiem.');
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Ścieżka eksportu nie jest bezpiecznym katalogiem.');
   }
   mkdirSync(directoryPath, { recursive: true });
   for (const candidate of missing) {
     if (!existsSync(candidate)) continue;
     const info = lstatSync(candidate);
-    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Utworzona ścieżka eksportu Phaser nie jest katalogiem.');
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Utworzona ścieżka eksportu nie jest katalogiem.');
     createdDirectories.add(candidate);
   }
 }
@@ -1137,28 +1251,28 @@ function removeCreatedEmptyDirectories(directories: Set<string>): void {
 }
 
 function assertSafeManagedFile(targetDirectory: string, filePath: string, mustExist: boolean): void {
-  if (!isContainedPath(targetDirectory, filePath)) throw new Error('Operacja eksportu Phaser wykracza poza katalog docelowy.');
+  if (!isContainedPath(targetDirectory, filePath)) throw new Error('Operacja eksportu wykracza poza katalog docelowy.');
   const relative = path.relative(targetDirectory, filePath);
   const segments = relative.split(path.sep).filter(Boolean);
   let current = targetDirectory;
   for (let index = 0; index < segments.length; index += 1) {
     current = path.join(current, segments[index]);
     if (!existsSync(current)) {
-      if (mustExist) throw new Error(`Plik eksportu Phaser zniknął: ${filePath}`);
+      if (mustExist) throw new Error(`Plik eksportu zniknął: ${filePath}`);
       return;
     }
     const info = lstatSync(current);
-    if (info.isSymbolicLink()) throw new Error(`Ścieżka eksportu Phaser zawiera symlink: ${current}`);
+    if (info.isSymbolicLink()) throw new Error(`Ścieżka eksportu zawiera symlink: ${current}`);
     if (index < segments.length - 1 && !info.isDirectory()) {
-      throw new Error(`Element ścieżki eksportu Phaser nie jest katalogiem: ${current}`);
+      throw new Error(`Element ścieżki eksportu nie jest katalogiem: ${current}`);
     }
     if (index === segments.length - 1 && !info.isFile()) {
-      throw new Error(`Eksporter Phaser może zarządzać wyłącznie plikami: ${current}`);
+      throw new Error(`Eksporter może zarządzać wyłącznie zwykłymi plikami: ${current}`);
     }
   }
   if (existsSync(filePath)
     && !isContainedPath(realpathSync.native(targetDirectory), realpathSync.native(filePath))) {
-    throw new Error('Rzeczywista ścieżka pliku Phaser wykracza poza katalog docelowy.');
+    throw new Error('Rzeczywista ścieżka pliku wykracza poza katalog docelowy.');
   }
 }
 
@@ -1168,7 +1282,7 @@ function temporarySibling(destinationPath: string, token: string, purpose: 'stag
 
 function assertTemporaryAvailable(targetDirectory: string, temporaryPath: string): void {
   assertSafeManagedFile(targetDirectory, temporaryPath, false);
-  if (existsSync(temporaryPath)) throw new Error(`Plik tymczasowy eksportu Phaser już istnieje: ${temporaryPath}`);
+  if (existsSync(temporaryPath)) throw new Error(`Plik tymczasowy eksportu już istnieje: ${temporaryPath}`);
 }
 
 function cleanupTemporaryFile(filePath: string): void {
@@ -1195,7 +1309,7 @@ function digest(filePath: string): string {
 
 function asRecord(candidate: unknown, label: string): Record<string, unknown> {
   if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
-    throw new Error(`Manifest Phaser ma niepoprawne pole ${label}.`);
+    throw new Error(`Manifest integracji ma niepoprawne pole ${label}.`);
   }
   return candidate as Record<string, unknown>;
 }

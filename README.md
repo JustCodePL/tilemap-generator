@@ -2,7 +2,7 @@
 
 Generator może korzystać równolegle z trzech backendów obrazowych: Codex + `imagegen`, ComfyUI oraz `stable-diffusion.cpp`. Każdy włączony backend tworzy osobną wersję tego samego assetu, dzięki czemu wynik można porównać, zatwierdzić jako preferowany i wyeksportować razem z informacją o modelu i systemie, który go wygenerował.
 
-Desktopowa fabryka assetów izometrycznych i top-down z wersjonowanym review oraz integracjami eksportu. Aplikacja łączy lokalny Codex App Server, skill `imagegen` i opcjonalne lokalne renderery ComfyUI oraz `stable-diffusion.cpp` z przenośnym registry SQLite. Zatwierdzone assety można eksportować do Unity oraz Phaser 3.
+Desktopowa fabryka assetów izometrycznych i top-down z wersjonowanym review oraz integracjami eksportu. Aplikacja łączy lokalny Codex App Server, skill `imagegen` i opcjonalne lokalne renderery ComfyUI oraz `stable-diffusion.cpp` z przenośnym registry SQLite. Zatwierdzone assety można eksportować do Unity, Phaser 3 oraz Godot 4.
 
 ## Uruchomienie
 
@@ -58,7 +58,7 @@ Artefakty dystrybucyjne powstają w `out/make/`.
 3. Po przygotowaniu finalnego PNG agent wyznacza proponowany pivot na podstawie rzeczywistego obrazu. Sprawdź PNG, footprint, pivot, typ, parametry rozmiaru i tagi; pivot możesz nadpisać przed zatwierdzeniem.
 4. Zatwierdź, odrzuć bez kasowania lub utwórz edycję/nowy wariant. Asset może mieć tylko jedną zatwierdzoną wersję; zatwierdzenie można cofnąć, aby wybrać inną.
 5. Po zatwierdzeniu Codex aktualizuje wersjonowane podsumowanie stylu.
-6. Otwórz **Eksport**, wybierz integrację i wskaż dokładny katalog docelowy. Katalog biblioteki pozostaje niezależny od miejsc eksportu, a Unity i Phaser zapamiętują swoje cele osobno. Eksport synchronizuje zatwierdzone wersje z wybranym celem; po cofnięciu ostatniego zatwierdzenia pusty plan assetów może usunąć wcześniej zarządzane pliki. Dla Unity wybierz miejsce wewnątrz `Assets`, na przykład `Assets/TilemapGenerator`. Dla Phaser wskaż dowolny istniejący katalog udostępniany przez grę, na przykład `public/assets/tilemap-generator`; zatwierdzone PNG trafią do podkatalogu `assets`, a obok nich powstanie manifest `tilemap-assets.phaser.json`.
+6. Otwórz **Eksport**, wybierz integrację i wskaż dokładny katalog docelowy. Katalog biblioteki pozostaje niezależny od miejsc eksportu, a Unity, Phaser i Godot zapamiętują swoje cele osobno. Eksport synchronizuje zatwierdzone wersje z wybranym celem; po cofnięciu ostatniego zatwierdzenia pusty plan assetów może usunąć wcześniej zarządzane pliki. Dla Unity wybierz miejsce wewnątrz `Assets`, na przykład `Assets/TilemapGenerator`. Dla Phaser wskaż dowolny istniejący katalog udostępniany przez grę, na przykład `public/assets/tilemap-generator`. Dla Godot wybierz katalog wewnątrz projektu zawierającego `project.godot`, na przykład `assets/tilemap-generator`.
 
 ## MCP dla Codexa
 
@@ -123,6 +123,21 @@ for (const asset of section.assets) {
   }
 }
 ```
+
+## Integracja Godot 4
+
+Eksporter Godot kopiuje zatwierdzone PNG i spritesheety do `assets/<kategoria>/` oraz tworzy ścisły manifest `tilemap-assets.godot.json` w schemacie v1. Cel musi znajdować się wewnątrz projektu z bezpiecznym plikiem `project.godot`. Każdy wpis pliku zawiera ścieżkę względną oraz gotową ścieżkę `res://`; manifest opisuje projekcję, orientację grida, tile size, PPU, footprinty, pivoty, 16 wariantów dróg, dane blendowania terenu i animacje postaci.
+
+Godot importuje PNG umieszczone w projekcie automatycznie. Manifest można odczytać przez `FileAccess` i `JSON`, a wskazane tekstury ładować przez `load()`:
+
+```gdscript
+var manifest_path := "res://assets/tilemap-generator/tilemap-assets.godot.json"
+var manifest := JSON.parse_string(FileAccess.get_file_as_string(manifest_path))
+var section: Dictionary = manifest["tilemap-generator"]
+var first_texture: Texture2D = load(section.files[0].resourcePath)
+```
+
+Przy budowaniu gry dodaj `*.json` do filtra plików nierozpoznawanych jako zasoby albo ustaw dla manifestu import `Keep File (exported as is)`, aby plik pozostał dostępny w wyeksportowanym PCK.
 
 ## Integracja Unity: terrain blending i auto-tile
 
@@ -208,7 +223,7 @@ Assety wymagające kanału alpha używają dodatkowo node'ów usuwania tła oraz
 models/background_removal/birefnet.safetensors
 ```
 
-Na stronie projektu można niezależnie włączać i wyłączać `Codex + imagegen`, `ComfyUI · Z-Image Turbo` oraz `stable-diffusion.cpp · Z-Image Turbo`; co najmniej jeden generator musi pozostać aktywny. Każdy aktywny renderer zapisuje osobną wersję pod tym samym assetem. Ekran review i lista wersji pokazują badge `system · model`. Registry przechowuje także identyfikator przebiegu, hash zarządzanego workflow oraz metadane, m.in. seed, sampler, scheduler, kroki i CFG. Manifest eksportu Unity ma schemat v9, a manifest Phaser schemat v1; oba zawierają jawną listę plików zarządzanych, projekcję projektu oraz ścisłe metadane zatwierdzonych animacji postaci.
+Na stronie projektu można niezależnie włączać i wyłączać `Codex + imagegen`, `ComfyUI · Z-Image Turbo` oraz `stable-diffusion.cpp · Z-Image Turbo`; co najmniej jeden generator musi pozostać aktywny. Każdy aktywny renderer zapisuje osobną wersję pod tym samym assetem. Ekran review i lista wersji pokazują badge `system · model`. Registry przechowuje także identyfikator przebiegu, hash zarządzanego workflow oraz metadane, m.in. seed, sampler, scheduler, kroki i CFG. Manifest eksportu Unity ma schemat v9, a manifesty Phaser i Godot schemat v1; wszystkie zawierają jawną listę plików zarządzanych, projekcję projektu oraz ścisłe metadane zatwierdzonych animacji postaci.
 
 Codex może odczytać stan przez `registry.get_generation_settings` i zaproponować zmianę generatorów przez `registry.propose_project_settings`. Tak jak pozostałe zmiany projektu, propozycja zaczyna obowiązywać dopiero po zatwierdzeniu w UI.
 

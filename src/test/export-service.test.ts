@@ -15,10 +15,11 @@ const secondToken = '22222222-2222-4222-8222-222222222222';
 
 beforeEach(() => vi.clearAllMocks());
 
-it('rejestruje Unity i Phaser jako niezależne integracje domyślne', () => {
+it('rejestruje Unity, Phaser i Godot jako niezależne integracje domyślne', () => {
   expect(new ExportService().listIntegrations()).toEqual([
     expect.objectContaining({ id: 'unity', label: 'Unity' }),
     expect.objectContaining({ id: 'phaser', label: 'Phaser 3' }),
+    expect.objectContaining({ id: 'godot', label: 'Godot 4' }),
   ]);
 });
 

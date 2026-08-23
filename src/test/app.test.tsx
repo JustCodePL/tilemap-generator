@@ -142,6 +142,9 @@ beforeEach(() => {
       }, {
         id: 'phaser', label: 'Phaser 3', description: 'PNG, spritesheety i ścisły manifest danych dla Phaser 3.',
         targetLabel: 'Katalog docelowy',
+      }, {
+        id: 'godot', label: 'Godot 4', description: 'PNG, spritesheety i manifest runtime ze ścieżkami res:// dla Godot 4.',
+        targetLabel: 'Katalog wewnątrz projektu Godot',
       }]),
       chooseTarget: vi.fn(), preview: vi.fn(), run: vi.fn(),
     },
@@ -225,6 +228,7 @@ function mockOpenedProject(project: ProjectInfo, assets: AssetSummary[] = []) {
 it('pokazuje listę projektów i otwiera formularz przyciskiem Nowy projekt', async () => {
   render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
   expect(await screen.findByRole('heading', { name: /Spójny świat/i })).toBeInTheDocument();
+  expect(screen.getByRole('img', { name: 'Kafel terenu wygenerowany w Tilemap Generator' })).toBeInTheDocument();
   expect(screen.getByRole('heading', { name: 'Projekty' })).toBeInTheDocument();
   expect(screen.queryByRole('button', { name: /Utwórz projekt/i })).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Nowy projekt' }));
@@ -339,18 +343,20 @@ it('oddziela katalog biblioteki od neutralnego ekranu integracji eksportu', asyn
   expect(await screen.findByRole('heading', { name: 'Integracje eksportu' })).toBeInTheDocument();
   expect(await screen.findByRole('button', { name: /Unity.*PNG, manifest/i })).toHaveAttribute('aria-pressed', 'true');
   expect(screen.getByRole('button', { name: /Phaser 3.*spritesheety/i })).toHaveAttribute('aria-pressed', 'false');
+  expect(screen.getByRole('button', { name: /Godot 4.*res:\/\//i })).toHaveAttribute('aria-pressed', 'false');
   expect(screen.getByLabelText('Ustawienia integracji Unity')).toHaveTextContent('Narzędzia Unity są instalowane raz, osobno w Assets/TilemapGeneratorIntegration.');
   expect(screen.queryByText('UNITY DELIVERY')).not.toBeInTheDocument();
   expect(screen.queryByText('KATALOG ASSETS')).not.toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Przygotuj podgląd' })).toBeDisabled();
 });
 
-it('przełącza integracje i zachowuje niezależny cel eksportu Phaser', async () => {
+it('przełącza integracje i zachowuje niezależne cele eksportu Phaser oraz Godot', async () => {
   const unityTarget = 'C:\\gra\\Assets\\Generated\\Tilemap';
   const phaserTarget = 'C:\\gra-web\\public\\assets\\tilemap';
+  const godotTarget = 'C:\\gra-godot\\assets\\tilemap-generator';
   const project = {
     ...projectFixture,
-    exportTargets: { unity: unityTarget, phaser: phaserTarget },
+    exportTargets: { unity: unityTarget, phaser: phaserTarget, godot: godotTarget },
   };
   mockOpenedProject(project);
   vi.mocked(window.tilemap.export.preview).mockResolvedValue({
@@ -380,6 +386,12 @@ it('przełącza integracje i zachowuje niezależny cel eksportu Phaser', async (
 
   fireEvent.click(screen.getByRole('button', { name: /Unity.*PNG, manifest/i }));
   expect(screen.getByLabelText('Ustawienia integracji Unity')).toHaveTextContent(unityTarget);
+
+  fireEvent.click(screen.getByRole('button', { name: /Godot 4.*res:\/\//i }));
+  const godotSettings = screen.getByLabelText('Ustawienia integracji Godot 4');
+  expect(within(godotSettings).getByText(godotTarget)).toBeInTheDocument();
+  expect(godotSettings).toHaveTextContent('project.godot');
+  expect(godotSettings).toHaveTextContent('tilemap-assets.godot.json');
 });
 
 it('pozwala przygotować plan usunięcia bez zatwierdzonych assetów', async () => {

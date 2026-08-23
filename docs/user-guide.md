@@ -116,7 +116,7 @@ Jeżeli agent uzna, że referencje są sprzeczne z projektem, może utworzyć pr
 
 1. Zatwierdź wymagane wersje.
 2. Otwórz **Eksport**.
-3. Wybierz integrację Unity albo Phaser.
+3. Wybierz integrację Unity, Phaser albo Godot.
 4. Wskaż dokładny katalog docelowy tej integracji.
 5. Przejrzyj plan: pliki nowe, zastępowane, niezmienione i usuwane.
 6. Uruchom eksport.

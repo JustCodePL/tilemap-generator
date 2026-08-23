@@ -23,8 +23,9 @@ import {
 } from '../shared/domain';
 
 it('definiuje neutralny kontrakt integracji eksportu', () => {
-  expect(exportIntegrations).toEqual(['unity', 'phaser']);
+  expect(exportIntegrations).toEqual(['unity', 'phaser', 'godot']);
   expect(exportIntegrationSchema.parse('unity')).toBe('unity');
+  expect(exportIntegrationSchema.parse('godot')).toBe('godot');
   expect(exportPreviewSchema.parse({
     integration: 'unity',
     targetDirectory: '  /game/Assets/TilemapGenerator  ',

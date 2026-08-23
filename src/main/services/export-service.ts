@@ -8,6 +8,7 @@ import type {
   ExportRunResult,
 } from '../../shared/domain';
 import type { ProjectDatabase } from '../db/project-database';
+import { GodotExporter } from './godot-exporter';
 import { PhaserExporter } from './phaser-exporter';
 import { UnityExporter } from './unity-exporter';
 
@@ -33,7 +34,7 @@ export class ExportService {
   private readonly grantedTargets = new Set<string>();
   private readonly pendingRoutes = new Map<string, PendingRoute>();
 
-  constructor(adapters: ExportIntegrationAdapter[] = [new UnityExporter(), new PhaserExporter()]) {
+  constructor(adapters: ExportIntegrationAdapter[] = [new UnityExporter(), new PhaserExporter(), new GodotExporter()]) {
     if (adapters.some((adapter) => adapter.descriptor.id !== adapter.integration)) {
       throw new Error('Id descriptora musi odpowiadać id integracji eksportu.');
     }

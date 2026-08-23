@@ -173,6 +173,40 @@ Manifest dostarcza dane, ale aplikacja gry nadal odpowiada za:
 - poruszanie postacią i ustawianie animacji;
 - kolizje oraz gameplay.
 
+## Godot 4
+
+### Cel
+
+Wskaż katalog wewnątrz projektu zawierającego zwykły plik `project.godot`, na przykład:
+
+```text
+my-game/assets/tilemap-generator
+```
+
+Adapter odrzuca katalogi poza projektem Godot oraz symlinki. Cel jest zapamiętywany niezależnie od Unity i Phaser.
+
+### Pliki i manifest
+
+```text
+<target>/
+├─ tilemap-assets.godot.json
+└─ assets/
+   ├─ flat_tile/
+   ├─ road_tile/
+   ├─ building/
+   ├─ character/
+   └─ ...
+```
+
+Manifest ma schema version 1 i engine `godot4`. Zachowuje wspólny ścisły kontrakt assetów, dróg, terrain blendów i animacji, a dodatkowo zawiera:
+
+- `godot.resourceRoot` i `godot.manifestPath` jako ścieżki `res://`;
+- `resourcePath` przy każdym pliku runtime;
+- orientację grida `orthogonal` albo `isometric`;
+- stabilne klucze tekstur, footprint, pivot źródłowy oraz origin liczony od lewego górnego rogu.
+
+PNG są zwykłymi zasobami projektu i Godot importuje je automatycznie. Manifest JSON odczytaj przez `FileAccess.get_file_as_string()` oraz `JSON.parse_string()`, a tekstury z pól `resourcePath` przez `load()`. Podczas eksportu gry dodaj `*.json` do filtra plików nierozpoznawanych jako zasoby albo ustaw `Keep File (exported as is)` dla manifestu.
+
 ## Dodanie kolejnej integracji
 
 Nowy adapter implementuje wspólny kontrakt `ExportIntegrationAdapter` i jest rejestrowany w `ExportService`. Powinien mieć:
@@ -186,4 +220,4 @@ Nowy adapter implementuje wspólny kontrakt `ExportIntegrationAdapter` i jest re
 7. atomowy commit/rollback;
 8. test routingu, synchronizacji, retargetu, obcego manifestu, ścieżek i błędów bazy.
 
-UI nie powinno zawierać warunków specyficznych dla Unity ani Phaser poza prezentacją descriptorów zwracanych przez backend.
+UI nie powinno zawierać logiki wykonawczej specyficznej dla Unity, Phaser ani Godot poza prezentacją descriptorów i instrukcji celu zwracanych przez backend.

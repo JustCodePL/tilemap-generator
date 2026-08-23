@@ -30,7 +30,7 @@ Aplikacja ma utrzymać spójność wymiarów, projekcji, kierunków, stylu i met
 - deterministyczne walidatory wymiarów, alfa, geometrii, szwów i dróg;
 - osobny workflow postaci z animacją chodu w czterech kierunkach;
 - podgląd pojedynczego tile'a oraz powtórzenia o konfigurowalnej szerokości i wysokości;
-- eksport zatwierdzonych wersji przez integracje Unity i Phaser 3;
+- eksport zatwierdzonych wersji przez integracje Unity, Phaser 3 i Godot 4;
 - lokalny MCP dla innej rozmowy Codexa.
 
 ## Projekcje
