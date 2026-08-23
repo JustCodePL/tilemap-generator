@@ -83,9 +83,9 @@ commitów do `main`.
 Po przejściu wszystkich lokalnych kontroli:
 
 ```bash
-git tag -a v0.2.0-beta.3 -m "Responsywny interfejs na małych ekranach"
+git tag -a v0.2.0-beta.4 -m "Czytelny widok assetu i odporniejsza generacja postaci"
 git push origin main
-git push origin v0.2.0-beta.3
+git push origin v0.2.0-beta.4
 ```
 
 Tag należy wypchnąć dopiero po commicie wersji na `main`. Zakończony zielony
