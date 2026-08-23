@@ -66,6 +66,7 @@ it('włącza Developer ID, hardened runtime, timestamp i notarization tylko dla 
       identity: 'Developer ID Application: Test (TEAM123456)',
       keychain: '/tmp/tilemap-release.keychain-db',
       identityValidation: true,
+      continueOnError: false,
       preAutoEntitlements: false,
       hardenedRuntime: true,
       timestamp: 'http://timestamp.apple.com/ts01',

@@ -56,6 +56,7 @@ const macSignConfig = releaseBuild
     identity: requiredReleaseEnvironment('TILEMAP_MACOS_SIGN_IDENTITY'),
     keychain: requiredReleaseEnvironment('TILEMAP_MACOS_KEYCHAIN'),
     identityValidation: true,
+    continueOnError: false,
     preAutoEntitlements: false,
     preEmbedProvisioningProfile: false,
     hardenedRuntime: true,

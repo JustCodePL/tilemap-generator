@@ -156,7 +156,7 @@ jobs:
           security set-key-partition-list \
             -S apple-tool:,apple: \
             -k "$keychain_password" \
-            "$keychain_path"
+            "$keychain_path" >/dev/null
 
           identity=$(security find-identity -v -p codesigning "$keychain_path" \
             | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' \
@@ -165,12 +165,27 @@ jobs:
             echo 'Zaimportowany P12 nie zawiera Developer ID Application.' >&2
             exit 1
           fi
+
+          signing_probe="$RUNNER_TEMP/tilemap-signing-probe"
+          cp /usr/bin/true "$signing_probe"
+          codesign --force --options runtime --timestamp \
+            --keychain "$keychain_path" \
+            --sign "$identity" \
+            "$signing_probe"
+          codesign --verify --strict --verbose=2 "$signing_probe"
+          probe_signature=$(codesign -dvvv "$signing_probe" 2>&1)
+          grep -Fq "TeamIdentifier=$APPLE_TEAM_ID" <<<"$probe_signature" || {
+            echo 'Próba podpisu nie użyła oczekiwanego Apple Team ID.' >&2
+            exit 1
+          }
+          rm -f "$signing_probe"
           echo "TILEMAP_MACOS_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
           echo "TILEMAP_MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
 
       - name: Make signed and notarized ZIP
         shell: bash
         env:
+          DEBUG: 'electron-osx-sign*'
           TILEMAP_RELEASE_BUILD: '1'
           TILEMAP_RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
@@ -340,7 +355,7 @@ jobs:
         shell: bash
         run: |
           security delete-keychain "$RUNNER_TEMP/tilemap-signing.keychain-db" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/tilemap-developer-id.p12"
+          rm -f "$RUNNER_TEMP/tilemap-developer-id.p12" "$RUNNER_TEMP/tilemap-signing-probe"
 
   deploy-update-feed:
     name: Deploy public update feed

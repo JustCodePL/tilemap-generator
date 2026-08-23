@@ -49,4 +49,6 @@ it('chroni certyfikat i nie kasuje feedu przy błędzie pobrania', () => {
   expect(workflow).toContain('fetch_previous_manifest beta');
   expect(workflow).toContain('404) rm -f "$temporary"');
   expect(workflow).not.toContain('previous-stable-RELEASES.json');
+  expect(workflow).toContain('signing_probe="$RUNNER_TEMP/tilemap-signing-probe"');
+  expect(workflow).toContain('TeamIdentifier=$APPLE_TEAM_ID');
 });
