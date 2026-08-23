@@ -142,10 +142,19 @@ jobs:
           keychain_path="$RUNNER_TEMP/tilemap-signing.keychain-db"
           keychain_password=$(openssl rand -base64 32)
           certificate_path="$RUNNER_TEMP/tilemap-developer-id.p12"
+          original_keychains_path="$RUNNER_TEMP/tilemap-original-keychains.txt"
 
+          security list-keychains -d user \
+            | sed -E 's/^[[:space:]]*"([^"]+)"[[:space:]]*$/\1/' \
+            > "$original_keychains_path"
           security create-keychain -p "$keychain_password" "$keychain_path"
           security set-keychain-settings -lut 21600 "$keychain_path"
           security unlock-keychain -p "$keychain_password" "$keychain_path"
+          original_keychains=()
+          while IFS= read -r existing_keychain; do
+            [[ -n "$existing_keychain" ]] && original_keychains+=("$existing_keychain")
+          done < "$original_keychains_path"
+          security list-keychains -d user -s "$keychain_path" "${original_keychains[@]}"
           printf '%s' "$DEVELOPER_ID_APPLICATION_P12" | base64 --decode > "$certificate_path"
           security import "$certificate_path" \
             -k "$keychain_path" \
@@ -158,11 +167,11 @@ jobs:
             -k "$keychain_password" \
             "$keychain_path" >/dev/null
 
-          identity=$(security find-identity -v -p codesigning "$keychain_path" \
-            | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' \
-            | sed -n '1p')
-          if [[ -z "$identity" ]]; then
-            echo 'Zaimportowany P12 nie zawiera Developer ID Application.' >&2
+          identity_output=$(security find-identity -v -p codesigning "$keychain_path")
+          identity_count=$(awk '/"Developer ID Application:/ { count++ } END { print count + 0 }' <<<"$identity_output")
+          identity_hash=$(awk '/"Developer ID Application:/ { print $2 }' <<<"$identity_output")
+          if [[ "$identity_count" != '1' || ! "$identity_hash" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+            echo "Oczekiwano dokładnie jednego Developer ID Application, znaleziono $identity_count." >&2
             exit 1
           fi
 
@@ -170,7 +179,7 @@ jobs:
           cp /usr/bin/true "$signing_probe"
           codesign --force --options runtime --timestamp \
             --keychain "$keychain_path" \
-            --sign "$identity" \
+            --sign "$identity_hash" \
             "$signing_probe"
           codesign --verify --strict --verbose=2 "$signing_probe"
           probe_signature=$(codesign -dvvv "$signing_probe" 2>&1)
@@ -180,7 +189,7 @@ jobs:
           }
           rm -f "$signing_probe"
           echo "TILEMAP_MACOS_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
-          echo "TILEMAP_MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "TILEMAP_MACOS_SIGN_IDENTITY=$identity_hash" >> "$GITHUB_ENV"
 
       - name: Make signed and notarized ZIP
         shell: bash
@@ -354,8 +363,21 @@ jobs:
         if: always()
         shell: bash
         run: |
+          original_keychains_path="$RUNNER_TEMP/tilemap-original-keychains.txt"
+          if [[ -s "$original_keychains_path" ]]; then
+            original_keychains=()
+            while IFS= read -r existing_keychain; do
+              [[ -n "$existing_keychain" ]] && original_keychains+=("$existing_keychain")
+            done < "$original_keychains_path"
+            if [[ ${#original_keychains[@]} -gt 0 ]]; then
+              security list-keychains -d user -s "${original_keychains[@]}" || true
+            fi
+          fi
           security delete-keychain "$RUNNER_TEMP/tilemap-signing.keychain-db" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/tilemap-developer-id.p12" "$RUNNER_TEMP/tilemap-signing-probe"
+          rm -f \
+            "$RUNNER_TEMP/tilemap-developer-id.p12" \
+            "$RUNNER_TEMP/tilemap-signing-probe" \
+            "$original_keychains_path"
 
   deploy-update-feed:
     name: Deploy public update feed

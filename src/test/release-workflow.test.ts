@@ -51,4 +51,8 @@ it('chroni certyfikat i nie kasuje feedu przy błędzie pobrania', () => {
   expect(workflow).not.toContain('previous-stable-RELEASES.json');
   expect(workflow).toContain('signing_probe="$RUNNER_TEMP/tilemap-signing-probe"');
   expect(workflow).toContain('TeamIdentifier=$APPLE_TEAM_ID');
+  expect(workflow).toContain('original_keychains_path="$RUNNER_TEMP/tilemap-original-keychains.txt"');
+  expect(workflow).toContain('security list-keychains -d user -s "$keychain_path" "${original_keychains[@]}"');
+  expect(workflow).toContain('security list-keychains -d user -s "${original_keychains[@]}" || true');
+  expect(workflow).toContain('TILEMAP_MACOS_SIGN_IDENTITY=$identity_hash');
 });
