@@ -4,14 +4,19 @@ import sharp, { type OverlayOptions } from 'sharp';
 
 const CHARACTER_ROWS = 4;
 const ALPHA_VISIBLE_THRESHOLD = 24;
+const CHARACTER_EDGE_REPAIR_PADDING_RATIO = 0.08;
+const DETACHED_VERTICAL_COMPONENT_GAP_RATIO = 0.08;
+const DETACHED_VERTICAL_COMPONENT_MAX_WEIGHT_RATIO = 0.35;
 
 export interface CharacterAnimationSourceCellInspection {
   row: number;
   column: number;
   visiblePixels: number;
   transparentPixels: number;
+  discardedPixels: number;
   touchesCellEdge: boolean;
   bounds: { left: number; top: number; right: number; bottom: number; width: number; height: number } | null;
+  centroid: { x: number; y: number } | null;
 }
 
 export interface CharacterAnimationSourceInspection {
@@ -294,9 +299,10 @@ export async function inspectCharacterAnimationSource(
 
 /**
  * Re-packs a generated (idle + walk frames) x 4 sheet without changing the source. Every cell uses
- * one common scale, keeps its aspect ratio, is centered horizontally and
- * bottom-aligned inside the target frame. No upscaling or background removal
- * is performed.
+ * one common scale, keeps its aspect ratio, centers the alpha mass horizontally
+ * and bottom-aligns the retained silhouette inside the target frame. Detached
+ * small fragments well above or below the main silhouette are excluded from the crop.
+ * No upscaling or background removal is performed.
  */
 export async function normalizeCharacterAnimationSource(
   input: NormalizeCharacterAnimationSourceInput,
@@ -305,16 +311,26 @@ export async function normalizeCharacterAnimationSource(
   assertFramesPerDirection(input.framesPerDirection);
   const columns = input.framesPerDirection + 1;
   const source = await inspectCharacterAnimationSource(input.sourcePath, input.framesPerDirection);
-  if (!source.usable) throw new Error(source.issues.join(' '));
+  const hasCompleteGrid = source.hasAlpha
+    && source.transparentPixels > 0
+    && source.visiblePixels > 0
+    && source.cells.length === columns * CHARACTER_ROWS
+    && source.cells.every((cell) => cell.visiblePixels > 0 && cell.bounds);
+  if (!hasCompleteGrid) throw new Error(source.issues.join(' '));
 
   const targetWidth = input.frameWidthPx * columns;
   const targetHeight = input.frameHeightPx * CHARACTER_ROWS;
   const samePath = path.resolve(input.sourcePath) === path.resolve(input.outputPath);
-  const normalized = source.width !== targetWidth || source.height !== targetHeight;
+  const touchesCellEdge = source.cells.some((cell) => cell.touchesCellEdge);
+  const hasDetachedVerticalArtifacts = source.cells.some((cell) => cell.discardedPixels > 0);
+  const normalized = source.width !== targetWidth
+    || source.height !== targetHeight
+    || touchesCellEdge
+    || hasDetachedVerticalArtifacts;
   const sourceCellWidth = source.width / columns;
   const sourceCellHeight = source.height / CHARACTER_ROWS;
-  const horizontalGutter = input.frameWidthPx >= 3 ? 1 : 0;
-  const verticalGutter = input.frameHeightPx >= 2 ? 1 : 0;
+  const horizontalGutter = characterCellGutter(input.frameWidthPx, touchesCellEdge);
+  const verticalGutter = characterCellGutter(input.frameHeightPx, touchesCellEdge);
   const availableWidth = input.frameWidthPx - horizontalGutter * 2;
   const availableHeight = input.frameHeightPx - verticalGutter * 2;
   const sourceRegions = source.cells.map((cell) => expandedCellRegion(
@@ -325,8 +341,21 @@ export async function normalizeCharacterAnimationSource(
   ));
   const maxSourceRegionWidth = Math.max(...sourceRegions.map((region) => region.width));
   const maxSourceRegionHeight = Math.max(...sourceRegions.map((region) => region.height));
+  const maxSourceCentroidRadius = Math.max(...sourceRegions.map((region, index) => {
+    const cell = source.cells[index];
+    if (!cell?.centroid) return Number.POSITIVE_INFINITY;
+    const cellLeft = gridBoundary(cell.column, source.width, columns);
+    const centroidInRegion = cell.centroid.x - (region.left - cellLeft);
+    return Math.max(centroidInRegion, region.width - centroidInRegion);
+  }));
+  const horizontalCentroidCapacity = input.frameWidthPx / 2 - horizontalGutter;
   const scale = normalized
-    ? Math.min(1, availableWidth / maxSourceRegionWidth, availableHeight / maxSourceRegionHeight)
+    ? Math.min(
+      1,
+      availableWidth / maxSourceRegionWidth,
+      availableHeight / maxSourceRegionHeight,
+      horizontalCentroidCapacity / maxSourceCentroidRadius,
+    )
     : 1;
   const outputCellWidth = normalized
     ? Math.max(1, Math.min(availableWidth, Math.round(maxSourceRegionWidth * scale)))
@@ -360,6 +389,10 @@ export async function normalizeCharacterAnimationSource(
       for (const [index, sourceRegion] of sourceRegions.entries()) {
         const row = Math.floor(index / columns);
         const column = index % columns;
+        const sourceCell = source.cells[index];
+        if (!sourceCell?.centroid) {
+          throw new Error(`Komórka ${column + 1}×${row + 1} źródła animacji postaci jest pusta.`);
+        }
         const cellWidth = Math.max(1, Math.min(availableWidth, Math.round(sourceRegion.width * scale)));
         const cellHeight = Math.max(1, Math.min(availableHeight, Math.round(sourceRegion.height * scale)));
         const cell = await sharp(input.sourcePath, { failOn: 'error' })
@@ -373,9 +406,19 @@ export async function normalizeCharacterAnimationSource(
           .resize({ width: cellWidth, height: cellHeight, fit: 'fill', kernel: 'lanczos3' })
           .png()
           .toBuffer();
+        const sourceCellLeft = gridBoundary(column, source.width, columns);
+        const sourceCentroidInRegion = sourceCell.centroid.x - (sourceRegion.left - sourceCellLeft);
+        const resizedCentroid = sourceCentroidInRegion * cellWidth / sourceRegion.width;
+        const minimumLeft = horizontalGutter;
+        const maximumLeft = input.frameWidthPx - horizontalGutter - cellWidth;
+        const localLeft = clamp(
+          Math.round(input.frameWidthPx / 2 - resizedCentroid),
+          minimumLeft,
+          maximumLeft,
+        );
         overlays.push({
           input: cell,
-          left: column * input.frameWidthPx + Math.floor((input.frameWidthPx - cellWidth) / 2),
+          left: column * input.frameWidthPx + localLeft,
           top: row * input.frameHeightPx + input.frameHeightPx - verticalGutter - cellHeight,
         });
       }
@@ -425,29 +468,35 @@ function inspectCell(
   right: number,
   bottom: number,
 ): CharacterAnimationSourceCellInspection {
-  let visiblePixels = 0;
-  let transparentPixels = 0;
-  let touchesCellEdge = false;
-  let minX = right - left;
-  let minY = bottom - top;
-  let maxX = -1;
-  let maxY = -1;
-  for (let y = top; y < bottom; y += 1) {
-    for (let x = left; x < right; x += 1) {
-      const alpha = pixelAlpha(raw, x, y);
-      if (alpha > ALPHA_VISIBLE_THRESHOLD) {
-        visiblePixels += 1;
-        minX = Math.min(minX, x - left);
-        minY = Math.min(minY, y - top);
-        maxX = Math.max(maxX, x - left);
-        maxY = Math.max(maxY, y - top);
-      } else transparentPixels += 1;
-      if (alpha > ALPHA_VISIBLE_THRESHOLD
-        && (x === left || x === right - 1 || y === top || y === bottom - 1)) {
-        touchesCellEdge = true;
-      }
-    }
-  }
+  const cellWidth = right - left;
+  const cellHeight = bottom - top;
+  const components = alphaComponents(raw, left, top, right, bottom);
+  const primary = components.reduce<AlphaComponent | null>((largest, component) => (
+    !largest || component.alphaWeight > largest.alphaWeight ? component : largest
+  ), null);
+  const maximumDetachedGap = Math.max(2, Math.ceil(cellHeight * DETACHED_VERTICAL_COMPONENT_GAP_RATIO));
+  const retained = components.filter((component) => {
+    if (!primary || component === primary) return true;
+    const gapBelowPrimary = component.top - primary.bottom - 1;
+    const gapAbovePrimary = primary.top - component.bottom - 1;
+    const verticalGap = Math.max(gapAbovePrimary, gapBelowPrimary);
+    return verticalGap <= maximumDetachedGap
+      || component.alphaWeight >= primary.alphaWeight * DETACHED_VERTICAL_COMPONENT_MAX_WEIGHT_RATIO;
+  });
+  const visiblePixels = retained.reduce((sum, component) => sum + component.visiblePixels, 0);
+  const discardedPixels = components.reduce(
+    (sum, component) => sum + component.visiblePixels,
+    0,
+  ) - visiblePixels;
+  const transparentPixels = cellWidth * cellHeight - visiblePixels;
+  const touchesCellEdge = retained.some((component) => component.touchesCellEdge);
+  const minX = retained.reduce((value, component) => Math.min(value, component.left), cellWidth);
+  const minY = retained.reduce((value, component) => Math.min(value, component.top), cellHeight);
+  const maxX = retained.reduce((value, component) => Math.max(value, component.right), -1);
+  const maxY = retained.reduce((value, component) => Math.max(value, component.bottom), -1);
+  const alphaWeight = retained.reduce((sum, component) => sum + component.alphaWeight, 0);
+  const weightedX = retained.reduce((sum, component) => sum + component.weightedX, 0);
+  const weightedY = retained.reduce((sum, component) => sum + component.weightedY, 0);
   const bounds = visiblePixels
     ? {
       left: minX,
@@ -458,7 +507,92 @@ function inspectCell(
       height: maxY - minY + 1,
     }
     : null;
-  return { row, column, visiblePixels, transparentPixels, touchesCellEdge, bounds };
+  const centroid = alphaWeight
+    ? { x: weightedX / alphaWeight, y: weightedY / alphaWeight }
+    : null;
+  return { row, column, visiblePixels, transparentPixels, discardedPixels, touchesCellEdge, bounds, centroid };
+}
+
+interface AlphaComponent {
+  visiblePixels: number;
+  alphaWeight: number;
+  weightedX: number;
+  weightedY: number;
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  touchesCellEdge: boolean;
+}
+
+function alphaComponents(
+  raw: RawImage,
+  left: number,
+  top: number,
+  right: number,
+  bottom: number,
+): AlphaComponent[] {
+  const width = right - left;
+  const height = bottom - top;
+  const visited = new Uint8Array(width * height);
+  const queue = new Int32Array(width * height);
+  const components: AlphaComponent[] = [];
+  for (let startY = 0; startY < height; startY += 1) {
+    for (let startX = 0; startX < width; startX += 1) {
+      const startIndex = startY * width + startX;
+      if (visited[startIndex] || pixelAlpha(raw, left + startX, top + startY) <= ALPHA_VISIBLE_THRESHOLD) {
+        visited[startIndex] = 1;
+        continue;
+      }
+      let queueStart = 0;
+      let queueEnd = 1;
+      queue[0] = startIndex;
+      visited[startIndex] = 1;
+      const component: AlphaComponent = {
+        visiblePixels: 0,
+        alphaWeight: 0,
+        weightedX: 0,
+        weightedY: 0,
+        left: width,
+        top: height,
+        right: -1,
+        bottom: -1,
+        touchesCellEdge: false,
+      };
+      while (queueStart < queueEnd) {
+        const index = queue[queueStart];
+        queueStart += 1;
+        const x = index % width;
+        const y = Math.floor(index / width);
+        const alpha = pixelAlpha(raw, left + x, top + y);
+        component.visiblePixels += 1;
+        component.alphaWeight += alpha;
+        component.weightedX += (x + 0.5) * alpha;
+        component.weightedY += (y + 0.5) * alpha;
+        component.left = Math.min(component.left, x);
+        component.top = Math.min(component.top, y);
+        component.right = Math.max(component.right, x);
+        component.bottom = Math.max(component.bottom, y);
+        component.touchesCellEdge ||= x === 0 || x === width - 1 || y === 0 || y === height - 1;
+        for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+          for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+            if (!offsetX && !offsetY) continue;
+            const neighborX = x + offsetX;
+            const neighborY = y + offsetY;
+            if (neighborX < 0 || neighborX >= width || neighborY < 0 || neighborY >= height) continue;
+            const neighborIndex = neighborY * width + neighborX;
+            if (visited[neighborIndex]) continue;
+            if (pixelAlpha(raw, left + neighborX, top + neighborY) <= ALPHA_VISIBLE_THRESHOLD) continue;
+            visited[neighborIndex] = 1;
+            queue[queueEnd] = neighborIndex;
+            queueEnd += 1;
+          }
+        }
+      }
+      components.push(component);
+    }
+  }
+  return components;
 }
 
 function expandedCellRegion(
@@ -522,6 +656,18 @@ function colorDistanceSquared(
 
 function gridBoundary(index: number, size: number, count: number): number {
   return Math.round(index * size / count);
+}
+
+function characterCellGutter(size: number, repairTouchedEdge: boolean): number {
+  if (size < 3) return 0;
+  const desired = repairTouchedEdge
+    ? Math.max(1, Math.ceil(size * CHARACTER_EDGE_REPAIR_PADDING_RATIO))
+    : 1;
+  return Math.min(desired, Math.floor((size - 1) / 2));
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
 }
 
 function assertFrameSize(width: number, height: number): void {

@@ -1184,7 +1184,7 @@ it('odzyskuje alfę z nieprzezroczystego arkusza postaci bez kosztownego retry',
   database.close();
 });
 
-it('wybiera najlepszy wynik imagegen, normalizuje go i kończy bez zbędnego retry', async () => {
+it('wybiera także wynik dotykający granic komórek, normalizuje go i kończy bez zbędnego retry', async () => {
   const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-character-source-selection-')), 'project');
   temporaryDirectories.push(path.dirname(root));
   mkdirSync(root);
@@ -1218,7 +1218,7 @@ it('wybiera najlepszy wynik imagegen, normalizuje go i kończy bez zbędnego ret
       const bakedPath = path.join(path.dirname(finalPath), 'second-baked.png');
       const secondBakedPath = path.join(path.dirname(finalPath), 'third-baked.png');
       await writeStaticCharacterSheet(staticExactPath, 32, 32);
-      await writeCharacterSheet(sourcePath, 40, 32);
+      await writeCharacterSheet(sourcePath, 40, 32, CHARACTER_FIXTURE_FRAMES, true);
       await sharp({ create: { width: 160, height: 128, channels: 3, background: '#cccccc' } })
         .png().toFile(bakedPath);
       await sharp({ create: { width: 160, height: 128, channels: 3, background: '#f0f0f0' } })
@@ -1257,7 +1257,7 @@ it('wybiera najlepszy wynik imagegen, normalizuje go i kończy bez zbędnego ret
   ))).toBe(true);
   const completedVersion = database.getAsset(job.assetId)?.versions[0];
   expect(completedVersion).toMatchObject({
-    status: 'needs_review', width: 160, height: 128, pivot: { x: 0.5, y: 0.0625 },
+    status: 'needs_review', width: 160, height: 128, pivot: { x: 0.5, y: 0.09375 },
     generationMetadata: {
       characterSourceNormalization: {
         normalized: true, sourceWidth: 200, sourceHeight: 128, outputWidth: 160, outputHeight: 128,
@@ -1468,6 +1468,7 @@ async function writeCharacterSheet(
   frameWidth: number,
   frameHeight: number,
   framesPerDirection = CHARACTER_FIXTURE_FRAMES,
+  touchCellEdge = false,
 ): Promise<void> {
   mkdirSync(path.dirname(filePath), { recursive: true });
   const columns = framesPerDirection + 1;
@@ -1485,6 +1486,7 @@ async function writeCharacterSheet(
       const svg = [
         `<svg width="${frameWidth}" height="${frameHeight}" xmlns="http://www.w3.org/2000/svg">`,
         `<g fill="${colors[row]}">`,
+        touchCellEdge ? '<rect x="0" y="14" width="13" height="2"/>' : '',
         '<circle cx="16" cy="6" r="3"/>',
         '<rect x="12" y="9" width="8" height="11" rx="2"/>',
         `<rect x="${leftLegX}" y="19" width="3" height="${leftLegBottom - 19 + 1}"/>`,

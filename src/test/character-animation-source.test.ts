@@ -192,6 +192,95 @@ describe('normalizeCharacterAnimationSource', () => {
     expect(digest(output)).toBe(digest(source));
   });
 
+  it('naprawia pełnokadrowe klatki w arkuszu o docelowym rozmiarze', async () => {
+    const directory = temp();
+    const source = path.join(directory, 'touching-target-size.png');
+    const output = path.join(directory, 'normalized.png');
+    const frameWidth = 64;
+    const frameHeight = 80;
+    await createTransparentSheet(source, frameWidth * 5, frameHeight * 4, {
+      touchFirstCellEdge: true,
+      fillRatio: 1,
+    });
+
+    const sourceInspection = await inspectCharacterAnimationSource(source, FIXTURE_FRAMES_PER_DIRECTION);
+    expect(sourceInspection.usable).toBe(false);
+    expect(sourceInspection.cells.some((cell) => cell.touchesCellEdge)).toBe(true);
+
+    const result = await normalizeCharacterAnimationSource({
+      sourcePath: source,
+      outputPath: output,
+      frameWidthPx: frameWidth,
+      frameHeightPx: frameHeight,
+      framesPerDirection: FIXTURE_FRAMES_PER_DIRECTION,
+    });
+
+    const horizontalPadding = Math.ceil(frameWidth * 0.08);
+    const verticalPadding = Math.ceil(frameHeight * 0.08);
+    expect(result.normalized).toBe(true);
+    expect(result.scale).toBeLessThan(1);
+    expect(result.output.usable).toBe(true);
+    expect(result.output.cells.every((cell) => {
+      if (!cell.bounds) return false;
+      return cell.bounds.left >= horizontalPadding
+        && frameWidth - 1 - cell.bounds.right >= horizontalPadding
+        && cell.bounds.top >= verticalPadding
+        && frameHeight - 1 - cell.bounds.bottom >= verticalPadding;
+    })).toBe(true);
+  });
+
+  it('stabilizuje poziomy centroid asymetrycznych sylwetek między klatkami', async () => {
+    const directory = temp();
+    const source = path.join(directory, 'asymmetric-centroids.png');
+    const output = path.join(directory, 'normalized.png');
+    await createAsymmetricCentroidSheet(source, 500, 320);
+
+    const result = await normalizeCharacterAnimationSource({
+      sourcePath: source,
+      outputPath: output,
+      frameWidthPx: 64,
+      frameHeightPx: 80,
+      framesPerDirection: FIXTURE_FRAMES_PER_DIRECTION,
+    });
+
+    expect(result.normalized).toBe(true);
+    expect(result.output.usable).toBe(true);
+    for (let row = 0; row < 4; row += 1) {
+      const centroids = result.output.cells
+        .filter((cell) => cell.row === row)
+        .map((cell) => cell.centroid?.x ?? Number.NaN);
+      expect(Math.max(...centroids) - Math.min(...centroids)).toBeLessThanOrEqual(1.5);
+    }
+  });
+
+  it('usuwa małe pionowo oderwane artefakty także z arkusza o docelowym rozmiarze', async () => {
+    const directory = temp();
+    const source = path.join(directory, 'detached-lower-artifacts.png');
+    const output = path.join(directory, 'normalized.png');
+    await createDetachedVerticalArtifactSheet(source, 320, 320);
+
+    const sourceInspection = await inspectCharacterAnimationSource(source, FIXTURE_FRAMES_PER_DIRECTION);
+    expect(sourceInspection.cells.some((cell) => cell.discardedPixels > 0)).toBe(true);
+
+    const result = await normalizeCharacterAnimationSource({
+      sourcePath: source,
+      outputPath: output,
+      frameWidthPx: 64,
+      frameHeightPx: 80,
+      framesPerDirection: FIXTURE_FRAMES_PER_DIRECTION,
+    });
+
+    expect(result.normalized).toBe(true);
+    expect(result.output.usable).toBe(true);
+    expect(result.output.cells.every((cell) => cell.discardedPixels === 0)).toBe(true);
+    for (let row = 0; row < 4; row += 1) {
+      const centroids = result.output.cells
+        .filter((cell) => cell.row === row)
+        .map((cell) => cell.centroid?.y ?? Number.NaN);
+      expect(Math.max(...centroids) - Math.min(...centroids)).toBeLessThanOrEqual(1.5);
+    }
+  });
+
   it('nie nadpisuje źródła, gdy normalizacja wymaga innego canvasa', async () => {
     const directory = temp();
     const source = path.join(directory, 'source.png');
@@ -307,6 +396,79 @@ async function createOpaqueSheet(
     .png()
     .toFile(filePath);
   rmSync(transparentPath, { force: true });
+}
+
+async function createAsymmetricCentroidSheet(
+  filePath: string,
+  width: number,
+  height: number,
+): Promise<void> {
+  const columns = FIXTURE_FRAMES_PER_DIRECTION + 1;
+  const composites: OverlayOptions[] = [];
+  for (let row = 0; row < 4; row += 1) {
+    const top = Math.round(row * height / 4);
+    const bottom = Math.round((row + 1) * height / 4);
+    for (let column = 0; column < columns; column += 1) {
+      const left = Math.round(column * width / columns);
+      const right = Math.round((column + 1) * width / columns);
+      const cellWidth = right - left;
+      const cellHeight = bottom - top;
+      const mirrored = column % 2 === 1;
+      const bodyLeft = mirrored ? cellWidth - 23 : 5;
+      const detailLeft = mirrored ? 16 : cellWidth - 20;
+      composites.push({
+        input: Buffer.from(
+          `<svg width="${cellWidth}" height="${cellHeight}" xmlns="http://www.w3.org/2000/svg">`
+          + `<rect x="${bodyLeft}" y="40" width="18" height="30" rx="2" fill="#4f8f46"/>`
+          + `<rect x="${detailLeft}" y="52" width="4" height="4" fill="#d7b36a"/>`
+          + '</svg>',
+        ),
+        left,
+        top,
+      });
+    }
+  }
+  await sharp({
+    create: { width, height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+  }).composite(composites).png().toFile(filePath);
+}
+
+async function createDetachedVerticalArtifactSheet(
+  filePath: string,
+  width: number,
+  height: number,
+): Promise<void> {
+  const columns = FIXTURE_FRAMES_PER_DIRECTION + 1;
+  const composites: OverlayOptions[] = [];
+  for (let row = 0; row < 4; row += 1) {
+    const top = Math.round(row * height / 4);
+    const bottom = Math.round((row + 1) * height / 4);
+    for (let column = 0; column < columns; column += 1) {
+      const left = Math.round(column * width / columns);
+      const right = Math.round((column + 1) * width / columns);
+      const cellWidth = right - left;
+      const cellHeight = bottom - top;
+      const artifact = column % 3 === 1
+        ? '<rect x="29" y="70" width="6" height="4" fill="#e46b32"/>'
+        : column % 3 === 2
+          ? '<rect x="29" y="2" width="6" height="4" fill="#e46b32"/>'
+          : '';
+      composites.push({
+        input: Buffer.from(
+          `<svg width="${cellWidth}" height="${cellHeight}" xmlns="http://www.w3.org/2000/svg">`
+          + '<rect x="21" y="20" width="22" height="30" rx="3" fill="#4f8f46"/>'
+          + '<rect x="48" y="30" width="4" height="5" fill="#d7b36a"/>'
+          + artifact
+          + '</svg>',
+        ),
+        left,
+        top,
+      });
+    }
+  }
+  await sharp({
+    create: { width, height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+  }).composite(composites).png().toFile(filePath);
 }
 
 async function alphaBounds(

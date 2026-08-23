@@ -1916,27 +1916,24 @@ async function resolveCharacterGeneratedFile(
         preparedCandidate = recoveredPath;
         inspection = recovery.output;
       }
-      if (inspection.usable) {
-        score = inspection.width === expectedSize.width && inspection.height === expectedSize.height ? 2 : 1;
-        try {
-          await normalizeCharacterAnimationSource({
-            sourcePath: preparedCandidate,
-            outputPath: evaluationPath,
-            frameWidthPx,
-            frameHeightPx,
-            framesPerDirection,
-          });
-          await validateCharacterAnimationSheet({
-            filePath: evaluationPath,
-            projection,
-            frameWidthPx,
-            frameHeightPx,
-            framesPerDirection,
-          });
-          score += 2;
-        } finally {
-          rmSync(evaluationPath, { force: true });
-        }
+      try {
+        await normalizeCharacterAnimationSource({
+          sourcePath: preparedCandidate,
+          outputPath: evaluationPath,
+          frameWidthPx,
+          frameHeightPx,
+          framesPerDirection,
+        });
+        await validateCharacterAnimationSheet({
+          filePath: evaluationPath,
+          projection,
+          frameWidthPx,
+          frameHeightPx,
+          framesPerDirection,
+        });
+        score = (inspection.width === expectedSize.width && inspection.height === expectedSize.height ? 2 : 1) + 2;
+      } finally {
+        rmSync(evaluationPath, { force: true });
       }
     } catch {
       // Unreadable candidates remain last-resort sources so validation can return actionable feedback.
