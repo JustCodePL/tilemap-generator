@@ -15,6 +15,7 @@ it('wydaje macOS na dedykowanym runnerze repozytorium i używa tylko sekretów A
   expect(workflow).toContain('runs-on: [self-hosted, macOS, ARM64, justcode, tilemap-generator]');
   expect(workflow).toContain('git merge-base --is-ancestor "$GITHUB_SHA" origin/main');
   expect(workflow).not.toContain('npm version');
+  expect(workflow).not.toContain('cache: npm');
 
   const secrets = [...workflow.matchAll(/secrets\.([A-Z0-9_]+)/g)].map((match) => match[1]);
   expect(new Set(secrets)).toEqual(new Set([
