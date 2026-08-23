@@ -67,7 +67,7 @@ jobs:
           if [[ "$version" == *-beta.* ]]; then
             channel=beta
             prerelease=true
-            title='Konfigurowalne animacje postaci'
+            title="Tilemap Generator ${version}"
           else
             channel=stable
             prerelease=false
