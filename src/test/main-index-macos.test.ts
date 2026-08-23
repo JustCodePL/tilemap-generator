@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 const state = vi.hoisted(() => {
   type Listener = (...args: unknown[]) => void;
   const appListeners = new Map<string, Listener>();
+  const autoUpdaterListeners = new Map<string, Listener>();
   const windows: FakeBrowserWindow[] = [];
   const registerIpc = vi.fn(() => vi.fn(async () => undefined));
 
@@ -43,6 +44,7 @@ const state = vi.hoisted(() => {
 
   return {
     appListeners,
+    autoUpdaterListeners,
     windows,
     registerIpc,
     BrowserWindow: FakeBrowserWindow,
@@ -52,11 +54,15 @@ const state = vi.hoisted(() => {
       getPath: vi.fn(() => '/tmp/tilemap-generator-test-user-data'),
       quit: vi.fn(),
     },
+    autoUpdater: {
+      on: vi.fn((event: string, listener: Listener) => autoUpdaterListeners.set(event, listener)),
+    },
   };
 });
 
 vi.mock('electron', () => ({
   app: state.app,
+  autoUpdater: state.autoUpdater,
   BrowserWindow: state.BrowserWindow,
   net: { fetch: vi.fn() },
   protocol: {
@@ -76,6 +82,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.resetModules();
   state.appListeners.clear();
+  state.autoUpdaterListeners.clear();
   state.windows.splice(0);
   state.registerIpc.mockClear();
   state.app.quit.mockClear();
@@ -136,4 +143,21 @@ it('nie pozwala drugiemu Cmd-Q ominąć trwającego cleanup aplikacji', async ()
   const finalEvent = { preventDefault: vi.fn() };
   beforeQuit?.(finalEvent);
   expect(finalEvent.preventDefault).not.toHaveBeenCalled();
+});
+
+it('nie zamienia restartu aktualizacyjnego w zwykłe ukrycie okna', async () => {
+  vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+  (globalThis as Record<string, unknown>).MAIN_WINDOW_VITE_DEV_SERVER_URL = 'http://127.0.0.1:5173';
+  (globalThis as Record<string, unknown>).MAIN_WINDOW_VITE_NAME = 'main_window';
+
+  await import('../main/index');
+  await vi.waitFor(() => expect(state.windows).toHaveLength(1));
+  const window = state.windows[0];
+  const closeEvent = { preventDefault: vi.fn() };
+
+  state.autoUpdaterListeners.get('before-quit-for-update')?.();
+  window.emit('close', closeEvent);
+
+  expect(closeEvent.preventDefault).not.toHaveBeenCalled();
+  expect(window.hidden).toBe(false);
 });

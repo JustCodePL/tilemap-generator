@@ -2,7 +2,7 @@
 
 Generator może korzystać równolegle z trzech backendów obrazowych: Codex + `imagegen`, ComfyUI oraz `stable-diffusion.cpp`. Każdy włączony backend tworzy osobną wersję tego samego assetu, dzięki czemu wynik można porównać, zatwierdzić jako preferowany i wyeksportować razem z informacją o modelu i systemie, który go wygenerował.
 
-Desktopowa fabryka assetów izometrycznych i top-down z wersjonowanym review oraz integracjami eksportu. Aplikacja łączy lokalny Codex App Server, skill `imagegen` i opcjonalne lokalne renderery ComfyUI oraz `stable-diffusion.cpp` z przenośnym registry SQLite. Pierwszą dostępną integracją eksportową jest Unity.
+Desktopowa fabryka assetów izometrycznych i top-down z wersjonowanym review oraz integracjami eksportu. Aplikacja łączy lokalny Codex App Server, skill `imagegen` i opcjonalne lokalne renderery ComfyUI oraz `stable-diffusion.cpp` z przenośnym registry SQLite. Zatwierdzone assety można eksportować do Unity oraz Phaser 3.
 
 ## Uruchomienie
 
@@ -58,7 +58,7 @@ Artefakty dystrybucyjne powstają w `out/make/`.
 3. Po przygotowaniu finalnego PNG agent wyznacza proponowany pivot na podstawie rzeczywistego obrazu. Sprawdź PNG, footprint, pivot, typ, parametry rozmiaru i tagi; pivot możesz nadpisać przed zatwierdzeniem.
 4. Zatwierdź, odrzuć bez kasowania lub utwórz edycję/nowy wariant. Asset może mieć tylko jedną zatwierdzoną wersję; zatwierdzenie można cofnąć, aby wybrać inną.
 5. Po zatwierdzeniu Codex aktualizuje wersjonowane podsumowanie stylu.
-6. Otwórz **Eksport**, wybierz integrację i wskaż dokładny katalog docelowy. Katalog biblioteki pozostaje niezależny od miejsc eksportu, a każda integracja zapamiętuje swój cel osobno. Eksport synchronizuje zatwierdzone wersje z wybranym celem; po cofnięciu ostatniego zatwierdzenia pusty plan assetów może usunąć wcześniej zarządzane pliki. Dla Unity wybierz miejsce wewnątrz `Assets`, na przykład `Assets/TilemapGenerator`; zestaw drogi trafia do własnego podkatalogu jako `road-00.png`…`road-15.png`, a manifest zawiera maskę i kierunki każdego pliku. Narzędzia Unity są instalowane raz, niezależnie od celu, w `Assets/TilemapGeneratorIntegration`. Unity tworzy z wariantów drogi jeden `RoadRuleTile.asset`, który dobiera wariant automatycznie podczas malowania. Każdy zatwierdzony `flat_tile` i `elevated_tile` dostaje też atlas blendingu oraz gotowe assety auto-tile w Unity.
+6. Otwórz **Eksport**, wybierz integrację i wskaż dokładny katalog docelowy. Katalog biblioteki pozostaje niezależny od miejsc eksportu, a Unity i Phaser zapamiętują swoje cele osobno. Eksport synchronizuje zatwierdzone wersje z wybranym celem; po cofnięciu ostatniego zatwierdzenia pusty plan assetów może usunąć wcześniej zarządzane pliki. Dla Unity wybierz miejsce wewnątrz `Assets`, na przykład `Assets/TilemapGenerator`. Dla Phaser wskaż dowolny istniejący katalog udostępniany przez grę, na przykład `public/assets/tilemap-generator`; zatwierdzone PNG trafią do podkatalogu `assets`, a obok nich powstanie manifest `tilemap-assets.phaser.json`.
 
 ## MCP dla Codexa
 
@@ -85,6 +85,44 @@ W utworzonej sekcji `[mcp_servers.tilemap_generator]` w `~/.codex/config.toml` u
 Aplikacja musi działać, ale nie trzeba udostępniać portu HTTP. Proces MCP odkrywa prywatny Unix socket w `~/Library/Application Support/Tilemap Generator/mcp`, uwierzytelnia się rotowanym tokenem dostępnym tylko dla bieżącego użytkownika i przekazuje żądania do tego samego runtime co UI. Token oraz wewnętrzne ścieżki projektu i zarządzanych plików nie są zwracane modelowi; `add_reference` przyjmuje wyłącznie jawnie wskazaną ścieżkę źródłową. Po rejestracji rozpocznij nowe zadanie Codexa albo uruchom ponownie klienta, aby odświeżył listę MCP. Status można sprawdzić także przez `/mcp`; wycofanie konfiguracji wykonuje `"$CODEX" mcp remove tilemap_generator`.
 
 `npm run package` i `npm run make` automatycznie budują MCP oraz kopiują go do `Contents/Resources/mcp` w paczce macOS. W aplikacji własny wewnętrzny `codex app-server` ma tę integrację wyłączoną, aby generacja obrazu nie uruchamiała rekurencyjnie kolejnej generacji MCP.
+
+## Integracja Phaser 3
+
+Eksporter Phaser kopiuje wyłącznie zatwierdzone wersje do `assets/<kategoria>/` w wybranym katalogu i tworzy ścisły manifest `tilemap-assets.phaser.json` w schemacie v1. Manifest zawiera projekcję projektu, typ Gridu (`isometric` albo `orthogonal`), rozmiar tile, PPU oraz listę zarządzanych plików. Każdy asset ma stabilny klucz tekstury, ścieżkę, metodę ładowania (`image` lub `spritesheet`), wymiary, footprint, tagi, pivot oraz origin przeliczony na układ współrzędnych Phaser z początkiem w lewym górnym rogu.
+
+Dane specyficzne dla typów assetów są gotowe do bezpośredniego zbudowania konfiguracji Phaser:
+
+- drogi zawierają 16 wariantów z maskami połączeń, kierunkami i osobnymi teksturami,
+- tereny zawierają atlas blendingu, konfigurację klatek i 47 kanonicznych masek oraz ściany dla izometrii,
+- przeanalizowane postacie zawierają układ arkusza 5×4, wiersze kierunków oraz gotowe definicje animacji `idle` i `walk` z numerami klatek, FPS i zapętleniem.
+
+Cel Phaser nie musi leżeć w katalogu o konkretnej nazwie. Aplikacja traktuje wskazane miejsce jako dokładny root integracji, zapamiętuje go niezależnie od celu Unity i przy kolejnym eksporcie synchronizuje tylko pliki wymienione jako zarządzane w poprzednim manifeście.
+
+Manifest jest jednocześnie natywnym Phaser File Pack. Ścieżki plików są względne względem katalogu manifestu. Phaser nie wyznacza jednak automatycznie katalogu plików z URL-a samego File Packa, dlatego przed utworzeniem gry ustaw sekcji `path` na publiczny URL wybranego rootu. `path` jest celowo użyte zamiast `baseURL`: Phaser dołącza je do URL-i plików już podczas `addPack`.
+
+```js
+const manifestUrl = new URL(
+  'assets/tilemap-generator/tilemap-assets.phaser.json',
+  window.location.href,
+);
+const response = await fetch(manifestUrl);
+const tilemapPack = await response.json();
+tilemapPack['tilemap-generator'].path = new URL('.', response.url).href;
+
+// Przekaż tilemapPack do sceny startowej, a w jej preload():
+this.load.addPack(tilemapPack, 'tilemap-generator');
+```
+
+Po załadowaniu File Packa wpisy postaci są bezpośrednimi konfiguracjami `AnimationManager` (dodatkowe pola `action`, `direction` i `frameNumbers` można wykorzystać w logice gry):
+
+```js
+const section = tilemapPack['tilemap-generator'];
+for (const asset of section.assets) {
+  for (const animation of asset.characterAnimation?.animations ?? []) {
+    this.anims.create(animation);
+  }
+}
+```
 
 ## Integracja Unity: terrain blending i auto-tile
 
@@ -170,7 +208,7 @@ Assety wymagające kanału alpha używają dodatkowo node'ów usuwania tła oraz
 models/background_removal/birefnet.safetensors
 ```
 
-Na stronie projektu można niezależnie włączać i wyłączać `Codex + imagegen`, `ComfyUI · Z-Image Turbo` oraz `stable-diffusion.cpp · Z-Image Turbo`; co najmniej jeden generator musi pozostać aktywny. Każdy aktywny renderer zapisuje osobną wersję pod tym samym assetem. Ekran review i lista wersji pokazują badge `system · model`. Registry przechowuje także identyfikator przebiegu, hash zarządzanego workflow oraz metadane, m.in. seed, sampler, scheduler, kroki i CFG. Manifest eksportu Unity ma schemat v9, jawną listę plików zarządzanych, pole `generatedBy`, projekcję projektu oraz ścisłe metadane zatwierdzonych animacji postaci.
+Na stronie projektu można niezależnie włączać i wyłączać `Codex + imagegen`, `ComfyUI · Z-Image Turbo` oraz `stable-diffusion.cpp · Z-Image Turbo`; co najmniej jeden generator musi pozostać aktywny. Każdy aktywny renderer zapisuje osobną wersję pod tym samym assetem. Ekran review i lista wersji pokazują badge `system · model`. Registry przechowuje także identyfikator przebiegu, hash zarządzanego workflow oraz metadane, m.in. seed, sampler, scheduler, kroki i CFG. Manifest eksportu Unity ma schemat v9, a manifest Phaser schemat v1; oba zawierają jawną listę plików zarządzanych, projekcję projektu oraz ścisłe metadane zatwierdzonych animacji postaci.
 
 Codex może odczytać stan przez `registry.get_generation_settings` i zaproponować zmianę generatorów przez `registry.propose_project_settings`. Tak jak pozostałe zmiany projektu, propozycja zaczyna obowiązywać dopiero po zatwierdzeniu w UI.
 
@@ -274,4 +312,4 @@ TILEMAP_LIVE_CODEX=1 npx vitest run src/test/live-codex.test.ts
 
 ## Zakres v1
 
-V1 nie zawiera własnego edytora całej mapy, chmury ani współpracy wielu użytkowników. Eksport terenu zawiera auto-tile, a eksport budynków prefabowy workflow rozmieszczania na Gridzie w edytorze Unity. Eksport zachowuje istniejące pliki `.meta` eksportowanych PNG.
+V1 nie zawiera własnego edytora całej mapy, chmury ani współpracy wielu użytkowników. Eksport terenu zawiera auto-tile, a integracja Unity dodatkowo prefabowy workflow rozmieszczania budynków na Gridzie. Eksport Unity zachowuje istniejące pliki `.meta` eksportowanych PNG; integracja Phaser dostarcza dane runtime przez własny manifest JSON.

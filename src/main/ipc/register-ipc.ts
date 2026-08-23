@@ -1,4 +1,4 @@
-import { BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain } from 'electron';
 import path from 'node:path';
 import { z } from 'zod';
 import {
@@ -32,6 +32,8 @@ import { StableDiffusionCppService } from '../stable-diffusion/stable-diffusion-
 import { GenerationQueue } from '../services/generation-queue';
 import { ExportService } from '../services/export-service';
 import { ProjectManager } from '../services/project-manager';
+import { createElectronAutoUpdateAdapter } from '../services/electron-auto-update-adapter';
+import { UpdateService } from '../services/update-service';
 import type { Logger } from '../services/app-logger';
 import type { ProjectDatabase } from '../db/project-database';
 
@@ -53,6 +55,14 @@ export async function registerIpc(
   const stableDiffusionCpp = new StableDiffusionCppService(logger);
   const queue = new GenerationQueue(codex, logger, comfy, stableDiffusionCpp);
   const exporter = new ExportService();
+  const updates = new UpdateService({
+    adapter: createElectronAutoUpdateAdapter(),
+    platform: process.platform,
+    architecture: process.arch,
+    packaged: app.isPackaged,
+    version: app.getVersion(),
+    logger,
+  });
   let transitionTail: Promise<void> = Promise.resolve();
   let shuttingDown = false;
   const activeIpcOperations = new Set<Promise<unknown>>();
@@ -62,6 +72,9 @@ export async function registerIpc(
   });
   stableDiffusionCpp.on('install-event', (event) => {
     if (!mainWindow.isDestroyed()) mainWindow.webContents.send(ipcChannels.stableDiffusionCppInstallEvent, event);
+  });
+  const unsubscribeUpdates = updates.onState((state) => {
+    if (!mainWindow.isDestroyed()) mainWindow.webContents.send(ipcChannels.appUpdateEvent, state);
   });
 
   const register = <T>(channel: string, handler: (payload: T) => unknown | Promise<unknown>) => {
@@ -333,9 +346,16 @@ export async function registerIpc(
     stableDiffusionCpp.selectModel(stableDiffusionCppModelIdSchema.parse(payload))
   ));
   register(ipcChannels.stableDiffusionCppCancelInstall, () => stableDiffusionCpp.cancelInstall());
+  register(ipcChannels.appUpdateStatus, () => updates.status());
+  register(ipcChannels.appUpdateCheck, () => updates.check());
+  register(ipcChannels.appUpdateInstall, () => updates.install());
+
+  void updates.start();
 
   return async () => {
     shuttingDown = true;
+    unsubscribeUpdates();
+    updates.stop();
     stableDiffusionCpp.cancelInstall();
     await mcpBridge?.stop();
     await Promise.allSettled([...activeIpcOperations]);
@@ -345,6 +365,7 @@ export async function registerIpc(
     for (const channel of Object.values(ipcChannels)) {
       if (channel !== ipcChannels.generationEvent
         && channel !== ipcChannels.stableDiffusionCppInstallEvent
+        && channel !== ipcChannels.appUpdateEvent
         && channel !== ipcChannels.projectChanged) {
         ipcMain.removeHandler(channel);
       }

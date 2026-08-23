@@ -83,6 +83,16 @@ const api: TilemapGeneratorApi = {
       return () => ipcRenderer.removeListener(ipcChannels.stableDiffusionCppInstallEvent, handler);
     },
   },
+  updates: {
+    status: () => ipcRenderer.invoke(ipcChannels.appUpdateStatus),
+    check: () => ipcRenderer.invoke(ipcChannels.appUpdateCheck),
+    install: () => ipcRenderer.invoke(ipcChannels.appUpdateInstall),
+    onState: (listener) => {
+      const handler = (_event: Electron.IpcRendererEvent, payload: Parameters<typeof listener>[0]) => listener(payload);
+      ipcRenderer.on(ipcChannels.appUpdateEvent, handler);
+      return () => ipcRenderer.removeListener(ipcChannels.appUpdateEvent, handler);
+    },
+  },
 };
 
 contextBridge.exposeInMainWorld('tilemap', api);

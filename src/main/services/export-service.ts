@@ -8,6 +8,7 @@ import type {
   ExportRunResult,
 } from '../../shared/domain';
 import type { ProjectDatabase } from '../db/project-database';
+import { PhaserExporter } from './phaser-exporter';
 import { UnityExporter } from './unity-exporter';
 
 const PREVIEW_TTL_MS = 10 * 60_000;
@@ -32,7 +33,7 @@ export class ExportService {
   private readonly grantedTargets = new Set<string>();
   private readonly pendingRoutes = new Map<string, PendingRoute>();
 
-  constructor(adapters: ExportIntegrationAdapter[] = [new UnityExporter()]) {
+  constructor(adapters: ExportIntegrationAdapter[] = [new UnityExporter(), new PhaserExporter()]) {
     if (adapters.some((adapter) => adapter.descriptor.id !== adapter.integration)) {
       throw new Error('Id descriptora musi odpowiadać id integracji eksportu.');
     }

@@ -23,7 +23,7 @@ import {
 } from '../shared/domain';
 
 it('definiuje neutralny kontrakt integracji eksportu', () => {
-  expect(exportIntegrations).toEqual(['unity']);
+  expect(exportIntegrations).toEqual(['unity', 'phaser']);
   expect(exportIntegrationSchema.parse('unity')).toBe('unity');
   expect(exportPreviewSchema.parse({
     integration: 'unity',

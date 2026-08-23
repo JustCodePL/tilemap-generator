@@ -29,6 +29,7 @@ import type {
   UpdateProjectReferenceInput,
   UpdateProjectSettingsInput,
 } from './domain';
+import type { AppUpdateState } from './update-feed';
 
 export const ipcChannels = {
   projectCreate: 'projects:create',
@@ -78,6 +79,10 @@ export const ipcChannels = {
   stableDiffusionCppSelectModel: 'stable-diffusion-cpp:select-model',
   stableDiffusionCppCancelInstall: 'stable-diffusion-cpp:cancel-install',
   stableDiffusionCppInstallEvent: 'stable-diffusion-cpp:install-event',
+  appUpdateStatus: 'app-update:status',
+  appUpdateCheck: 'app-update:check',
+  appUpdateInstall: 'app-update:install',
+  appUpdateEvent: 'app-update:event',
 } as const;
 
 export interface TilemapGeneratorApi {
@@ -145,5 +150,11 @@ export interface TilemapGeneratorApi {
     selectModel(modelId: StableDiffusionCppModelId): Promise<StableDiffusionCppSetupInfo>;
     cancelInstall(): Promise<void>;
     onInstallEvent(listener: (event: StableDiffusionCppInstallEvent) => void): () => void;
+  };
+  updates: {
+    status(): Promise<AppUpdateState>;
+    check(): Promise<AppUpdateState>;
+    install(): Promise<void>;
+    onState(listener: (state: AppUpdateState) => void): () => void;
   };
 }

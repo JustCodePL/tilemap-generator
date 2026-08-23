@@ -241,7 +241,7 @@ export const generatorProviderSelectionSchema = z.array(generatorProviderSchema)
   })
   .transform((providers) => generatorProviders.filter((provider) => providers.includes(provider)));
 
-export const exportIntegrations = ['unity'] as const;
+export const exportIntegrations = ['unity', 'phaser'] as const;
 export const exportIntegrationSchema = z.enum(exportIntegrations);
 export type ExportIntegration = z.infer<typeof exportIntegrationSchema>;
 

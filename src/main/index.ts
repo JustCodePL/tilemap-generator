@@ -1,4 +1,4 @@
-import { app, BrowserWindow, net, protocol } from 'electron';
+import { app, autoUpdater, BrowserWindow, net, protocol } from 'electron';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { registerIpc } from './ipc/register-ipc';
@@ -17,6 +17,7 @@ let mainWindow: BrowserWindow | null = null;
 let cleanup: (() => Promise<void>) | null = null;
 let cleanupStarted = false;
 let readyToQuit = false;
+let updateQuitRequested = false;
 let windowCreation: Promise<void> | null = null;
 const projects = new ProjectManager();
 
@@ -64,7 +65,7 @@ async function createWindowOnce(): Promise<void> {
     if (!allowed) event.preventDefault();
   });
   window.on('close', (event) => {
-    if (process.platform !== 'darwin' || cleanupStarted || readyToQuit) return;
+    if (process.platform !== 'darwin' || cleanupStarted || readyToQuit || updateQuitRequested) return;
     event.preventDefault();
     window.hide();
   });
@@ -114,6 +115,15 @@ void app.whenReady().then(async () => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
+
+if (process.platform === 'darwin') {
+  autoUpdater.on('before-quit-for-update', () => {
+    // `quitAndInstall()` closes windows before Electron emits `before-quit`.
+    // Let this close through instead of turning it into the normal macOS hide;
+    // the existing `before-quit` path still performs the asynchronous cleanup.
+    updateQuitRequested = true;
+  });
+}
 
 app.on('before-quit', (event) => {
   if (readyToQuit) return;

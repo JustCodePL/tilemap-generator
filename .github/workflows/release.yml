@@ -1,0 +1,451 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: tilemap-generator-release
+  cancel-in-progress: false
+
+jobs:
+  release-macos-arm64:
+    name: Verify, sign and publish Apple Silicon
+    runs-on: [self-hosted, macOS, ARM64, justcode, tilemap-generator]
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    outputs:
+      asset_name: ${{ steps.metadata.outputs.asset_name }}
+      bundle_version: ${{ steps.metadata.outputs.bundle_version }}
+      build_number: ${{ steps.metadata.outputs.build_number }}
+      channel: ${{ steps.metadata.outputs.channel }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      update_name: ${{ steps.metadata.outputs.update_name }}
+      version: ${{ steps.metadata.outputs.version }}
+    env:
+      APPLE_ID: artur.czuba.94@gmail.com
+      APPLE_TEAM_ID: 4VWT253QFF
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag, branch and package version
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ github.ref_name }}'
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[1-9][0-9]*)?$ ]]; then
+            echo "Nieprawidłowy tag: $tag" >&2
+            echo 'Oczekiwano vMAJOR.MINOR.PATCH albo vMAJOR.MINOR.PATCH-beta.N.' >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo 'Tag release musi wskazywać commit obecny na origin/main.' >&2
+            exit 1
+          fi
+
+          version=${tag#v}
+          bundle_version=${version%%-*}
+          package_version=$(node -p "require('./package.json').version")
+          if [[ "$package_version" != "$version" ]]; then
+            echo "package.json ma wersję $package_version, a tag wskazuje $version." >&2
+            exit 1
+          fi
+
+          if [[ "$version" == *-beta.* ]]; then
+            channel=beta
+            prerelease=true
+            title='Eksport Phaser i aktualizacje macOS'
+          else
+            channel=stable
+            prerelease=false
+            title='Tilemap Generator'
+          fi
+          asset_name="tilemap-generator-darwin-arm64-${version}.zip"
+          update_name="tilemap-generator-darwin-arm64-${version}-update.json"
+
+          {
+            echo "RELEASE_TAG=$tag"
+            echo "RELEASE_VERSION=$version"
+            echo "RELEASE_CHANNEL=$channel"
+            echo "RELEASE_BUNDLE_VERSION=$bundle_version"
+            echo "RELEASE_PRERELEASE=$prerelease"
+            echo "RELEASE_TITLE=$title"
+            echo "RELEASE_ASSET_NAME=$asset_name"
+            echo "RELEASE_UPDATE_NAME=$update_name"
+            echo "TILEMAP_BUILD_NUMBER=$GITHUB_RUN_NUMBER"
+            echo "TILEMAP_BUILD_OUT_DIR=$RUNNER_TEMP/tilemap-release-out"
+          } >> "$GITHUB_ENV"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "bundle_version=$bundle_version"
+            echo "channel=$channel"
+            echo "prerelease=$prerelease"
+            echo "asset_name=$asset_name"
+            echo "update_name=$update_name"
+            echo "build_number=$GITHUB_RUN_NUMBER"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Require Apple release credentials
+        shell: bash
+        env:
+          DEVELOPER_ID_APPLICATION_P12: ${{ secrets.DEVELOPER_ID_APPLICATION_P12 }}
+          DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=''
+          for name in \
+            DEVELOPER_ID_APPLICATION_P12 \
+            DEVELOPER_ID_APPLICATION_P12_PASSWORD \
+            APPLE_APP_SPECIFIC_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then missing="$missing $name"; fi
+          done
+          if [[ -n "$missing" ]]; then
+            echo "Brak wymaganych sekretów repozytorium:$missing" >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install exact dependencies
+        run: npm ci
+
+      - name: Verify sources
+        run: npm run verify
+
+      - name: Import Developer ID Application certificate
+        shell: bash
+        env:
+          DEVELOPER_ID_APPLICATION_P12: ${{ secrets.DEVELOPER_ID_APPLICATION_P12 }}
+          DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          keychain_path="$RUNNER_TEMP/tilemap-signing.keychain-db"
+          keychain_password=$(openssl rand -base64 32)
+          certificate_path="$RUNNER_TEMP/tilemap-developer-id.p12"
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          printf '%s' "$DEVELOPER_ID_APPLICATION_P12" | base64 --decode > "$certificate_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$DEVELOPER_ID_APPLICATION_P12_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          rm -f "$certificate_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$keychain_password" \
+            "$keychain_path"
+
+          identity=$(security find-identity -v -p codesigning "$keychain_path" \
+            | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' \
+            | sed -n '1p')
+          if [[ -z "$identity" ]]; then
+            echo 'Zaimportowany P12 nie zawiera Developer ID Application.' >&2
+            exit 1
+          fi
+          echo "TILEMAP_MACOS_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
+          echo "TILEMAP_MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Make signed and notarized ZIP
+        shell: bash
+        env:
+          TILEMAP_RELEASE_BUILD: '1'
+          TILEMAP_RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: npm run make -- --platform=darwin --arch=arm64
+
+      - name: Resolve release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="$TILEMAP_BUILD_OUT_DIR/Tilemap Generator-darwin-arm64/Tilemap Generator.app"
+          [[ -d "$app_path" ]] || { echo "Brak aplikacji: $app_path" >&2; exit 1; }
+
+          zip_directory="$TILEMAP_BUILD_OUT_DIR/make/zip/darwin/arm64"
+          zip_count=$(find "$zip_directory" -maxdepth 1 -type f -name '*.zip' | wc -l | tr -d ' ')
+          [[ "$zip_count" == '1' ]] || { echo "Oczekiwano jednego ZIP, znaleziono $zip_count." >&2; exit 1; }
+          source_zip=$(find "$zip_directory" -maxdepth 1 -type f -name '*.zip' -print)
+
+          release_assets="$RUNNER_TEMP/tilemap-release-assets"
+          mkdir -p "$release_assets"
+          release_zip="$release_assets/$RELEASE_ASSET_NAME"
+          cp "$source_zip" "$release_zip"
+          (
+            cd "$release_assets"
+            shasum -a 256 "$RELEASE_ASSET_NAME" > SHA256SUMS
+          )
+
+          {
+            echo "RELEASE_APP_PATH=$app_path"
+            echo "RELEASE_ASSETS_PATH=$release_assets"
+            echo "RELEASE_ZIP_PATH=$release_zip"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify packaged application
+        shell: bash
+        env:
+          TILEMAP_VERIFY_SMOKE: '1'
+        run: scripts/release/verify-macos-app.sh "$RELEASE_APP_PATH" "$RELEASE_VERSION" "$RELEASE_BUNDLE_VERSION" "$TILEMAP_BUILD_NUMBER" "$APPLE_TEAM_ID"
+
+      - name: Verify the ZIP payload
+        shell: bash
+        env:
+          TILEMAP_VERIFY_SMOKE: '1'
+        run: |
+          set -euo pipefail
+          extracted=$(mktemp -d "$RUNNER_TEMP/tilemap-release-extracted.XXXXXX")
+          ditto -x -k "$RELEASE_ZIP_PATH" "$extracted"
+          scripts/release/verify-macos-app.sh \
+            "$extracted/Tilemap Generator.app" \
+            "$RELEASE_VERSION" \
+            "$RELEASE_BUNDLE_VERSION" \
+            "$TILEMAP_BUILD_NUMBER" \
+            "$APPLE_TEAM_ID"
+
+      - name: Build complete GitHub Pages update feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          feed_root="$RUNNER_TEMP/tilemap-update-pages"
+          mkdir -p "$feed_root"
+
+          fetch_previous_manifest() {
+            local channel=$1
+            local directory="$feed_root/updates/$channel/darwin/arm64"
+            local temporary="$RUNNER_TEMP/previous-$channel-RELEASES.json"
+            local url="https://justcodepl.github.io/tilemap-generator/updates/$channel/darwin/arm64/RELEASES.json"
+            local status
+            mkdir -p "$directory"
+            status=$(curl --location --silent --show-error \
+              --retry 5 --retry-delay 5 --retry-max-time 90 \
+              --output "$temporary" --write-out '%{http_code}' "$url")
+            case "$status" in
+              200) mv "$temporary" "$directory/RELEASES.json" ;;
+              404) rm -f "$temporary" ;;
+              *)
+                rm -f "$temporary"
+                echo "Nie udało się zachować feedu $channel: HTTP $status." >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          if [[ "$RELEASE_CHANNEL" == 'beta' ]]; then
+            fetch_previous_manifest stable
+            fetch_previous_manifest beta
+          else
+            fetch_previous_manifest stable
+            fetch_previous_manifest beta
+          fi
+          published_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          FEED_ROOT="$feed_root" RELEASE_PUBLISHED_AT="$published_at" \
+            node scripts/release/build-update-feed.mjs
+          echo "RELEASE_FEED_PATH=$feed_root" >> "$GITHUB_ENV"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ env.RELEASE_FEED_PATH }}
+
+      - name: Create verified draft release
+        uses: softprops/action-gh-release@fe965f7af51af5f2602596916f38a38df2e33de0 # v3.0.2
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-beta.') }}
+          generate_release_notes: true
+          name: ${{ env.RELEASE_TITLE }}
+          body: |
+            Podpisany i notaryzowany build Tilemap Generator dla macOS Apple Silicon.
+            Rozpakuj ZIP i przenieś `Tilemap Generator.app` do katalogu Aplikacje.
+            Suma SHA-256 znajduje się w pliku `SHA256SUMS`.
+          fail_on_unmatched_files: true
+          files: |
+            ${{ runner.temp }}/tilemap-release-assets/*.zip
+            ${{ runner.temp }}/tilemap-release-assets/*-update.json
+            ${{ runner.temp }}/tilemap-release-assets/SHA256SUMS
+
+      - name: Re-download and verify draft assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TILEMAP_VERIFY_SMOKE: '1'
+        run: |
+          set -euo pipefail
+          downloaded=$(mktemp -d "$RUNNER_TEMP/tilemap-release-downloaded.XXXXXX")
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$RELEASE_ASSET_NAME" \
+            --pattern "$RELEASE_UPDATE_NAME" \
+            --pattern SHA256SUMS \
+            --dir "$downloaded"
+          (
+            cd "$downloaded"
+            shasum -a 256 -c SHA256SUMS
+          )
+          extracted=$(mktemp -d "$RUNNER_TEMP/tilemap-release-redownloaded.XXXXXX")
+          UPDATE_PATH="$downloaded/$RELEASE_UPDATE_NAME" EXPECTED_ASSET_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$RELEASE_ASSET_NAME" node <<'NODE'
+          const fs = require('node:fs');
+          const update = JSON.parse(fs.readFileSync(process.env.UPDATE_PATH, 'utf8'));
+          if (update.version !== process.env.RELEASE_VERSION || update.url !== process.env.EXPECTED_ASSET_URL) {
+            throw new Error('Payload Squirrel nie odpowiada temu release.');
+          }
+          NODE
+          ditto -x -k "$downloaded/$RELEASE_ASSET_NAME" "$extracted"
+          scripts/release/verify-macos-app.sh \
+            "$extracted/Tilemap Generator.app" \
+            "$RELEASE_VERSION" \
+            "$RELEASE_BUNDLE_VERSION" \
+            "$TILEMAP_BUILD_NUMBER" \
+            "$APPLE_TEAM_ID"
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_PRERELEASE" == 'true' ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest
+          fi
+
+      - name: Remove temporary signing material
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/tilemap-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/tilemap-developer-id.p12"
+
+  deploy-update-feed:
+    name: Deploy public update feed
+    needs: release-macos-arm64
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+
+  verify-public-release:
+    name: Verify anonymous updater payload
+    needs: [release-macos-arm64, deploy-update-feed]
+    runs-on: [self-hosted, macOS, ARM64, justcode, tilemap-generator]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      APPLE_TEAM_ID: 4VWT253QFF
+      RELEASE_ASSET_NAME: ${{ needs.release-macos-arm64.outputs.asset_name }}
+      RELEASE_BUNDLE_VERSION: ${{ needs.release-macos-arm64.outputs.bundle_version }}
+      RELEASE_CHANNEL: ${{ needs.release-macos-arm64.outputs.channel }}
+      RELEASE_TAG: ${{ needs.release-macos-arm64.outputs.tag }}
+      RELEASE_UPDATE_NAME: ${{ needs.release-macos-arm64.outputs.update_name }}
+      RELEASE_VERSION: ${{ needs.release-macos-arm64.outputs.version }}
+      TILEMAP_BUILD_NUMBER: ${{ needs.release-macos-arm64.outputs.build_number }}
+    steps:
+      - name: Check out verification scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install exact verification dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Download and verify public feed and assets without credentials
+        shell: bash
+        env:
+          TILEMAP_VERIFY_SMOKE: '1'
+        run: |
+          set -euo pipefail
+          public_root=$(mktemp -d "$RUNNER_TEMP/tilemap-public-release.XXXXXX")
+          manifest_url="https://justcodepl.github.io/tilemap-generator/updates/$RELEASE_CHANNEL/darwin/arm64/RELEASES.json?release=$RELEASE_TAG"
+          asset_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$RELEASE_ASSET_NAME"
+          checksum_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/SHA256SUMS"
+          update_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$RELEASE_UPDATE_NAME"
+
+          curl --fail --location --silent --show-error \
+            --retry 20 --retry-all-errors --retry-delay 15 --retry-max-time 360 \
+            --output "$public_root/RELEASES.json" \
+            "$manifest_url"
+          MANIFEST_PATH="$public_root/RELEASES.json" EXPECTED_ASSET_URL="$asset_url" EXPECTED_UPDATE_URL="$update_url" node <<'NODE'
+          const fs = require('node:fs');
+          const manifest = JSON.parse(fs.readFileSync(process.env.MANIFEST_PATH, 'utf8'));
+          if (manifest.currentRelease !== process.env.RELEASE_VERSION) {
+            throw new Error(`Publiczny feed wskazuje ${manifest.currentRelease}, oczekiwano ${process.env.RELEASE_VERSION}.`);
+          }
+          const release = manifest.releases?.find((candidate) => candidate.version === process.env.RELEASE_VERSION);
+          if (release?.updateTo?.url !== process.env.EXPECTED_ASSET_URL
+              || release?.updateTo?.serverUrl !== process.env.EXPECTED_UPDATE_URL) {
+            throw new Error('Publiczny feed nie wskazuje plików tego release.');
+          }
+          NODE
+
+          curl --fail --location --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 5 \
+            --output "$public_root/$RELEASE_ASSET_NAME" \
+            "$asset_url"
+          curl --fail --location --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 5 \
+            --output "$public_root/SHA256SUMS" \
+            "$checksum_url"
+          curl --fail --location --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 5 \
+            --output "$public_root/$RELEASE_UPDATE_NAME" \
+            "$update_url"
+          UPDATE_PATH="$public_root/$RELEASE_UPDATE_NAME" EXPECTED_ASSET_URL="$asset_url" node <<'NODE'
+          const fs = require('node:fs');
+          const update = JSON.parse(fs.readFileSync(process.env.UPDATE_PATH, 'utf8'));
+          if (update.version !== process.env.RELEASE_VERSION || update.url !== process.env.EXPECTED_ASSET_URL) {
+            throw new Error('Publiczny payload Squirrel nie odpowiada temu release.');
+          }
+          NODE
+          (
+            cd "$public_root"
+            shasum -a 256 -c SHA256SUMS
+          )
+          extracted=$(mktemp -d "$RUNNER_TEMP/tilemap-public-release-extracted.XXXXXX")
+          ditto -x -k "$public_root/$RELEASE_ASSET_NAME" "$extracted"
+          scripts/release/verify-macos-app.sh \
+            "$extracted/Tilemap Generator.app" \
+            "$RELEASE_VERSION" \
+            "$RELEASE_BUNDLE_VERSION" \
+            "$TILEMAP_BUILD_NUMBER" \
+            "$APPLE_TEAM_ID"

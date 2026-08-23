@@ -5,6 +5,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { TilemapGeneratorApi } from '../shared/bridge';
 import type { AssetDetail, AssetSummary, AssetVersion, CharacterMovementAnalysisStatus, ProjectInfo, ProjectProjection } from '../shared/domain';
 import { characterDirectionsForProjection } from '../shared/domain';
+import type { AppUpdateState } from '../shared/update-feed';
 import { App, CharacterAnimationPreview, GenerationLogPanel, MovementAnalysisPanel, PreviewZoomControls, ProjectReferencesPanel, ProjectSettingsProposalsPanel, ReviewControls, TerrainSeamPreview } from '../renderer/ui/App';
 
 const projectFixture: ProjectInfo = {
@@ -137,6 +138,9 @@ beforeEach(() => {
       listIntegrations: vi.fn(async () => [{
         id: 'unity', label: 'Unity', description: 'PNG, manifest i narzędzia edytora Unity.',
         targetLabel: 'Katalog docelowy',
+      }, {
+        id: 'phaser', label: 'Phaser 3', description: 'PNG, spritesheety i ścisły manifest danych dla Phaser 3.',
+        targetLabel: 'Katalog docelowy',
       }]),
       chooseTarget: vi.fn(), preview: vi.fn(), run: vi.fn(),
     },
@@ -185,6 +189,24 @@ beforeEach(() => {
       cancelInstall: vi.fn(async () => undefined),
       onInstallEvent: vi.fn(() => () => undefined),
     },
+    updates: {
+      status: vi.fn(async () => ({
+        enabled: false,
+        status: 'disabled',
+        channel: 'stable',
+        architecture: 'x64',
+        currentVersion: '0.1.1',
+        feedUrl: null,
+        message: 'Aktualizacje są wyłączone w trybie developerskim.',
+        availableVersion: null,
+        releaseNotes: null,
+        releaseDate: null,
+        checkedAt: null,
+      })),
+      check: vi.fn(),
+      install: vi.fn(async () => undefined),
+      onState: vi.fn(() => () => undefined),
+    },
   } as unknown as TilemapGeneratorApi;
 });
 
@@ -205,6 +227,47 @@ it('pokazuje ekran tworzenia projektu bez otwartego registry', async () => {
   expect(screen.getByRole('button', { name: /Utwórz projekt/i })).toBeInTheDocument();
   expect(screen.getByText('Eksport przez integracje')).toBeInTheDocument();
   expect(screen.queryByText('Eksport gotowy dla Unity')).not.toBeInTheDocument();
+});
+
+it('pozwala ręcznie sprawdzić i jawnie zainstalować pobraną aktualizację macOS', async () => {
+  mockOpenedProject(projectFixture);
+  const idle: AppUpdateState = {
+    enabled: true,
+    status: 'idle',
+    channel: 'beta',
+    architecture: 'arm64',
+    currentVersion: '0.2.0-beta.1',
+    feedUrl: 'https://justcodepl.github.io/tilemap-generator/updates/beta/darwin/arm64/RELEASES.json',
+    message: 'Aktualizacje są gotowe do sprawdzenia.',
+    availableVersion: null,
+    releaseNotes: null,
+    releaseDate: null,
+    checkedAt: null,
+  };
+  const downloaded: AppUpdateState = {
+    ...idle,
+    status: 'downloaded',
+    message: 'Aktualizacja została pobrana.',
+    availableVersion: 'Tilemap Generator v0.2.0-beta.2',
+    releaseNotes: 'Poprawki generatora postaci.',
+    releaseDate: '2026-08-23T12:00:00.000Z',
+    checkedAt: '2026-08-23T12:01:00.000Z',
+  };
+  vi.mocked(window.tilemap.updates.status).mockResolvedValue(idle);
+  vi.mocked(window.tilemap.updates.check).mockResolvedValue(downloaded);
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+  fireEvent.click(await screen.findByRole('button', { name: 'Diagnostyka' }));
+
+  expect(await screen.findByRole('heading', { name: 'Aktualizacje macOS' })).toBeInTheDocument();
+  expect(screen.getByText('v0.2.0-beta.1')).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Sprawdź aktualizacje' }));
+  await waitFor(() => expect(window.tilemap.updates.check).toHaveBeenCalledOnce());
+
+  expect(await screen.findByText(/Tilemap Generator v0\.2\.0-beta\.2/)).toBeInTheDocument();
+  expect(screen.getByText('Poprawki generatora postaci.')).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Uruchom ponownie i zainstaluj' }));
+  await waitFor(() => expect(window.tilemap.updates.install).toHaveBeenCalledOnce());
 });
 
 it('tworzy projekt top-down z bazowym tile 1:1', async () => {
@@ -255,10 +318,48 @@ it('oddziela katalog biblioteki od neutralnego ekranu integracji eksportu', asyn
   fireEvent.click(screen.getByRole('button', { name: 'Eksport' }));
   expect(await screen.findByRole('heading', { name: 'Integracje eksportu' })).toBeInTheDocument();
   expect(await screen.findByRole('button', { name: /Unity.*PNG, manifest/i })).toHaveAttribute('aria-pressed', 'true');
+  expect(screen.getByRole('button', { name: /Phaser 3.*spritesheety/i })).toHaveAttribute('aria-pressed', 'false');
   expect(screen.getByLabelText('Ustawienia integracji Unity')).toHaveTextContent('Narzędzia Unity są instalowane raz, osobno w Assets/TilemapGeneratorIntegration.');
   expect(screen.queryByText('UNITY DELIVERY')).not.toBeInTheDocument();
   expect(screen.queryByText('KATALOG ASSETS')).not.toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Przygotuj podgląd' })).toBeDisabled();
+});
+
+it('przełącza integracje i zachowuje niezależny cel eksportu Phaser', async () => {
+  const unityTarget = 'C:\\gra\\Assets\\Generated\\Tilemap';
+  const phaserTarget = 'C:\\gra-web\\public\\assets\\tilemap';
+  const project = {
+    ...projectFixture,
+    exportTargets: { unity: unityTarget, phaser: phaserTarget },
+  };
+  mockOpenedProject(project);
+  vi.mocked(window.tilemap.export.preview).mockResolvedValue({
+    token: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+    integration: 'phaser',
+    targetDirectory: phaserTarget,
+    manifestPath: `${phaserTarget}\\tilemap-assets.phaser.json`,
+    assetCount: 0,
+    files: [],
+  });
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+  fireEvent.click(await screen.findByRole('button', { name: 'Eksport' }));
+  expect(await screen.findByText(unityTarget)).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', { name: /Phaser 3.*spritesheety/i }));
+  const phaserSettings = screen.getByLabelText('Ustawienia integracji Phaser 3');
+  expect(within(phaserSettings).getByText(phaserTarget)).toBeInTheDocument();
+  expect(phaserSettings).toHaveTextContent('wyłącznie zatwierdzone assety oraz natywny manifest Phaser File Pack tilemap-assets.phaser.json');
+  expect(phaserSettings).not.toHaveTextContent('Unity');
+
+  fireEvent.click(within(phaserSettings).getByRole('button', { name: 'Przygotuj podgląd' }));
+  await waitFor(() => expect(window.tilemap.export.preview).toHaveBeenCalledWith({
+    integration: 'phaser',
+    targetDirectory: phaserTarget,
+  }));
+
+  fireEvent.click(screen.getByRole('button', { name: /Unity.*PNG, manifest/i }));
+  expect(screen.getByLabelText('Ustawienia integracji Unity')).toHaveTextContent(unityTarget);
 });
 
 it('pozwala przygotować plan usunięcia bez zatwierdzonych assetów', async () => {

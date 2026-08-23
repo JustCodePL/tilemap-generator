@@ -15,6 +15,13 @@ const secondToken = '22222222-2222-4222-8222-222222222222';
 
 beforeEach(() => vi.clearAllMocks());
 
+it('rejestruje Unity i Phaser jako niezależne integracje domyślne', () => {
+  expect(new ExportService().listIntegrations()).toEqual([
+    expect.objectContaining({ id: 'unity', label: 'Unity' }),
+    expect.objectContaining({ id: 'phaser', label: 'Phaser 3' }),
+  ]);
+});
+
 it('udostępnia neutralny descriptor i grantuje cel tylko bieżącemu projektowi', async () => {
   const adapter = fakeAdapter();
   const service = new ExportService([adapter]);

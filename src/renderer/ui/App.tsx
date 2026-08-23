@@ -9,6 +9,7 @@ import {
   CircleDot,
   Download,
   FolderOpen,
+  Gamepad2,
   ImagePlus,
   Layers3,
   LoaderCircle,
@@ -53,6 +54,7 @@ import type {
   StyleSummaryRevision,
   VersionStatus,
 } from '../../shared/domain';
+import type { AppUpdateState } from '../../shared/update-feed';
 import {
   assetCategories,
   assetPixelSize,
@@ -2030,6 +2032,7 @@ function ExportView({ project, assets }: { project: ProjectInfo; assets: AssetSu
       {integrations.data?.map((integration) => <button
         key={integration.id}
         type="button"
+        data-integration={integration.id}
         className={`integration-card ${selectedIntegration === integration.id ? 'active' : ''}`}
         aria-pressed={selectedIntegration === integration.id}
         disabled={choose.isPending || makePreview.isPending || run.isPending}
@@ -2040,7 +2043,7 @@ function ExportView({ project, assets }: { project: ProjectInfo; assets: AssetSu
           setError('');
         }}
       >
-        <span><Box /></span>
+        <span>{integration.id === 'phaser' ? <Gamepad2 /> : <Box />}</span>
         <div><strong>{integration.label}</strong><small>{integration.description}</small></div>
         {selectedIntegration === integration.id && <Check />}
       </button>)}
@@ -2050,6 +2053,8 @@ function ExportView({ project, assets }: { project: ProjectInfo; assets: AssetSu
       <div className="integration-settings-heading"><div><p className="eyebrow">{selectedDescriptor.label.toLocaleUpperCase('pl-PL')}</p><h3>Miejsce eksportu</h3></div><span>{formatPolishCount(preview?.assetCount ?? approvedCount, 'asset', 'assety', 'assetów')}</span></div>
       <p className="integration-target-help">{selectedIntegration === 'unity'
         ? <>Wybierz dokładne miejsce wewnątrz katalogu <code>Assets</code> projektu Unity. Trafią tam zatwierdzone pliki i manifest. Narzędzia Unity są instalowane raz, osobno w <code>Assets/TilemapGeneratorIntegration</code>.</>
+        : selectedIntegration === 'phaser'
+          ? <>Wybierz dokładny katalog docelowy używany przez grę Phaser. Trafią tam wyłącznie zatwierdzone assety oraz natywny manifest Phaser File Pack <code>tilemap-assets.phaser.json</code>.</>
         : <>Wybierz dokładny katalog docelowy integracji {selectedDescriptor.label}. Trafią tam wyłącznie zatwierdzone assety.</>}</p>
       <div className="export-target"><FolderOpen /><div><small>{selectedDescriptor.targetLabel}</small><strong title={target}>{target || 'Nie wybrano'}</strong></div><button className="secondary" type="button" disabled={choose.isPending || makePreview.isPending || run.isPending} onClick={() => choose.mutate(selectedIntegration)}>{choose.isPending ? <LoaderCircle className="spin" /> : <FolderOpen />} Wybierz miejsce eksportu</button></div>
       <button className="primary" disabled={!target || choose.isPending || makePreview.isPending || run.isPending} onClick={() => makePreview.mutate()}>{makePreview.isPending ? <LoaderCircle className="spin" /> : <Play />} Przygotuj podgląd</button>
@@ -2093,7 +2098,70 @@ function DiagnosticsView({
     ['stable-diffusion.cpp Z-Image Turbo', stableDiffusionCppHealth?.state === 'ready', stableDiffusionCppHealth?.state === 'ready' ? stableDiffusionCppHealth.model : stableDiffusionCppHealth?.missingFiles.join(', ') || 'Niegotowy'],
     ['Log aplikacji', Boolean(codexHealth?.logPath), codexHealth?.logPath ?? 'Niedostępny'],
   ] as const;
-  return <div className="diagnostics-page"><div className="section-heading"><div><p className="eyebrow">SYSTEM</p><h2>Diagnostyka generatorów</h2><p>Każdy włączony generator musi przejść własne kontrole gotowości.</p></div><button className="secondary" disabled={refresh.isPending} onClick={() => refresh.mutate()}><RefreshCw className={refresh.isPending ? 'spin' : ''} /> Sprawdź ponownie</button></div><div className="diagnostic-grid">{checks.map(([name, ok, detail]) => <div key={name} className={ok ? 'ok' : 'bad'}><span>{ok ? <Check /> : <X />}</span><div><strong>{name}</strong><small>{detail}</small></div></div>)}</div><div className="diagnostic-message"><CircleDot /><span>{codexHealth?.message ?? 'Codex: sprawdzanie…'}<br />{comfyHealth?.message ?? 'ComfyUI: sprawdzanie…'}<br />{stableDiffusionCppHealth?.message ?? 'stable-diffusion.cpp: sprawdzanie…'}</span></div></div>;
+  return <div className="diagnostics-page"><div className="section-heading"><div><p className="eyebrow">SYSTEM</p><h2>Diagnostyka generatorów</h2><p>Każdy włączony generator musi przejść własne kontrole gotowości.</p></div><button className="secondary" disabled={refresh.isPending} onClick={() => refresh.mutate()}><RefreshCw className={refresh.isPending ? 'spin' : ''} /> Sprawdź ponownie</button></div><div className="diagnostic-grid">{checks.map(([name, ok, detail]) => <div key={name} className={ok ? 'ok' : 'bad'}><span>{ok ? <Check /> : <X />}</span><div><strong>{name}</strong><small>{detail}</small></div></div>)}</div><div className="diagnostic-message"><CircleDot /><span>{codexHealth?.message ?? 'Codex: sprawdzanie…'}<br />{comfyHealth?.message ?? 'ComfyUI: sprawdzanie…'}<br />{stableDiffusionCppHealth?.message ?? 'stable-diffusion.cpp: sprawdzanie…'}</span></div><AppUpdatePanel /></div>;
+}
+
+export function AppUpdatePanel() {
+  const queryClient = useQueryClient();
+  const update = useQuery({
+    queryKey: ['app-update'],
+    queryFn: () => window.tilemap.updates.status(),
+    staleTime: Infinity,
+  });
+  useEffect(() => window.tilemap.updates.onState((state) => {
+    queryClient.setQueryData(['app-update'], state);
+  }), [queryClient]);
+  const check = useMutation({
+    mutationFn: () => window.tilemap.updates.check(),
+    onSuccess: (state) => queryClient.setQueryData(['app-update'], state),
+  });
+  const install = useMutation({ mutationFn: () => window.tilemap.updates.install() });
+  const state = update.data;
+
+  if (!state) return <section className="app-update-panel loading"><LoaderCircle className="spin" /> Sprawdzanie konfiguracji aktualizacji…</section>;
+
+  const busy = ['checking', 'downloading', 'installing'].includes(state.status);
+  return <section className={`app-update-panel ${state.status}`} aria-label="Aktualizacje aplikacji">
+    <div className="app-update-heading">
+      <span>{updateStatusIcon(state)}</span>
+      <div><p className="eyebrow">APLIKACJA</p><h3>Aktualizacje macOS</h3></div>
+      <div className="app-update-version"><strong>v{state.currentVersion}</strong><small>{state.channel === 'beta' ? 'BETA' : 'STABLE'} · {state.architecture}</small></div>
+    </div>
+    <div className="app-update-status" role={state.status === 'error' ? 'alert' : 'status'}>
+      <strong>{updateStatusLabel(state)}</strong>
+      <span>{state.message}</span>
+      {state.availableVersion && <small>{state.availableVersion}{state.releaseDate ? ` · ${formatDate(state.releaseDate)}` : ''}</small>}
+      {state.releaseNotes && <p>{state.releaseNotes}</p>}
+      {state.checkedAt && <small>Ostatnie sprawdzenie: {formatDate(state.checkedAt)}</small>}
+    </div>
+    <div className="app-update-actions">
+      {state.status === 'downloaded'
+        ? <button className="primary" type="button" disabled={install.isPending} onClick={() => install.mutate()}>{install.isPending ? <LoaderCircle className="spin" /> : <RotateCcw />} Uruchom ponownie i zainstaluj</button>
+        : <button className="secondary" type="button" disabled={!state.enabled || busy || check.isPending} onClick={() => check.mutate()}>{busy || check.isPending ? <LoaderCircle className="spin" /> : <RefreshCw />} Sprawdź aktualizacje</button>}
+    </div>
+    {install.error && <ErrorBox message={errorMessage(install.error)} />}
+  </section>;
+}
+
+function updateStatusIcon(state: AppUpdateState) {
+  if (['checking', 'downloading', 'installing'].includes(state.status)) return <LoaderCircle className="spin" />;
+  if (state.status === 'downloaded') return <Download />;
+  if (state.status === 'up-to-date') return <Check />;
+  if (state.status === 'error') return <AlertTriangle />;
+  return <CircleDot />;
+}
+
+function updateStatusLabel(state: AppUpdateState): string {
+  switch (state.status) {
+    case 'disabled': return 'Updater wyłączony';
+    case 'idle': return 'Gotowy';
+    case 'checking': return 'Sprawdzanie';
+    case 'downloading': return 'Pobieranie';
+    case 'up-to-date': return 'Aktualna wersja';
+    case 'downloaded': return 'Gotowa do instalacji';
+    case 'installing': return 'Instalowanie';
+    case 'error': return 'Błąd aktualizacji';
+  }
 }
 
 function QueueBar({ jobs }: { jobs: Awaited<ReturnType<typeof window.tilemap.generation.jobs>> }) {
