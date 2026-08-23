@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import type { TilemapGeneratorApi } from '../shared/bridge';
-import type { AssetDetail, AssetSummary, AssetVersion, ProjectInfo } from '../shared/domain';
-import { App, GenerationLogPanel, PreviewZoomControls, ProjectReferencesPanel, ProjectSettingsProposalsPanel, ReviewControls, TerrainSeamPreview } from '../renderer/ui/App';
+import type { AssetDetail, AssetSummary, AssetVersion, CharacterMovementAnalysisStatus, ProjectInfo, ProjectProjection } from '../shared/domain';
+import { characterDirectionsForProjection } from '../shared/domain';
+import { App, CharacterAnimationPreview, GenerationLogPanel, MovementAnalysisPanel, PreviewZoomControls, ProjectReferencesPanel, ProjectSettingsProposalsPanel, ReviewControls, TerrainSeamPreview } from '../renderer/ui/App';
 
 const projectFixture: ProjectInfo = {
   id: '11111111-1111-4111-8111-111111111111', rootPath: 'C:\\project', name: 'Test', artBrief: '',
@@ -15,6 +16,110 @@ const projectFixture: ProjectInfo = {
   createdAt: '2026-08-07T10:00:00.000Z', updatedAt: '2026-08-07T10:00:00.000Z',
 };
 
+function terrainVersionFixture(overrides: Partial<AssetVersion> = {}): AssetVersion {
+  return {
+    id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    assetId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    parentVersionId: null,
+    mode: 'generate',
+    status: 'needs_review',
+    prompt: 'Zielona łąka',
+    feedback: '',
+    category: 'flat_tile',
+    characterAnimation: null,
+    elevationLevels: 0,
+    relativeWidth: 1,
+    relativeHeight: 1,
+    tags: ['łąka'],
+    finalPath: 'assets/meadow/final.png',
+    imageUrl: 'tilemap-asset://asset/meadow.png',
+    width: 256,
+    height: 128,
+    footprint: { x: 1, y: 1 },
+    pivot: { x: 0.5, y: 0.5 },
+    aiDescription: '',
+    aiVerificationStatus: 'passed',
+    aiVerificationMessage: '',
+    rejectionReason: '',
+    error: '',
+    createdAt: projectFixture.createdAt,
+    updatedAt: projectFixture.updatedAt,
+    ...overrides,
+  };
+}
+
+function characterVersionFixture(
+  analysisStatus: CharacterMovementAnalysisStatus = 'passed',
+  projection: ProjectProjection = 'isometric',
+): AssetVersion {
+  const directions = [...characterDirectionsForProjection(projection)];
+  return {
+    id: '12121212-1212-4212-8212-121212121212',
+    assetId: '34343434-3434-4434-8434-343434343434',
+    parentVersionId: null,
+    mode: 'generate',
+    status: 'needs_review',
+    prompt: 'Leśna strażniczka',
+    feedback: '',
+    category: 'character',
+    elevationLevels: 0,
+    relativeWidth: 0.5,
+    relativeHeight: 1.5,
+    characterAnimation: {
+      settings: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+      directions,
+      frameSize: { width: 128, height: projection === 'isometric' ? 192 : 384 },
+      sheetSize: { width: 640, height: projection === 'isometric' ? 768 : 1_536 },
+      movementAnalysis: {
+        status: analysisStatus,
+        summary: analysisStatus === 'passed' ? 'Sylwetka porusza się płynnie we wszystkich kierunkach.' : analysisStatus === 'failed' ? 'Kierunek NE przeskakuje między klatkami.' : '',
+        directions: analysisStatus === 'pending' ? [] : directions.map((direction) => ({
+          direction: direction.id,
+          status: analysisStatus === 'passed' || direction.id !== 'north_east' ? 'passed' : 'failed',
+          message: analysisStatus === 'passed' || direction.id !== 'north_east' ? 'Pętla jest płynna.' : 'Sylwetka przeskakuje.',
+        })),
+        turnId: analysisStatus === 'pending' ? null : 'turn-character-analysis',
+        analyzedAt: analysisStatus === 'pending' ? null : '2026-08-07T10:05:00.000Z',
+      },
+    },
+    tags: ['postać', 'strażniczka'],
+    finalPath: 'assets/character/final.png',
+    imageUrl: 'tilemap-asset://project/assets/character/final.png',
+    width: 640,
+    height: projection === 'isometric' ? 768 : 1_536,
+    footprint: { x: 1, y: 1 },
+    pivot: { x: 0.5, y: 0.08 },
+    aiDescription: 'Leśna strażniczka w pełnym zestawie ruchu.',
+    aiVerificationStatus: 'passed',
+    aiVerificationMessage: '',
+    generatorProvider: 'codex',
+    generatorModel: 'imagegen',
+    rejectionReason: '',
+    error: '',
+    createdAt: projectFixture.createdAt,
+    updatedAt: projectFixture.updatedAt,
+  };
+}
+
+function characterAssetFixture(version = characterVersionFixture()): AssetDetail {
+  return {
+    id: version.assetId,
+    name: 'Leśna strażniczka',
+    description: version.aiDescription,
+    category: 'character',
+    elevationLevels: 0,
+    relativeWidth: version.relativeWidth,
+    relativeHeight: version.relativeHeight,
+    currentApprovedVersionId: version.status === 'approved' ? version.id : null,
+    latestVersion: version,
+    versionCount: 1,
+    codexThreadId: null,
+    createdAt: version.createdAt,
+    updatedAt: version.updatedAt,
+    versions: [version],
+  };
+}
+
 beforeEach(() => {
   cleanup();
   window.tilemap = {
@@ -22,6 +127,7 @@ beforeEach(() => {
       current: vi.fn(async () => null), recents: vi.fn(async () => []),
       chooseStorageDirectory: vi.fn(), create: vi.fn(), open: vi.fn(), openRecent: vi.fn(), update: vi.fn(), close: vi.fn(), removeRecent: vi.fn(),
       settingsProposals: vi.fn(async () => []), reviewSettingsProposal: vi.fn(),
+      onChanged: vi.fn(() => () => undefined),
     },
     assets: { list: vi.fn(), get: vi.fn(), review: vi.fn(), undoApproval: vi.fn(), undoRejection: vi.fn() },
     references: { list: vi.fn(async () => []), add: vi.fn(), update: vi.fn(), remove: vi.fn() },
@@ -41,7 +147,7 @@ beforeEach(() => {
         version: null, profile: 'z_image_turbo', model: 'z_image_turbo_bf16.safetensors',
         missingNodes: [], missingModels: [], message: 'ComfyUI wyłączone',
       })),
-      refresh: vi.fn(),
+      refresh: vi.fn(() => window.tilemap.comfy.health()),
     },
     stableDiffusionCpp: {
       health: vi.fn(async () => ({
@@ -314,15 +420,332 @@ it('pozwala generować asset z samej nazwy bez opcjonalnego opisu', async () => 
   await waitFor(() => expect(window.tilemap.generation.enqueue).toHaveBeenCalledWith(expect.objectContaining({
     name: 'Kamienna droga', prompt: '', category: 'elevated_tile', elevationLevels: 2,
     footprint: { x: 1, y: 1 },
+    generatorProviders: ['codex'],
   })));
   expect(vi.mocked(window.tilemap.generation.enqueue).mock.calls[0][0]).not.toHaveProperty('pivot');
+});
+
+it('pozwala wybrać generatory nowego assetu i odtwarza zapisany wybór w sekcji postaci', async () => {
+  const initialProject = {
+    ...projectFixture,
+    codexGenerationEnabled: true,
+    comfyUiEnabled: false,
+    stableDiffusionCppEnabled: false,
+  };
+  const savedProject = { ...initialProject, comfyUiEnabled: true };
+  vi.mocked(window.tilemap.projects.current)
+    .mockResolvedValueOnce(initialProject)
+    .mockResolvedValue(savedProject);
+  vi.mocked(window.tilemap.assets.list).mockResolvedValue([]);
+  vi.mocked(window.tilemap.generation.jobs).mockResolvedValue([]);
+  vi.mocked(window.tilemap.style.history).mockResolvedValue([]);
+  vi.mocked(window.tilemap.codex.health).mockResolvedValue({
+    state: 'ready', version: '0.142.5', appServer: true, imageGeneration: true,
+    imagegenSkill: true, skillPath: 'C:\\imagegen\\SKILL.md', logPath: null, message: 'Gotowe',
+  });
+  vi.mocked(window.tilemap.comfy.health).mockResolvedValue({
+    state: 'ready', installed: true, server: true, endpoint: 'http://127.0.0.1:8188',
+    version: '1.0.39', profile: 'z_image_turbo', model: 'z_image_turbo_bf16.safetensors',
+    missingNodes: [], missingModels: [], message: 'Gotowe',
+  });
+  vi.mocked(window.tilemap.generation.enqueue).mockResolvedValue([{
+    id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', assetId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    versionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', status: 'queued', progress: 'Oczekuje', error: '',
+    createdAt: projectFixture.createdAt, updatedAt: projectFixture.updatedAt,
+  }]);
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+  const codex = await screen.findByRole('checkbox', { name: /Codex imagegen/ });
+  const comfy = screen.getByRole('checkbox', { name: /ComfyUI/ });
+  expect(codex).toBeChecked();
+  expect(codex).toBeDisabled();
+  expect(comfy).not.toBeChecked();
+
+  fireEvent.click(comfy);
+  expect(comfy).toBeChecked();
+  expect(codex).toBeEnabled();
+  fireEvent.change(screen.getByLabelText('Nazwa assetu'), { target: { value: 'Kamienny mur' } });
+  const generate = screen.getByRole('button', { name: 'Generuj 2 warianty' });
+  await waitFor(() => expect(generate).toBeEnabled());
+  fireEvent.click(generate);
+
+  await waitFor(() => expect(window.tilemap.generation.enqueue).toHaveBeenCalledWith(expect.objectContaining({
+    name: 'Kamienny mur',
+    generatorProviders: ['codex', 'comfyui'],
+  })));
+  await waitFor(() => expect(window.tilemap.projects.current).toHaveBeenCalledTimes(2));
+
+  fireEvent.click(screen.getByRole('button', { name: 'Postacie' }));
+  expect(await screen.findByRole('checkbox', { name: /Codex imagegen/ })).toBeChecked();
+  expect(screen.getByRole('checkbox', { name: /ComfyUI/ })).toBeChecked();
+  expect(screen.getByRole('button', { name: 'Generuj 2 warianty postaci' })).toBeInTheDocument();
+});
+
+it('rozróżnia wykrytą aplikację Comfy Desktop od nieaktywnego API i blokuje tylko wybrany provider', async () => {
+  mockOpenedProject({
+    ...projectFixture,
+    codexGenerationEnabled: false,
+    comfyUiEnabled: true,
+    stableDiffusionCppEnabled: false,
+  });
+  vi.mocked(window.tilemap.comfy.health).mockResolvedValue({
+    state: 'detected', installed: true, server: false, endpoint: 'http://127.0.0.1:8188',
+    version: '1.0.39', profile: 'z_image_turbo', model: 'z_image_turbo_bf16.safetensors',
+    missingNodes: [], missingModels: [], message: 'Wykryto Comfy Desktop, ale lokalny serwer nie odpowiada.',
+  });
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+  expect((await screen.findAllByText('Comfy Desktop wykryty · API offline')).length).toBeGreaterThanOrEqual(1);
+  const comfy = screen.getByRole('checkbox', { name: /ComfyUI/ });
+  expect(comfy).toBeChecked();
+  expect(comfy).toBeDisabled();
+  fireEvent.change(screen.getByLabelText('Nazwa assetu'), { target: { value: 'Kamienna ściana' } });
+  expect(screen.getByRole('button', { name: 'Generuj asset' })).toBeDisabled();
+});
+
+it('odświeża stan ComfyUI bez otwierania diagnostyki i odblokowuje wybrany provider po starcie API', async () => {
+  mockOpenedProject({
+    ...projectFixture,
+    codexGenerationEnabled: false,
+    comfyUiEnabled: true,
+    stableDiffusionCppEnabled: false,
+  });
+  const offline = {
+    state: 'detected' as const, installed: true, server: false, endpoint: 'http://127.0.0.1:8188',
+    version: '1.0.39', profile: 'z_image_turbo' as const, model: 'z_image_turbo_bf16.safetensors',
+    missingNodes: [], missingModels: [], message: 'Wykryto Comfy Desktop, ale lokalny serwer nie odpowiada.',
+  };
+  const ready = {
+    ...offline,
+    state: 'ready' as const,
+    server: true,
+    message: 'ComfyUI i profil Z-Image Turbo są gotowe.',
+  };
+  vi.mocked(window.tilemap.comfy.refresh).mockResolvedValueOnce(offline).mockResolvedValue(ready);
+  const queryClient = new QueryClient();
+
+  render(<QueryClientProvider client={queryClient}><App /></QueryClientProvider>);
+  fireEvent.change(await screen.findByLabelText('Nazwa assetu'), { target: { value: 'Kamienna ściana' } });
+  expect(screen.getByRole('button', { name: 'Generuj asset' })).toBeDisabled();
+
+  await queryClient.refetchQueries({ queryKey: ['comfy-health'] });
+
+  expect(await screen.findByText('API gotowe')).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Generuj asset' })).toBeEnabled());
+  expect(window.tilemap.comfy.refresh).toHaveBeenCalledTimes(2);
+});
+
+it('pokazuje osobną sekcję Postacie i generuje pełny zestaw kierunków izometrycznych', async () => {
+  mockOpenedProject({ ...projectFixture, codexGenerationEnabled: true });
+  vi.mocked(window.tilemap.generation.enqueue).mockResolvedValue([{
+    id: '56565656-5656-4656-8656-565656565656',
+    assetId: '34343434-3434-4434-8434-343434343434',
+    versionId: '12121212-1212-4212-8212-121212121212',
+    status: 'queued', progress: 'Oczekuje', error: '',
+    createdAt: projectFixture.createdAt, updatedAt: projectFixture.updatedAt,
+  }]);
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+  const genericCategory = await screen.findByLabelText('Typ assetu');
+  expect(within(genericCategory).queryByRole('option', { name: 'Postać' })).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Postacie' }));
+  expect(await screen.findByRole('heading', { name: 'Postać gotowa do ruchu' })).toBeInTheDocument();
+  const directions = screen.getByRole('region', { name: 'Kierunki animacji postaci' });
+  for (const label of ['NW', 'NE', 'SE', 'SW']) expect(within(directions).getByText(label)).toBeInTheDocument();
+  expect(screen.getByText(/Kolumna 1: idle · kolumny 2–5: chód/)).toBeInTheDocument();
+  expect(screen.getByText(/Analiza ruchu jest obowiązkowa/)).toBeInTheDocument();
+
+  fireEvent.change(screen.getByLabelText('Nazwa postaci'), { target: { value: 'Leśna strażniczka' } });
+  fireEvent.change(screen.getByLabelText('Klatki na sekundę (FPS)'), { target: { value: '12' } });
+  fireEvent.change(screen.getByLabelText('Footprint X postaci — zajęte komórki'), { target: { value: '2' } });
+  const generate = screen.getByRole('button', { name: 'Generuj postać' });
+  await waitFor(() => expect(generate).toBeEnabled());
+  fireEvent.click(generate);
+
+  await waitFor(() => expect(window.tilemap.generation.enqueue).toHaveBeenCalledWith({
+    name: 'Leśna strażniczka',
+    prompt: '',
+    mode: 'generate',
+    category: 'character',
+    relativeWidth: 0.5,
+    relativeHeight: 1.5,
+    footprint: { x: 2, y: 1 },
+    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 12 },
+    generatorProviders: ['codex'],
+  }));
+
+  fireEvent.click(screen.getByRole('button', { name: 'Strona główna projektu Test' }));
+  expect(await screen.findByText(/obowiązkowa analiza ruchu postaci pozostają aktywne/i)).toBeInTheDocument();
+});
+
+it('pokazuje postaci top-down wyłącznie w kierunkach N/E/S/W', async () => {
+  mockOpenedProject({
+    ...projectFixture,
+    projection: 'top_down',
+    tileHeightPx: projectFixture.tileWidthPx,
+    codexGenerationEnabled: true,
+  });
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+  fireEvent.click(await screen.findByRole('button', { name: 'Postacie' }));
+  const directions = await screen.findByRole('region', { name: 'Kierunki animacji postaci' });
+  for (const label of ['N', 'E', 'S', 'W']) expect(within(directions).getByText(label)).toBeInTheDocument();
+  for (const label of ['NW', 'NE', 'SE', 'SW']) expect(within(directions).queryByText(label)).not.toBeInTheDocument();
+  expect(screen.getByText('Top-down, osie świata')).toBeInTheDocument();
+});
+
+it('blokuje generowanie postaci, gdy provider jest gotowy, ale analizator Codex nie działa', async () => {
+  mockOpenedProject({
+    ...projectFixture,
+    codexGenerationEnabled: false,
+    comfyUiEnabled: true,
+  });
+  vi.mocked(window.tilemap.codex.health).mockResolvedValue({
+    state: 'unavailable', version: null, appServer: false, imageGeneration: false,
+    imagegenSkill: false, skillPath: null, logPath: null, message: 'Codex jest niedostępny.',
+  });
+  vi.mocked(window.tilemap.comfy.health).mockResolvedValue({
+    state: 'ready', installed: true, server: true, endpoint: 'http://127.0.0.1:8188',
+    version: '1.0', profile: 'z_image_turbo', model: 'z_image_turbo_bf16.safetensors',
+    missingNodes: [], missingModels: [], message: 'Gotowe',
+  });
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+  fireEvent.click(await screen.findByRole('button', { name: 'Postacie' }));
+  expect(await screen.findByText(/Obowiązkowy analizator ruchu Codex nie jest gotowy/i)).toHaveTextContent('Codex jest niedostępny.');
+  fireEvent.change(screen.getByLabelText('Nazwa postaci'), { target: { value: 'Strażniczka' } });
+  expect(screen.getByRole('button', { name: 'Generuj postać' })).toBeDisabled();
+});
+
+it('generuje postać tylko przez ComfyUI, zachowując Codex jako obowiązkowy analizator ruchu', async () => {
+  mockOpenedProject({
+    ...projectFixture,
+    codexGenerationEnabled: false,
+    comfyUiEnabled: true,
+    stableDiffusionCppEnabled: false,
+  });
+  vi.mocked(window.tilemap.comfy.health).mockResolvedValue({
+    state: 'ready', installed: true, server: true, endpoint: 'http://127.0.0.1:8188',
+    version: '1.0.39', profile: 'z_image_turbo', model: 'z_image_turbo_bf16.safetensors',
+    missingNodes: [], missingModels: [], message: 'Gotowe',
+  });
+  vi.mocked(window.tilemap.generation.enqueue).mockResolvedValue([{
+    id: '56565656-5656-4656-8656-565656565656',
+    assetId: '34343434-3434-4434-8434-343434343434',
+    versionId: '12121212-1212-4212-8212-121212121212',
+    status: 'queued', progress: 'Oczekuje', error: '',
+    createdAt: projectFixture.createdAt, updatedAt: projectFixture.updatedAt,
+  }]);
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+  fireEvent.click(await screen.findByRole('button', { name: 'Postacie' }));
+  expect(await screen.findByRole('checkbox', { name: /ComfyUI/ })).toBeChecked();
+  expect(screen.getByRole('checkbox', { name: /Codex imagegen/ })).not.toBeChecked();
+  fireEvent.change(screen.getByLabelText('Nazwa postaci'), { target: { value: 'Leśna strażniczka' } });
+  const generate = screen.getByRole('button', { name: 'Generuj postać' });
+  await waitFor(() => expect(generate).toBeEnabled());
+  fireEvent.click(generate);
+
+  await waitFor(() => expect(window.tilemap.generation.enqueue).toHaveBeenCalledWith(expect.objectContaining({
+    category: 'character',
+    generatorProviders: ['comfyui'],
+  })));
+});
+
+it('odtwarza, zatrzymuje i przełącza kierunek arkusza animacji postaci', () => {
+  vi.useFakeTimers();
+  const version = characterVersionFixture();
+  render(<CharacterAnimationPreview version={version} assetName="Leśna strażniczka" />);
+
+  const frame = screen.getByRole('img', { name: /Leśna strażniczka: chód, kierunek Północny zachód/i });
+  expect(frame).toHaveAttribute('data-column', '1');
+  expect(frame).toHaveAttribute('data-row', '0');
+  act(() => vi.advanceTimersByTime(125));
+  expect(frame).toHaveAttribute('data-column', '2');
+
+  fireEvent.click(screen.getByRole('button', { name: 'Wstrzymaj animację' }));
+  act(() => vi.advanceTimersByTime(500));
+  expect(frame).toHaveAttribute('data-column', '2');
+
+  fireEvent.click(screen.getByRole('tab', { name: /NE.*Północny wschód/i }));
+  expect(screen.getByRole('img', { name: /kierunek Północny wschód/i })).toHaveAttribute('data-row', '1');
+  fireEvent.click(screen.getByRole('tab', { name: 'Idle' }));
+  expect(screen.getByRole('img', { name: /idle, kierunek Północny wschód/i })).toHaveAttribute('data-column', '0');
+  expect(screen.getByRole('button', { name: 'Odtwórz animację' })).toBeDisabled();
+  vi.useRealTimers();
+});
+
+it('pokazuje raport agenta per kierunek i blokuje review, dopóki ruch nie jest zaliczony', async () => {
+  const failedVersion = characterVersionFixture('failed');
+  const failedAsset = characterAssetFixture(failedVersion);
+  const view = render(<QueryClientProvider client={new QueryClient()}><>
+    <MovementAnalysisPanel animation={failedVersion.characterAnimation!} />
+    <ReviewControls asset={failedAsset} version={failedVersion} project={projectFixture} onChanged={() => undefined} />
+  </></QueryClientProvider>);
+
+  expect(screen.getByRole('alert', { name: 'Analiza ruchu postaci' })).toHaveTextContent('Niezaliczona');
+  expect(screen.getByText('Kierunek NE przeskakuje między klatkami.')).toBeInTheDocument();
+  expect(screen.getByText('Sylwetka przeskakuje.')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /^Zatwierdź$/i })).toBeDisabled();
+  expect(screen.getByText(/Tej kontroli nie można pominąć/i)).toBeInTheDocument();
+
+  view.unmount();
+  const passedVersion = characterVersionFixture('passed');
+  const passedAsset = characterAssetFixture(passedVersion);
+  vi.mocked(window.tilemap.assets.review).mockResolvedValue({
+    ...passedAsset,
+    currentApprovedVersionId: passedVersion.id,
+    versions: [{ ...passedVersion, status: 'approved' }],
+  });
+  vi.mocked(window.tilemap.generation.enqueue).mockResolvedValue([{
+    id: '78787878-7878-4878-8878-787878787878', assetId: passedAsset.id,
+    versionId: '90909090-9090-4090-8090-909090909090', status: 'queued', progress: 'Oczekuje', error: '',
+    createdAt: projectFixture.createdAt, updatedAt: projectFixture.updatedAt,
+  }]);
+  render(<QueryClientProvider client={new QueryClient()}><ReviewControls
+    asset={passedAsset} version={passedVersion} project={projectFixture} onChanged={() => undefined}
+  /></QueryClientProvider>);
+
+  const approve = screen.getByRole('button', { name: /^Zatwierdź$/i });
+  expect(approve).toBeEnabled();
+  fireEvent.change(screen.getByLabelText('FPS'), { target: { value: '14' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Przegeneruj' }));
+  await waitFor(() => expect(window.tilemap.generation.enqueue).toHaveBeenCalledWith(expect.objectContaining({
+    category: 'character',
+    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 14 },
+  })));
+  fireEvent.click(approve);
+  await waitFor(() => expect(window.tilemap.assets.review).toHaveBeenCalledWith(expect.objectContaining({
+    versionId: passedVersion.id, decision: 'approved',
+  })));
+});
+
+it('otwiera asset postaci w sekcji Postacie z animacją i zaliczoną analizą', async () => {
+  const version = characterVersionFixture('passed');
+  const asset = characterAssetFixture(version);
+  mockOpenedProject({ ...projectFixture, codexGenerationEnabled: true }, [asset]);
+  vi.mocked(window.tilemap.assets.get).mockResolvedValue(asset);
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+  fireEvent.click(await screen.findByRole('button', { name: /Leśna strażniczka/i }));
+
+  expect(await screen.findByRole('region', { name: 'Podgląd animacji postaci' })).toBeInTheDocument();
+  expect(screen.getByRole('status', { name: 'Analiza ruchu postaci' })).toHaveTextContent('Zaliczona');
+  expect(screen.getByRole('button', { name: 'Postacie' })).toHaveClass('active');
+  expect(screen.getByText('4 / 4 kierunki')).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Studio' }));
+  expect(await screen.findByRole('heading', { name: 'Co budujemy?' })).toBeInTheDocument();
+  expect(screen.queryByRole('region', { name: 'Podgląd animacji postaci' })).not.toBeInTheDocument();
+  expect(within(screen.getByLabelText('Typ assetu')).queryByRole('option', { name: 'Postać' })).not.toBeInTheDocument();
 });
 
 it('rozróżnia rozmiar obrazu budynku od footprintu siatki', async () => {
   const version: AssetVersion = {
     id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', assetId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
     parentVersionId: null, mode: 'generate', status: 'generating', prompt: '', feedback: '',
-    category: 'building', elevationLevels: 0, relativeWidth: 2, relativeHeight: 2, tags: [],
+    category: 'building', elevationLevels: 0, relativeWidth: 2, relativeHeight: 2, characterAnimation: null, tags: [],
     finalPath: null, imageUrl: null, width: null, height: null,
     footprint: { x: 1, y: 1 }, pivot: { x: 0.5, y: 0.5 }, aiDescription: '',
     aiVerificationStatus: 'pending', aiVerificationMessage: '', rejectionReason: '', error: '',
@@ -412,7 +835,7 @@ it('pokazuje komplet road tile jako siatkę 4×4 bez zielonych markerów', async
   const roadVersion: AssetVersion = {
     id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', assetId: '33333333-3333-4333-8333-333333333333',
     parentVersionId: null, mode: 'generate', status: 'needs_review', prompt: '', feedback: '',
-    category: 'road_tile', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, roadConnections: 15,
+    category: 'road_tile', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, roadConnections: 15, characterAnimation: null,
     roadVariants: Array.from({ length: 16 }, (_, connectionMask) => ({
       connectionMask,
       finalPath: `assets/road-${connectionMask.toString().padStart(2, '0')}.png`,
@@ -508,7 +931,7 @@ it('pokazuje szczegóły błędu w modalu i krótką akcję Ponów obok statusu'
   const failedVersion: AssetVersion = {
     id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', assetId: '33333333-3333-4333-8333-333333333333',
     parentVersionId: null, mode: 'generate', status: 'failed', prompt: 'Zielona łąka', feedback: '',
-    category: 'flat_tile', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, tags: ['łąka'], finalPath: null, imageUrl: null, width: null, height: null,
+    category: 'flat_tile', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, characterAnimation: null, tags: ['łąka'], finalPath: null, imageUrl: null, width: null, height: null,
     footprint: { x: 1, y: 1 }, pivot: { x: 0.5, y: 0.5 }, aiDescription: 'Łąka', aiVerificationStatus: 'passed', aiVerificationMessage: '', rejectionReason: '',
     error: 'Pełny komunikat błędu generacji.', createdAt: '2026-08-07T10:00:00.000Z', updatedAt: '2026-08-07T10:00:00.000Z',
   };
@@ -564,7 +987,7 @@ it('pokazuje przycisk Weryfikacja w miejscu akcji statusu, gdy kontrola AI zosta
   const unverifiedVersion: AssetVersion = {
     id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', assetId: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
     parentVersionId: null, mode: 'generate', status: 'needs_review', prompt: 'Omszały kamień', feedback: '',
-    category: 'other', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, tags: ['kamień'],
+    category: 'other', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, characterAnimation: null, tags: ['kamień'],
     finalPath: 'assets/stone/final.png', imageUrl: 'tilemap-asset://project/assets/stone/final.png',
     width: 128, height: 128, footprint: { x: 1, y: 1 }, pivot: { x: 0.5, y: 0.5 },
     aiDescription: 'Omszały kamień', aiVerificationStatus: 'pending', aiVerificationMessage: '',
@@ -624,6 +1047,7 @@ it('układa dziewięć kopii terenu w podglądzie szwów', () => {
       prompt: 'Zielona łąka',
       feedback: '',
       category: 'flat_tile',
+      characterAnimation: null,
       elevationLevels: 0,
       relativeWidth: 1,
       relativeHeight: 1,
@@ -644,12 +1068,12 @@ it('układa dziewięć kopii terenu w podglądzie szwów', () => {
     }}
   />);
 
-  expect(screen.getByRole('img', { name: /Podgląd powtarzania terenu Łąka/i })).toBeInTheDocument();
-  expect(screen.getAllByAltText(/Łąka — sąsiad/i)).toHaveLength(9);
-  expect(view.container.querySelector('.seam-grid')).toHaveStyle({ width: '448px', height: '224px' });
-  expect(screen.getByAltText('Łąka — sąsiad 3,2')).toHaveStyle({ left: '448px', top: '224px' });
+  expect(screen.getByRole('region', { name: /Podgląd powtarzania terenu Łąka/i })).toBeInTheDocument();
+  expect(view.container.querySelectorAll('.seam-tile')).toHaveLength(9);
+  expect(view.container.querySelector('.seam-grid')).toHaveStyle({ width: '1344px', height: '672px' });
+  expect(view.container.querySelector('.seam-tile[data-column="3"][data-row="2"]')).toHaveStyle({ left: '896px', top: '448px' });
 
-  const stage = screen.getByRole('img', { name: /Podgląd powtarzania terenu Łąka/i });
+  const stage = screen.getByRole('region', { name: /Podgląd powtarzania terenu Łąka/i });
   fireEvent.wheel(stage, { deltaY: -100, clientX: 100, clientY: 80 });
   expect(onZoom).toHaveBeenCalledWith(200);
 
@@ -662,7 +1086,7 @@ it('układa dziewięć kopii terenu w podglądzie szwów', () => {
   });
 });
 
-it('układa podgląd szwów top-down na prostokątnej siatce 3×3', () => {
+it('układa konfigurowalny podgląd szwów top-down na prostokątnej siatce 5×2', () => {
   const version: AssetVersion = {
     id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
     assetId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
@@ -672,6 +1096,7 @@ it('układa podgląd szwów top-down na prostokątnej siatce 3×3', () => {
     prompt: '',
     feedback: '',
     category: 'flat_tile',
+    characterAnimation: null,
     elevationLevels: 0,
     relativeWidth: 1,
     relativeHeight: 1,
@@ -695,13 +1120,58 @@ it('układa podgląd szwów top-down na prostokątnej siatce 3×3', () => {
     tileWidth={256}
     tileHeight={256}
     projection="top_down"
+    columns={5}
+    rows={2}
     zoom={100}
     onZoom={vi.fn()}
     version={version}
   />);
 
-  expect(view.container.querySelector('.seam-grid')).toHaveStyle({ width: '768px', height: '768px' });
-  expect(screen.getByAltText('Łąka — sąsiad 3,2')).toHaveStyle({ left: '640px', top: '384px' });
+  expect(view.container.querySelectorAll('.seam-tile')).toHaveLength(10);
+  expect(view.container.querySelector('.seam-grid')).toHaveStyle({ width: '1280px', height: '512px' });
+  expect(view.container.querySelector('.seam-tile[data-column="5"][data-row="2"]')).toHaveStyle({ left: '1152px', top: '384px' });
+});
+
+it('mieści izometryczną siatkę 4×2 w pełnym bounding boxie', () => {
+  const view = render(<TerrainSeamPreview
+    assetName="Łąka"
+    tileWidth={256}
+    tileHeight={128}
+    projection="isometric"
+    columns={4}
+    rows={2}
+    zoom={100}
+    onZoom={vi.fn()}
+    version={terrainVersionFixture()}
+  />);
+
+  const tiles = view.container.querySelectorAll('.seam-tile');
+  expect(tiles).toHaveLength(8);
+  expect(Array.from(tiles).map((tile) => `${tile.getAttribute('data-column')}:${tile.getAttribute('data-row')}`)).toEqual([
+    '1:1', '1:2', '2:1', '2:2', '3:1', '3:2', '4:1', '4:2',
+  ]);
+  expect(view.container.querySelector('.seam-grid')).toHaveStyle({ width: '768px', height: '384px' });
+  expect(view.container.querySelector('.seam-tile[data-column="1"][data-row="2"]')).toHaveStyle({ left: '128px', top: '128px' });
+  expect(view.container.querySelector('.seam-tile[data-column="4"][data-row="1"]')).toHaveStyle({ left: '640px', top: '256px' });
+  expect(view.container.querySelector('.seam-tile[data-column="4"][data-row="2"]')).toHaveStyle({ left: '512px', top: '320px' });
+});
+
+it('dodaje wysokość podniesionego sprite’a do izometrycznego bounding boxu', () => {
+  const view = render(<TerrainSeamPreview
+    assetName="Urwisko"
+    tileWidth={256}
+    tileHeight={128}
+    projection="isometric"
+    spriteHeight={384}
+    columns={2}
+    rows={2}
+    zoom={100}
+    onZoom={vi.fn()}
+    version={terrainVersionFixture({ category: 'elevated_tile', elevationLevels: 2, height: 384 })}
+  />);
+
+  expect(view.container.querySelector('.seam-grid')).toHaveStyle({ width: '512px', height: '512px' });
+  expect(view.container.querySelector('.seam-tile[data-column="2"][data-row="2"]')).toHaveStyle({ top: '192px', height: '384px' });
 });
 
 it('steruje zoomem podglądu krokami i pozwala go zresetować', () => {
@@ -870,7 +1340,7 @@ it('pozwala przegenerować bez opisu i cofnąć odrzucenie', async () => {
   const version: AssetVersion = {
     id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', assetId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
     parentVersionId: null, mode: 'generate', status: 'rejected', prompt: 'Zielona łąka', feedback: '',
-    category: 'flat_tile', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, tags: ['łąka'], finalPath: 'assets/meadow/final.png',
+    category: 'flat_tile', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, characterAnimation: null, tags: ['łąka'], finalPath: 'assets/meadow/final.png',
     imageUrl: 'tilemap-asset://asset/meadow.png', width: 256, height: 128,
     footprint: { x: 1, y: 1 }, pivot: { x: 0.5, y: 0.5 }, aiDescription: 'Łąka', aiVerificationStatus: 'passed', aiVerificationMessage: '',
     rejectionReason: 'Za ciemna', error: '', createdAt: '2026-08-07T10:00:00.000Z', updatedAt: '2026-08-07T10:00:00.000Z',
@@ -912,7 +1382,7 @@ it('pokazuje pivot wyznaczony przez AI dopiero w review i pozwala go nadpisać p
   const version: AssetVersion = {
     id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', assetId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
     parentVersionId: null, mode: 'generate', status: 'needs_review', prompt: 'Stary dąb', feedback: '',
-    category: 'vegetation', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, tags: ['drzewo'],
+    category: 'vegetation', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, characterAnimation: null, tags: ['drzewo'],
     finalPath: 'assets/oak/final.png', imageUrl: 'tilemap-asset://asset/oak.png', width: 256, height: 256,
     footprint: { x: 2, y: 2 }, pivot: { x: 0.48, y: 0.12 }, aiDescription: 'Stary dąb', aiVerificationStatus: 'passed', aiVerificationMessage: '',
     rejectionReason: '', error: '', createdAt: '2026-08-07T10:00:00.000Z', updatedAt: '2026-08-07T10:00:00.000Z',
@@ -945,7 +1415,7 @@ it('blokuje drugie zatwierdzenie i pozwala cofnąć bieżące', async () => {
   const pendingVersion: AssetVersion = {
     id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', assetId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
     parentVersionId: null, mode: 'variant', status: 'needs_review', prompt: 'Zielona łąka', feedback: '',
-    category: 'flat_tile', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, tags: ['łąka'], finalPath: 'assets/meadow/pending.png',
+    category: 'flat_tile', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, characterAnimation: null, tags: ['łąka'], finalPath: 'assets/meadow/pending.png',
     imageUrl: 'tilemap-asset://asset/pending.png', width: 256, height: 128,
     footprint: { x: 1, y: 1 }, pivot: { x: 0.5, y: 0.5 }, aiDescription: 'Nowa łąka', aiVerificationStatus: 'passed', aiVerificationMessage: '',
     rejectionReason: '', error: '', createdAt: '2026-08-07T10:01:00.000Z', updatedAt: '2026-08-07T10:01:00.000Z',
@@ -990,7 +1460,7 @@ it('pokazuje podejścia w prawym sidebarze assetu, a Art Direction tylko na pozi
   const version: AssetVersion = {
     id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', assetId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
     parentVersionId: null, mode: 'generate', status: 'needs_review', prompt: 'Zielona łąka', feedback: '',
-    category: 'flat_tile', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, tags: ['łąka'], finalPath: 'assets/meadow/final.png',
+    category: 'flat_tile', elevationLevels: 0, relativeWidth: 1, relativeHeight: 1, characterAnimation: null, tags: ['łąka'], finalPath: 'assets/meadow/final.png',
     imageUrl: 'tilemap-asset://asset/meadow.png', width: 256, height: 128,
     footprint: { x: 1, y: 1 }, pivot: { x: 0.5, y: 0.5 }, aiDescription: 'Łąka', aiVerificationStatus: 'passed', aiVerificationMessage: '', rejectionReason: '', error: '',
     createdAt: '2026-08-07T10:00:00.000Z', updatedAt: '2026-08-07T10:00:00.000Z',
@@ -1025,6 +1495,33 @@ it('pokazuje podejścia w prawym sidebarze assetu, a Art Direction tylko na pozi
   const generationLog = await screen.findByRole('region', { name: 'Dziennik generacji' });
   expect(generationLog.closest('.review-page')).not.toBeNull();
   expect(generationLog.closest('.asset-attempts-panel')).toBeNull();
+
+  fireEvent.click(screen.getByRole('button', { name: /Tile obok tile/i }));
+  const gridSize = screen.getByRole('group', { name: 'Rozmiar siatki podglądu' });
+  expect(gridSize).toHaveAttribute('title', 'W izometrii szerokość i wysokość biegną po przekątnych siatki.');
+  const columns = within(gridSize).getByRole('spinbutton', { name: 'Szerokość podglądu w kaflach' });
+  const rows = within(gridSize).getByRole('spinbutton', { name: 'Wysokość podglądu w kaflach' });
+  expect(columns).toHaveValue(3);
+  expect(columns).toHaveAttribute('min', '1');
+  expect(columns).toHaveAttribute('max', '16');
+  expect(rows).toHaveValue(3);
+  fireEvent.change(columns, { target: { value: '99' } });
+  expect(columns).toHaveValue(16);
+  fireEvent.change(rows, { target: { value: '0' } });
+  expect(rows).toHaveValue(1);
+  fireEvent.change(columns, { target: { value: '5' } });
+  fireEvent.change(rows, { target: { value: '2' } });
+  expect(document.querySelectorAll('.seam-tile')).toHaveLength(10);
+  expect(document.querySelector('.seam-tile[data-column="5"][data-row="2"]')).toHaveStyle({ left: '640px', top: '384px' });
+  expect(document.querySelectorAll('.seam-tile[aria-hidden="true"]')).toHaveLength(10);
+  const stage = screen.getByRole('region', { name: /Podgląd powtarzania terenu Łąka/i });
+  fireEvent.click(screen.getByRole('button', { name: 'Powiększ podgląd' }));
+  fireEvent.pointerDown(stage, { button: 0, pointerId: 7, clientX: 100, clientY: 80 });
+  fireEvent.pointerMove(stage, { pointerId: 7, clientX: 124, clientY: 92 });
+  expect(document.querySelector('.seam-grid')).toHaveStyle({ '--preview-pan-x': '24px', '--preview-pan-y': '12px' });
+  fireEvent.change(rows, { target: { value: '3' } });
+  expect(screen.getByRole('button', { name: 'Resetuj zoom' })).toHaveTextContent('125%');
+  expect(document.querySelector('.seam-grid')).toHaveStyle({ '--preview-pan-x': '0px', '--preview-pan-y': '0px' });
 
   fireEvent.click(screen.getByRole('button', { name: /Nowy asset/i }));
   expect(await screen.findByRole('heading', { name: 'DNA stylu' })).toBeInTheDocument();

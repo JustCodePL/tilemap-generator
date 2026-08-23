@@ -3,7 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
 import { afterEach, expect, it, vi } from 'vitest';
-import { StableDiffusionCppService } from '../main/stable-diffusion/stable-diffusion-cpp-service';
+import {
+  buildPrompt,
+  StableDiffusionCppService,
+} from '../main/stable-diffusion/stable-diffusion-cpp-service';
 
 const temporaryDirectories: string[] = [];
 
@@ -97,4 +100,20 @@ it('raportuje brak programu i modeli bez uruchamiania procesu', async () => {
     state: 'unavailable', installed: false,
     missingFiles: ['sd-cli.exe', 'model.safetensors', 'llm.safetensors', 'vae.safetensors'],
   });
+});
+
+it('opisuje kompletny arkusz animacji postaci top-down', () => {
+  const prompt = buildPrompt({
+    assetName: 'Łowca', category: 'character', projection: 'top_down', prompt: '', feedback: '',
+    artBrief: 'Czytelne sylwetki', styleSummary: '', outputPath: '/tmp/character.png',
+    outputSize: { width: 400, height: 256 },
+    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 10 },
+    roadAtlas: false, attempt: 1, verificationFeedback: '', signal: new AbortController().signal,
+  });
+
+  expect(prompt).toContain('5-column by 4-row');
+  expect(prompt).toContain('Every frame cell is exactly 80x64px');
+  expect(prompt).toContain('N (north), E (east), S (south), W (west)');
+  expect(prompt).toContain('Column 1 is a grounded idle pose');
+  expect(prompt).toContain('last walk frame loop smoothly into the first walk frame');
 });

@@ -1,7 +1,12 @@
 import { expect, it } from 'vitest';
 import {
   assetPixelSize,
+  characterAnimationFrameSize,
+  characterAnimationSettingsSchema,
+  characterAnimationSheetSize,
+  characterDirectionsForProjection,
   createProjectSchema,
+  defaultCharacterAnimationSettings,
   defaultAssetSizing,
   enqueueGenerationSchema,
   exportIntegrationSchema,
@@ -42,6 +47,77 @@ it('normalizuje brak opcjonalnego promptu do pustego tekstu', () => {
   const input = enqueueGenerationSchema.parse({ name: 'Kamienna droga' });
 
   expect(input.prompt).toBe('');
+});
+
+it('waliduje niepusty zestaw generatorów wybrany dla nowego assetu', () => {
+  expect(enqueueGenerationSchema.parse({
+    name: 'Kamienna droga',
+    generatorProviders: ['stable_diffusion_cpp', 'codex'],
+  }).generatorProviders).toEqual(['codex', 'stable_diffusion_cpp']);
+  expect(() => enqueueGenerationSchema.parse({
+    name: 'Kamienna droga', generatorProviders: [],
+  })).toThrow(/co najmniej jeden generator/);
+  expect(() => enqueueGenerationSchema.parse({
+    name: 'Kamienna droga', generatorProviders: ['codex', 'codex'],
+  })).toThrow(/tylko raz/);
+  expect(() => enqueueGenerationSchema.parse({
+    name: 'Kamienna droga', generatorProvider: 'codex', generatorProviders: ['comfyui'],
+  })).toThrow(/Nie można łączyć/);
+  expect(() => enqueueGenerationSchema.parse({
+    assetId: '11111111-1111-4111-8111-111111111111',
+    name: 'Kamienna droga', generatorProviders: ['comfyui'],
+  })).toThrow(/tylko dla nowego assetu/);
+});
+
+it('definiuje stały kontrakt kierunkowej animacji postaci', () => {
+  expect(characterDirectionsForProjection('isometric').map((direction) => direction.id)).toEqual([
+    'north_west', 'north_east', 'south_east', 'south_west',
+  ]);
+  expect(characterDirectionsForProjection('top_down').map((direction) => direction.id)).toEqual([
+    'north', 'east', 'south', 'west',
+  ]);
+  expect(characterDirectionsForProjection('isometric').map((direction) => direction.gridDelta)).toEqual([
+    { x: -1, y: 0 }, { x: 0, y: -1 }, { x: 1, y: 0 }, { x: 0, y: 1 },
+  ]);
+  expect(characterDirectionsForProjection('top_down').map((direction) => direction.gridDelta)).toEqual([
+    { x: 0, y: 1 }, { x: 1, y: 0 }, { x: 0, y: -1 }, { x: -1, y: 0 },
+  ]);
+  expect(defaultCharacterAnimationSettings).toEqual({
+    action: 'walk', framesPerDirection: 4, framesPerSecond: 8,
+  });
+  expect(characterAnimationSettingsSchema.parse({})).toEqual(defaultCharacterAnimationSettings);
+  expect(characterAnimationSettingsSchema.parse({ framesPerSecond: 24 })).toEqual({
+    action: 'walk', framesPerDirection: 4, framesPerSecond: 24,
+  });
+  expect(() => characterAnimationSettingsSchema.parse({ framesPerDirection: 5 })).toThrow();
+  expect(() => characterAnimationSettingsSchema.parse({ framesPerSecond: 25 })).toThrow();
+});
+
+it('wylicza klatkę i arkusz postaci jako idle plus cztery klatki chodu w czterech kierunkach', () => {
+  const project = { tileWidthPx: 256, tileHeightPx: 128 };
+  const asset = { relativeWidth: 0.5, relativeHeight: 1.5 };
+  expect(characterAnimationFrameSize(project, asset)).toEqual({ width: 128, height: 192 });
+  expect(characterAnimationSheetSize(project, asset, defaultCharacterAnimationSettings)).toEqual({
+    width: 640,
+    height: 768,
+  });
+  expect(characterAnimationSheetSize(
+    { width: 128, height: 192 },
+    defaultCharacterAnimationSettings,
+  )).toEqual({ width: 640, height: 768 });
+});
+
+it('odrzuca ustawienia animacji dla assetu innego niż postać', () => {
+  expect(() => enqueueGenerationSchema.parse({
+    name: 'Kamień',
+    category: 'prop',
+    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+  })).toThrow(/tylko dla kategorii character/);
+  expect(enqueueGenerationSchema.parse({
+    name: 'Rycerz',
+    category: 'character',
+    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 12 },
+  }).characterAnimation).toEqual({ action: 'walk', framesPerDirection: 4, framesPerSecond: 12 });
 });
 
 it('wylicza względne canvasy względem bazowego tile 2:1', () => {

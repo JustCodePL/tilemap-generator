@@ -1,10 +1,12 @@
 import { EventEmitter } from 'node:events';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
 import type {
   AssetCategory,
+  CharacterDirectionId,
+  CharacterMovementAnalysis,
   EnqueueGenerationInput,
   GenerationEvent,
   GenerationJob,
@@ -17,6 +19,9 @@ import type {
 } from '../../shared/domain';
 import {
   assetPixelSize,
+  characterAnimationFrameSize,
+  characterAnimationSheetSize,
+  characterDirectionsForProjection,
   isRoadAssetCategory,
   isTileAssetCategory,
 } from '../../shared/domain';
@@ -27,9 +32,18 @@ import {
   generationResponseSchema,
 } from '../codex/codex-service';
 import { ComfyService } from '../comfy/comfy-service';
-import type { JobContext, ProjectDatabase } from '../db/project-database';
+import type { GeneratedVersionData, JobContext, ProjectDatabase } from '../db/project-database';
 import { StableDiffusionCppService } from '../stable-diffusion/stable-diffusion-cpp-service';
 import { nullLogger, type Logger } from './app-logger';
+import {
+  inspectCharacterAnimationSource,
+  normalizeCharacterAnimationSource,
+} from './character-animation-source';
+import {
+  createCharacterAnimationAnalysisArtifacts,
+  type CharacterAnimationValidationReport,
+  validateCharacterAnimationSheet,
+} from './character-animation-validator';
 import {
   createRoadVariantsFromMaterial,
   createRoadVariantGrid,
@@ -65,8 +79,52 @@ const aiVerificationOutputSchema = {
   required: ['status', 'message'],
   additionalProperties: false,
 };
+const characterMovementAnalysisResponseSchema = z.object({
+  status: z.enum(['passed', 'failed']),
+  summary: z.string().trim().min(1).max(4_000),
+  directions: z.array(z.object({
+    direction: z.enum([
+      'north_west', 'north_east', 'south_east', 'south_west',
+      'north', 'east', 'south', 'west',
+    ]),
+    status: z.enum(['passed', 'failed']),
+    message: z.string().trim().min(1).max(2_000),
+  })).length(4),
+});
+const characterMovementAnalysisOutputSchema = {
+  type: 'object',
+  properties: {
+    status: { type: 'string', enum: ['passed', 'failed'] },
+    summary: { type: 'string' },
+    directions: {
+      type: 'array',
+      minItems: 4,
+      maxItems: 4,
+      items: {
+        type: 'object',
+        properties: {
+          direction: {
+            type: 'string',
+            enum: [
+              'north_west', 'north_east', 'south_east', 'south_west',
+              'north', 'east', 'south', 'west',
+            ],
+          },
+          status: { type: 'string', enum: ['passed', 'failed'] },
+          message: { type: 'string' },
+        },
+        required: ['direction', 'status', 'message'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['status', 'summary', 'directions'],
+  additionalProperties: false,
+};
 const MAX_GEOMETRY_ATTEMPTS = 3;
+const MAX_CHARACTER_ANALYSIS_ATTEMPTS = 2;
 const ROAD_GENERATION_TIMEOUT_MS = 25 * 60_000;
+const QUEUE_SHUTDOWN_TIMEOUT_MS = 30_000;
 
 export class GenerationQueue extends EventEmitter {
   private database: ProjectDatabase | null = null;
@@ -101,15 +159,26 @@ export class GenerationQueue extends EventEmitter {
     this.activeVerifications.clear();
   }
 
-  async shutdown(): Promise<void> {
+  isAttachedTo(database: ProjectDatabase): boolean {
+    return !this.stopping && this.database === database;
+  }
+
+  async shutdown(timeoutMs = QUEUE_SHUTDOWN_TIMEOUT_MS): Promise<void> {
     this.stopping = true;
     for (const active of this.activeJobs.values()) active.controller.abort();
     for (const controller of this.activeVerifications.values()) controller.abort();
     if (this.activeJobs.size || this.activeVerifications.size) {
-      await Promise.race([
-        new Promise<void>((resolve) => this.once('idle', resolve)),
-        new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+      let timer: NodeJS.Timeout | null = null;
+      const completed = await Promise.race([
+        new Promise<true>((resolve) => this.once('idle', () => resolve(true))),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
       ]);
+      if (timer) clearTimeout(timer);
+      if (!completed || this.activeJobs.size || this.activeVerifications.size) {
+        throw new Error('Nie można bezpiecznie odłączyć projektu: aktywne zadania nie zakończyły anulowania.');
+      }
     }
     this.detach();
   }
@@ -123,22 +192,23 @@ export class GenerationQueue extends EventEmitter {
   }
 
   enqueueEnabled(input: EnqueueGenerationInput): GenerationJob[] {
-    if (input.generatorProvider) return [this.enqueue(input)];
     const database = this.requireDatabase();
+    if (input.assetId) {
+      const generatorProvider = input.generatorProvider
+        ?? database.generatorProviderForIteration(input.assetId, input.parentVersionId);
+      return [this.enqueue({ ...input, generatorProvider, generatorProviders: undefined })];
+    }
+    if (input.generatorProvider) return [this.enqueue(input)];
     const project = database.getProject();
-    const providers = [
+    const providers = input.generatorProviders ?? [
       project.codexGenerationEnabled ? 'codex' : null,
       project.comfyUiEnabled ? 'comfyui' : null,
       project.stableDiffusionCppEnabled ? 'stable_diffusion_cpp' : null,
     ].filter((provider): provider is GeneratorProvider => Boolean(provider));
     if (!providers.length) throw new Error('Włącz co najmniej jeden generator w ustawieniach projektu.');
-    const jobs: GenerationJob[] = [];
-    let assetId = input.assetId;
-    for (const provider of providers) {
-      const job = this.enqueue({ ...input, assetId, generatorProvider: provider });
-      jobs.push(job);
-      assetId ??= job.assetId;
-    }
+    const jobs = database.enqueueNewAssetGenerations(input, providers, Boolean(input.generatorProviders));
+    for (const job of jobs) this.emitEvent({ type: 'queue', job });
+    void this.pump();
     return jobs;
   }
 
@@ -185,6 +255,7 @@ export class GenerationQueue extends EventEmitter {
       relativeWidth: context.relativeWidth,
       relativeHeight: context.relativeHeight,
       footprint: context.footprint,
+      characterAnimation: context.characterAnimation ?? undefined,
       generatorProvider: context.generatorProvider,
     });
     this.logger.info('generation.retried', {
@@ -360,6 +431,8 @@ export class GenerationQueue extends EventEmitter {
         const currentJob = database.getJob(job.id);
         if (!currentJob || currentJob.status === 'cancelled') return;
         const context = database.getJobContext(job.id);
+        const project = database.getProject();
+        const characterVerification = context.category === 'character';
         const stagingPath = path.join(database.rootPath, 'staging', job.id);
         mkdirSync(stagingPath, { recursive: true });
         const codexHealth = context.generatorProvider === 'codex' && typeof this.codex.health === 'function'
@@ -367,6 +440,21 @@ export class GenerationQueue extends EventEmitter {
           : null;
         if (codexHealth && codexHealth.state !== 'ready') {
           throw new Error(codexHealth.message || 'Codex nie jest gotowy.');
+        }
+        if (characterVerification) {
+          if (typeof this.codex.health !== 'function') {
+            throw new Error('Obowiązkowy analizator ruchu postaci (Codex) nie jest dostępny.');
+          }
+          const analyzerHealth = this.codex.health();
+          if (analyzerHealth.state !== 'ready') {
+            throw new Error(
+              analyzerHealth.message
+              || 'Obowiązkowy analizator ruchu postaci (Codex) nie jest gotowy.',
+            );
+          }
+          if (!context.characterAnimation) {
+            throw new Error('Zadanie postaci nie zawiera konfiguracji animacji kierunkowej.');
+          }
         }
         if (context.generatorProvider === 'comfyui' && this.comfy.health().state !== 'ready') {
           const refreshed = await this.comfy.refresh();
@@ -380,11 +468,11 @@ export class GenerationQueue extends EventEmitter {
         const threadId = context.generatorProvider === 'codex'
           ? await this.codex.ensureAssetThread(context.assetId, context.assetThreadId)
           : null;
-        const project = database.getProject();
         const projectReferences = database.listProjectReferences();
         const terrainVerification = isTileAssetCategory(context.category);
         const roadVerification = isRoadAssetCategory(context.category);
-        const maxAttempts = project.aiVerificationEnabled && (terrainVerification || roadVerification)
+        const maxAttempts = characterVerification
+          || (project.aiVerificationEnabled && (terrainVerification || roadVerification))
           ? MAX_GEOMETRY_ATTEMPTS
           : 1;
         let previousCandidate: string | null = null;
@@ -413,8 +501,14 @@ export class GenerationQueue extends EventEmitter {
           let generationMetadata: Record<string, unknown> = {};
           let codexTurnId: string | undefined;
           let resultItems: Array<Record<string, unknown>> = [];
+          let characterSourcePath: string | null = null;
+          let projectSettingsProposalIdsBeforeTurn = new Set<string>();
+          let projectSettingsProposalToolUsed = false;
 
           if (context.generatorProvider === 'codex') {
+            projectSettingsProposalIdsBeforeTurn = new Set(
+              database.listProjectSettingsProposals().map((proposal) => proposal.id),
+            );
             const input: Array<Record<string, unknown>> = [
               {
                 type: 'text',
@@ -430,7 +524,20 @@ export class GenerationQueue extends EventEmitter {
                     projectReferences,
                     project.aiVerificationEnabled,
                   )
-                  : terrainVerification
+                  : characterVerification
+                    ? buildCharacterRetryPrompt(
+                      context,
+                      project.projection,
+                      project.artBrief,
+                      project.styleSummary,
+                      project.tileWidthPx,
+                      project.tileHeightPx,
+                      attemptPath,
+                      verificationFeedback,
+                      projectReferences,
+                      Boolean(previousCandidate),
+                    )
+                    : terrainVerification
                     ? buildTerrainRetryPrompt(
                       context,
                       project.projection,
@@ -467,14 +574,20 @@ export class GenerationQueue extends EventEmitter {
               threadId!,
               input,
               generationOutputSchema,
-              (notification) => this.forwardCodexEvent(job.id, activeAttempt, notification),
-              roadVerification ? ROAD_GENERATION_TIMEOUT_MS : undefined,
+              (notification) => {
+                projectSettingsProposalToolUsed ||= isProjectSettingsProposalNotification(notification);
+                this.forwardCodexEvent(job.id, activeAttempt, notification);
+              },
+              roadVerification || characterVerification ? ROAD_GENERATION_TIMEOUT_MS : undefined,
               signal,
             );
             response = generationResponseSchema.parse(parseJson(result.finalMessage));
             codexTurnId = result.turnId;
             providerRunId = result.turnId;
             resultItems = result.items;
+            projectSettingsProposalToolUsed ||= resultItems.some((item) => (
+              describeRegistryCall(item).details.tool === 'registry.propose_project_settings'
+            ));
             generationMetadata = { skill: 'imagegen' };
           } else if (context.generatorProvider === 'comfyui') {
             const comfyOutput = path.join(attemptPath, roadVerification ? 'road-material.png' : 'final.png');
@@ -487,7 +600,10 @@ export class GenerationQueue extends EventEmitter {
               artBrief: project.artBrief,
               styleSummary: project.styleSummary,
               outputPath: comfyOutput,
-              outputSize: assetPixelSize(project, context),
+              outputSize: characterVerification
+                ? characterAnimationSheetSize(project, context, context.characterAnimation!)
+                : assetPixelSize(project, context),
+              characterAnimation: context.characterAnimation,
               roadAtlas: roadVerification,
               attempt: activeAttempt,
               verificationFeedback,
@@ -524,7 +640,10 @@ export class GenerationQueue extends EventEmitter {
               artBrief: project.artBrief,
               styleSummary: project.styleSummary,
               outputPath: stableDiffusionCppOutput,
-              outputSize: assetPixelSize(project, context),
+              outputSize: characterVerification
+                ? characterAnimationSheetSize(project, context, context.characterAnimation!)
+                : assetPixelSize(project, context),
+              characterAnimation: context.characterAnimation,
               roadAtlas: roadVerification,
               attempt: activeAttempt,
               verificationFeedback,
@@ -549,7 +668,14 @@ export class GenerationQueue extends EventEmitter {
             generationMetadata = stableDiffusionCppResult.metadata;
           }
           if (database.getJob(job.id)?.status === 'cancelled') return;
-          if (response.status === 'needs_user_decision' && !roadVerification) {
+          const createdProjectSettingsProposal = projectSettingsProposalToolUsed
+            && database.listProjectSettingsProposals().some((proposal) => (
+              !projectSettingsProposalIdsBeforeTurn.has(proposal.id)
+            ));
+          if (createdProjectSettingsProposal) {
+            throw new Error(response.message || 'Agent zaproponował zmianę ustawień projektu. Rozpatrz propozycję i ponów generację na zatwierdzonych ustawieniach.');
+          }
+          if (response.status === 'needs_user_decision' && !roadVerification && !characterVerification) {
             throw new Error(response.message || 'Generacja wymaga decyzji użytkownika. Sprawdź propozycje ustawień projektu i ponów próbę po ich rozpatrzeniu.');
           }
 
@@ -602,7 +728,42 @@ export class GenerationQueue extends EventEmitter {
                 : `Nie udało się uzyskać kompletu 16 wariantów drogi. ${verificationFeedback} Weryfikacja AI jest wyłączona, więc nie uruchomiono automatycznej korekty.`);
             }
           } else {
-            stagedFinal = resolveGeneratedFile(database, attemptPath, response.finalPath, resultItems);
+            try {
+              if (characterVerification) {
+                characterSourcePath = await resolveCharacterGeneratedFile(
+                  database,
+                  attemptPath,
+                  response.finalPath,
+                  resultItems,
+                  characterAnimationSheetSize(project, context, context.characterAnimation!),
+                );
+                stagedFinal = characterSourcePath;
+              } else {
+                stagedFinal = resolveGeneratedFile(database, attemptPath, response.finalPath, resultItems);
+              }
+            } catch (error) {
+              if (!characterVerification) throw error;
+              verificationFeedback = [
+                response.status === 'needs_user_decision' ? response.message : '',
+                error instanceof Error ? error.message : String(error),
+              ].filter(Boolean).join(' ');
+              this.log(database, job.id, 'verification', 'warning', activeAttempt, verificationFeedback);
+              if (activeAttempt < maxAttempts) {
+                this.log(
+                  database,
+                  job.id,
+                  'retry',
+                  'warning',
+                  activeAttempt,
+                  `Generator nie zapisał kandydata postaci. Zaplanowano automatyczną próbę ${activeAttempt + 1}/${maxAttempts}.`,
+                );
+                continue;
+              }
+              throw new Error(
+                `Nie udało się uzyskać poprawnej animacji ruchu postaci po ${maxAttempts} próbach. `
+                + verificationFeedback,
+              );
+            }
           }
           previousCandidate = stagedFinal;
           database.addArtifact(job.id, `candidate-attempt-${activeAttempt}`, database.relative(stagedFinal), 'image/png');
@@ -618,7 +779,162 @@ export class GenerationQueue extends EventEmitter {
           );
 
           let validated: Awaited<ReturnType<typeof validateTransparentPng>>;
-          if (terrainVerification) {
+          let characterMovementAnalysis: CharacterMovementAnalysis | undefined;
+          let characterPivot: { x: number; y: number } | undefined;
+          if (characterVerification) {
+            database.updateJob(job.id, 'generating', `${attemptLabel}: analiza ruchu postaci…`);
+            this.log(
+              database,
+              job.id,
+              'verification',
+              'info',
+              activeAttempt,
+              'Uruchomiono deterministyczną walidację arkusza i obowiązkową analizę ruchu przez osobnego agenta.',
+            );
+            const frameSize = characterAnimationFrameSize(project, context);
+            try {
+              const normalizedPath = path.join(attemptPath, 'normalized-character.png');
+              const normalization = await normalizeCharacterAnimationSource({
+                sourcePath: stagedFinal,
+                outputPath: normalizedPath,
+                frameWidthPx: frameSize.width,
+                frameHeightPx: frameSize.height,
+              });
+              stagedFinal = normalizedPath;
+              previousCandidate = stagedFinal;
+              generationMetadata = {
+                ...generationMetadata,
+                characterSourceNormalization: {
+                  normalized: normalization.normalized,
+                  scale: normalization.scale,
+                  sourceWidth: normalization.source.width,
+                  sourceHeight: normalization.source.height,
+                  outputWidth: normalization.output.width,
+                  outputHeight: normalization.output.height,
+                },
+              };
+              if (normalization.normalized) {
+                database.addArtifact(
+                  job.id,
+                  `normalized-candidate-attempt-${activeAttempt}`,
+                  database.relative(stagedFinal),
+                  'image/png',
+                );
+                this.log(
+                  database,
+                  job.id,
+                  'verification',
+                  'info',
+                  activeAttempt,
+                  `Przepakowano źródłowy arkusz ${normalization.source.width}×${normalization.source.height}px `
+                  + `do wymaganego ${normalization.output.width}×${normalization.output.height}px bez rozciągania klatek.`,
+                );
+              }
+              validated = await validateTransparentPng(stagedFinal);
+              const report = await validateCharacterAnimationSheet({
+                filePath: stagedFinal,
+                projection: project.projection,
+                frameWidthPx: frameSize.width,
+                frameHeightPx: frameSize.height,
+              });
+              characterPivot = characterPivotFromValidationReport(report);
+              const artifacts = await createCharacterAnimationAnalysisArtifacts({
+                filePath: stagedFinal,
+                projection: project.projection,
+                frameWidthPx: frameSize.width,
+                frameHeightPx: frameSize.height,
+                outputDirectory: path.join(attemptPath, 'movement-analysis'),
+                report,
+              });
+              database.addArtifact(
+                job.id,
+                `movement-board-attempt-${activeAttempt}`,
+                database.relative(artifacts.boardPath),
+                'image/png',
+              );
+              for (const strip of artifacts.directionStrips) {
+                database.addArtifact(
+                  job.id,
+                  `movement-${strip.direction}-attempt-${activeAttempt}`,
+                  database.relative(strip.filePath),
+                  'image/png',
+                );
+              }
+              for (let analysisAttempt = 1; analysisAttempt <= MAX_CHARACTER_ANALYSIS_ATTEMPTS; analysisAttempt += 1) {
+                try {
+                  characterMovementAnalysis = await this.analyzeCharacterMovement(
+                    database,
+                    job.id,
+                    context,
+                    project.projection,
+                    stagedFinal,
+                    artifacts.boardPath,
+                    artifacts.directionStrips,
+                    report,
+                    signal,
+                    activeAttempt,
+                  );
+                  break;
+                } catch (error) {
+                  if (!(error instanceof CharacterAnalyzerError)
+                    || signal.aborted
+                    || analysisAttempt === MAX_CHARACTER_ANALYSIS_ATTEMPTS) {
+                    throw error;
+                  }
+                  this.log(
+                    database,
+                    job.id,
+                    'retry',
+                    'warning',
+                    activeAttempt,
+                    `Analizator ruchu zwrócił błąd techniczny. Ponawiam samą analizę `
+                    + `${analysisAttempt + 1}/${MAX_CHARACTER_ANALYSIS_ATTEMPTS} bez ponownego generowania obrazu.`,
+                  );
+                }
+              }
+              if (!characterMovementAnalysis) {
+                throw new CharacterAnalyzerError('Obowiązkowy analizator ruchu nie zwrócił raportu.');
+              }
+              verificationFeedback = characterMovementAnalysis.summary;
+              if (characterMovementAnalysis.status !== 'passed') {
+                database.recordRejectedCharacterMovementAnalysis(
+                  context.versionId,
+                  characterMovementAnalysis,
+                );
+                throw new CharacterMovementRejectedError(formatCharacterMovementFeedback(characterMovementAnalysis));
+              }
+              this.log(
+                database,
+                job.id,
+                'verification',
+                'success',
+                activeAttempt,
+                characterMovementAnalysis.summary,
+              );
+            } catch (error) {
+              if (error instanceof CharacterAnalyzerError) throw error;
+              verificationFeedback = [
+                response.status === 'needs_user_decision' ? response.message : '',
+                error instanceof Error ? error.message : String(error),
+              ].filter(Boolean).join(' ');
+              this.log(database, job.id, 'verification', 'warning', activeAttempt, verificationFeedback);
+              if (activeAttempt < maxAttempts) {
+                this.log(
+                  database,
+                  job.id,
+                  'retry',
+                  'warning',
+                  activeAttempt,
+                  `Weryfikacja postaci nieudana. Zaplanowano automatyczną próbę ${activeAttempt + 1}/${maxAttempts}.`,
+                );
+                continue;
+              }
+              throw new Error(
+                `Nie udało się uzyskać poprawnej animacji ruchu postaci po ${maxAttempts} próbach. `
+                + verificationFeedback,
+              );
+            }
+          } else if (terrainVerification) {
             database.updateJob(job.id, 'generating', `${attemptLabel}: weryfikacja szwów 3×3…`);
             this.log(database, job.id, 'verification', 'info', activeAttempt, 'Uruchomiono deterministyczny test szwów 3×3.');
             try {
@@ -747,37 +1063,38 @@ export class GenerationQueue extends EventEmitter {
           }
 
           const versionDirectory = path.join(database.rootPath, 'assets', context.assetId, context.versionId);
-          mkdirSync(versionDirectory, { recursive: true });
           const finalPath = path.join(versionDirectory, 'final.png');
+          const sourcePath = characterVerification ? path.join(versionDirectory, 'source.png') : null;
           const thumbnailPath = path.join(versionDirectory, 'preview.webp');
-          copyFileSync(stagedFinal, finalPath);
           const storedRoadVariants = roadVerification
-            ? roadCandidateFiles.map((variant) => {
-              const variantsDirectory = path.join(versionDirectory, 'road-variants');
-              mkdirSync(variantsDirectory, { recursive: true });
-              const storedPath = path.join(variantsDirectory, path.basename(variant.filePath));
-              copyFileSync(variant.filePath, storedPath);
-              return {
-                connectionMask: variant.connectionMask,
-                finalPath: database.relative(storedPath),
-                width: project.tileWidthPx,
-                height: project.tileHeightPx,
-              };
-            })
+            ? roadCandidateFiles.map((variant) => ({
+              connectionMask: variant.connectionMask,
+              finalPath: database.relative(path.join(
+                versionDirectory,
+                'road-variants',
+                path.basename(variant.filePath),
+              )),
+              width: project.tileWidthPx,
+              height: project.tileHeightPx,
+            }))
             : undefined;
-          await createThumbnail(finalPath, thumbnailPath);
           const relativeFinal = database.relative(finalPath);
-          database.addArtifact(job.id, 'final', relativeFinal, 'image/png');
-          database.addArtifact(job.id, 'thumbnail', database.relative(thumbnailPath), 'image/webp');
-          database.finalizeGeneration(job.id, {
+          const relativeSource = sourcePath ? database.relative(sourcePath) : undefined;
+          const finalizationData = {
             finalPath: relativeFinal,
+            sourcePath: relativeSource,
             width: validated.width,
             height: validated.height,
             category: context.category,
             tags: response.tags,
-            pivot: response.pivot,
+            pivot: characterVerification
+              ? characterPivot ?? defaultPivot('character')
+              : response.pivot,
             description: response.description,
-            aiVerificationStatus: context.generatorProvider === 'codex' && project.aiVerificationEnabled ? 'passed' : 'pending',
+            aiVerificationStatus: characterVerification
+              ? 'passed'
+              : context.generatorProvider === 'codex' && project.aiVerificationEnabled ? 'passed' : 'pending',
+            aiVerificationMessage: characterMovementAnalysis?.summary,
             codexTurnId,
             generatorProvider: context.generatorProvider,
             generatorModel,
@@ -785,8 +1102,49 @@ export class GenerationQueue extends EventEmitter {
             providerRunId,
             generationMetadata: { ...generationMetadata, attempt: activeAttempt },
             roadVariants: storedRoadVariants,
-          });
-          if (context.generatorProvider !== 'codex'
+            characterAnimation: characterMovementAnalysis
+              ? {
+                settings: context.characterAnimation!,
+                directions: [...characterDirectionsForProjection(project.projection)],
+                frameSize: characterAnimationFrameSize(project, context),
+                sheetSize: characterAnimationSheetSize(project, context, context.characterAnimation!),
+                movementAnalysis: characterMovementAnalysis,
+              }
+              : undefined,
+          } satisfies GeneratedVersionData;
+          database.validateGenerationFinalization(job.id, finalizationData);
+          if (existsSync(versionDirectory)) {
+            throw new Error('Katalog finalnej wersji już istnieje; przerwano publikację, aby go nie nadpisać.');
+          }
+          try {
+            mkdirSync(versionDirectory, { recursive: true });
+            copyFileSync(stagedFinal, finalPath);
+            if (sourcePath && characterSourcePath) copyFileSync(characterSourcePath, sourcePath);
+            if (roadVerification) {
+              const variantsDirectory = path.join(versionDirectory, 'road-variants');
+              mkdirSync(variantsDirectory, { recursive: true });
+              for (const variant of roadCandidateFiles) {
+                copyFileSync(variant.filePath, path.join(variantsDirectory, path.basename(variant.filePath)));
+              }
+            }
+            await createThumbnail(finalPath, thumbnailPath);
+            database.finalizeGeneration(job.id, finalizationData);
+          } catch (error) {
+            rmSync(versionDirectory, { recursive: true, force: true });
+            throw error;
+          }
+          try {
+            database.addArtifact(job.id, 'final', relativeFinal, 'image/png');
+            if (relativeSource) database.addArtifact(job.id, 'source', relativeSource, 'image/png');
+            database.addArtifact(job.id, 'thumbnail', database.relative(thumbnailPath), 'image/webp');
+          } catch (error) {
+            this.logger.warn('generation.artifacts.register.failed', {
+              jobId: job.id,
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+          if (!characterVerification
+            && context.generatorProvider !== 'codex'
             && project.aiVerificationEnabled
             && this.codex.health().state === 'ready') {
             try {
@@ -816,6 +1174,100 @@ export class GenerationQueue extends EventEmitter {
         });
         this.emitEvent({ type: 'failed', jobId: job.id, message });
       }
+    }
+  }
+
+  private async analyzeCharacterMovement(
+    database: ProjectDatabase,
+    jobId: string,
+    context: JobContext,
+    projection: ProjectProjection,
+    sheetPath: string,
+    boardPath: string,
+    directionStrips: Array<{ direction: CharacterDirectionId; filePath: string }>,
+    report: CharacterAnimationValidationReport,
+    signal: AbortSignal,
+    attempt: number,
+  ): Promise<CharacterMovementAnalysis> {
+    const project = database.getProject();
+    const expectedDirections = characterDirectionsForProjection(projection);
+    const metrics = report.directions.map((direction) => ({
+      direction: direction.direction,
+      maxBaselineDriftPx: direction.maxBaselineDriftPx,
+      maxCentroidDriftPx: direction.maxCentroidDriftPx,
+      visibleAreaRatio: Number(direction.visibleAreaRatio.toFixed(3)),
+      walkTransitionRatios: direction.walkTransitionRatios.map((value) => Number(value.toFixed(4))),
+      loopTransitionRatio: Number(direction.loopTransitionRatio.toFixed(4)),
+    }));
+    database.updateJob(jobId, 'generating', `Próba ${attempt}: agent analizuje ruch w 4 kierunkach…`);
+    this.emitEvent({
+      type: 'progress',
+      jobId,
+      message: 'Osobny agent analizuje kierunki, fazy chodu, kontakt z podłożem i ciągłość pętli.',
+    });
+
+    try {
+      const analysisThreadId = await this.codex.startUtilityThread({
+        readOnly: true,
+        serviceName: 'tilemap-generator-character-analysis',
+      });
+      const result = await this.codex.runTurn(
+        analysisThreadId,
+        [
+          {
+            type: 'text',
+            text: [
+              'Wykonaj końcową, wyłącznie odczytową analizę animacji ruchu postaci. Nie generuj, nie edytuj i nie zapisuj żadnych plików.',
+              'Nie ufaj deklaracji generatora. Oceń widoczną sekwencję samodzielnie i failuj bezpiecznie przy każdej niepewności.',
+              `Postać: ${context.assetName}`,
+              `Opis: ${context.prompt || '(brak dodatkowego opisu)'}`,
+              context.feedback ? `Uwagi użytkownika: ${context.feedback}` : '',
+              `Tryb projektu: ${projection}; kierunki w wymaganej kolejności: ${expectedDirections.map((direction) => `${direction.shortLabel} (${direction.id})`).join(', ')}.`,
+              `Brief projektu: ${project.artBrief || '(brak)'}`,
+              `Kanoniczny styl: ${project.styleSummary || '(brak zatwierdzonych assetów)'}`,
+              `Kontrakt arkusza: 4 wiersze kierunków, po 5 kolumn: IDLE, W1 lewy kontakt, W2 passing, W3 prawy kontakt, W4 passing. Chód zapętla W4→W1 z prędkością ${context.characterAnimation!.framesPerSecond} FPS.`,
+              'Obraz 1 to pełny arkusz. Obraz 2 to plansza kontrolna z sekwencją IDLE,W1,W2,W3,W4,W1 dla każdego kierunku. Kolejne obrazy to powiększone paski kierunków w tej samej kolejności.',
+              `Metryki deterministyczne (pomocnicze, nie zastępują oceny semantycznej): ${JSON.stringify(metrics)}`,
+              'Dla KAŻDEGO kierunku sprawdź: poprawne zwrócenie i czytelny ruch w zadanym kierunku; tę samą tożsamość, strój, proporcje i liczbę kończyn; naturalne naprzemienne fazy nóg i ramion; stabilny punkt kontaktu z podłożem bez ślizgania stóp, teleportacji i dryfu korpusu; brak kadrowania i kolizji między komórkami; płynne przejścia oraz pętlę W4→W1.',
+              'Zwróć status passed tylko wtedy, gdy WSZYSTKIE cztery kierunki przechodzą. Każdy wpis directions musi wystąpić dokładnie raz i w podanej kolejności. W message podaj konkretną obserwację po polsku.',
+              'Zwróć wyłącznie JSON zgodny ze schematem.',
+            ].filter(Boolean).join('\n\n'),
+          },
+          { type: 'localImage', path: sheetPath, detail: 'original' },
+          { type: 'localImage', path: boardPath, detail: 'original' },
+          ...directionStrips.map((strip) => ({
+            type: 'localImage',
+            path: strip.filePath,
+            detail: 'original',
+          })),
+        ],
+        characterMovementAnalysisOutputSchema,
+        undefined,
+        ROAD_GENERATION_TIMEOUT_MS,
+        signal,
+        { readOnly: true },
+      );
+      const parsed = characterMovementAnalysisResponseSchema.parse(parseJson(result.finalMessage));
+      const actualDirections = parsed.directions.map((direction) => direction.direction);
+      const requiredDirections = expectedDirections.map((direction) => direction.id);
+      if (actualDirections.some((direction, index) => direction !== requiredDirections[index])) {
+        throw new Error(
+          `Raport ruchu musi zawierać dokładnie kierunki ${requiredDirections.join(', ')} w tej kolejności.`,
+        );
+      }
+      const everyDirectionPassed = parsed.directions.every((direction) => direction.status === 'passed');
+      const status = parsed.status === 'passed' && everyDirectionPassed ? 'passed' : 'failed';
+      return {
+        status,
+        summary: parsed.summary,
+        directions: parsed.directions,
+        turnId: result.turnId,
+        analyzedAt: new Date().toISOString(),
+      };
+    } catch (error) {
+      if (error instanceof CharacterMovementRejectedError) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      throw new CharacterAnalyzerError(`Obowiązkowa analiza ruchu postaci nie powiodła się: ${message}`);
     }
   }
 
@@ -874,6 +1326,27 @@ export class GenerationQueue extends EventEmitter {
   }
 }
 
+class CharacterAnalyzerError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CharacterAnalyzerError';
+  }
+}
+
+class CharacterMovementRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CharacterMovementRejectedError';
+  }
+}
+
+function formatCharacterMovementFeedback(analysis: CharacterMovementAnalysis): string {
+  const failedDirections = analysis.directions
+    .filter((direction) => direction.status === 'failed')
+    .map((direction) => `${direction.direction}: ${direction.message}`);
+  return [analysis.summary, ...failedDirections].filter(Boolean).join(' ');
+}
+
 function buildGenerationPrompt(
   context: JobContext,
   projection: ProjectProjection,
@@ -905,8 +1378,19 @@ function buildGenerationPrompt(
     { tileWidthPx: tileWidth, tileHeightPx: tileHeight },
     context,
   );
-  const geometryInstructions = isRoadAssetCategory(context.category)
-    ? buildRoadMaterialInstructions(tileWidth, tileHeight, projection, aiVerificationEnabled)
+  const geometryInstructions = context.category === 'character'
+    ? buildCharacterAnimationInstructions(
+      context,
+      projection,
+      relativePixelSize,
+      characterAnimationSheetSize(
+        { tileWidthPx: tileWidth, tileHeightPx: tileHeight },
+        context,
+        context.characterAnimation!,
+      ),
+    )
+    : isRoadAssetCategory(context.category)
+      ? buildRoadMaterialInstructions(tileWidth, tileHeight, projection, aiVerificationEnabled)
     : !isTerrainTile
     ? relativePixelSize
       ? [
@@ -965,6 +1449,13 @@ function buildGenerationPrompt(
       'Do not run background removal, chroma-key processing or the transparent-output helper. Do not use CLI/API and do not request OPENAI_API_KEY. The application creates geometry, shoulders, alpha, exact dimensions and all 16 variants after this turn.',
       `In the final JSON use ${path.join(stagingPath, 'road-material.png')} as finalPath.`,
     ].join('\n')
+    : context.category === 'character'
+      ? [
+        'Use exactly one built-in image generation call in this application attempt. The generated PNG is a native-resolution source sheet; the application owns alpha inspection, exact sizing, deterministic composition and retry.',
+        `Copy the best native PNG unchanged to exactly ${path.join(stagingPath, 'final.png')}, even when the generator chose a different canvas size or omitted alpha. Do not make a second image-generation/edit call to remove a background or checkerboard in this turn.`,
+        'Inspect transparency numerically from PNG metadata and alpha values, never from the preview or from RGB values hidden under alpha=0. If a real alpha channel and transparent pixels exist, accept that source without background removal.',
+        `In the final JSON use ${path.join(stagingPath, 'final.png')} as finalPath. The application will preserve the source, normalize all 20 cells and reject or retry it when necessary.`,
+      ].join('\n')
     : `Project-bound output: copy the final ${opaqueTopDownTerrain ? 'PNG' : 'transparent PNG'} to exactly ${path.join(stagingPath, 'final.png')}. Preserve any useful source as ${path.join(stagingPath, 'source.png')}.`;
   return [
     '$imagegen',
@@ -990,13 +1481,17 @@ function buildGenerationPrompt(
       ? 'Use the built-in image generation workflow. This source intentionally does not request transparency, so do not enter the imagegen transparent-output workflow.'
       : opaqueTopDownTerrain
         ? 'Use the built-in image generation workflow. This full-canvas terrain intentionally does not require transparency, so do not run background removal, chroma-key, or transparent-output helpers. Never switch to CLI/API or request OPENAI_API_KEY.'
+        : context.category === 'character'
+          ? 'Use the built-in image generation workflow once. Never switch to CLI/API or request OPENAI_API_KEY. Do not run a generative background-removal edit after the source is created; the application, not the agent preview, decides whether alpha is valid.'
         : 'Use the built-in image generation workflow. Follow the imagegen skill transparent-output workflow. Never switch to CLI/API or request OPENAI_API_KEY.',
     outputInstructions,
-    aiVerificationEnabled
-      ? isRoadAssetCategory(context.category)
+    context.category === 'character'
+      ? 'Do not claim that the movement is correct and do not skip frames. After this turn, the application runs a separate mandatory read-only motion-analysis turn over the saved sheet before it can become user-reviewable.'
+      : aiVerificationEnabled
+        ? isRoadAssetCategory(context.category)
         ? 'AI verification is enabled. Inspect the saved material swatch: it must be a coherent close-up surface filling the whole frame, with no chroma key, road silhouette, atlas, grid, junction or isolated object.'
         : 'AI verification is enabled. After saving the output, inspect the final image with image view and correct visible defects before returning the result.'
-      : 'AI verification is disabled by project settings. After the image generator saves the required PNG files, do not open them with image view, do not perform a subjective visual review, and do not regenerate them. Return the result immediately; the application will still run deterministic technical validation.',
+        : 'AI verification is disabled by project settings. After the image generator saves the required PNG files, do not open them with image view, do not perform a subjective visual review, and do not regenerate them. Return the result immediately; the application will still run deterministic technical validation.',
     'Use registry.list_tags and registry.search_assets when useful. Load only a small number of relevant approved assets with registry.get_asset.',
     'Project reference images are user-provided art direction. Use registry.list_references and registry.get_reference when their descriptions are relevant to this request.',
     'If a reference proves that the current art brief, base tile width, or PPU must change for a valid result, call registry.propose_project_settings with exact proposed values, a concrete reason, and the relevant referenceIds. Asset type, elevation height, and relative asset size belong to the asset and must never be proposed as project settings. This creates a proposal only and never grants approval.',
@@ -1006,11 +1501,15 @@ function buildGenerationPrompt(
     aiVerificationEnabled
       ? 'Choose pivot only after the final PNG is complete and inspected. Return it as normalized sprite coordinates in pivot; the user can override this recommendation during final review.'
       : 'Return the pivot from the category geometry and intended ground anchor without reopening the final PNG. The user can override it during final review.',
-    'Finish with JSON matching the supplied schema and put the actual final PNG path in finalPath.',
+    context.category === 'character'
+      ? 'Finish with JSON matching the supplied schema and put the native candidate PNG path in finalPath. It is an intermediate source until the application passes numeric validation and movement analysis.'
+      : 'Finish with JSON matching the supplied schema and put the actual final PNG path in finalPath.',
     isRoadAssetCategory(context.category)
       ? 'The road source is deliberately opaque and requires no transparency fallback. Do not return needs_user_decision merely because built-in image generation has no native alpha.'
       : opaqueTopDownTerrain
         ? 'Do not return needs_user_decision merely because this terrain has no transparent pixels; opaque edge-to-edge coverage is required.'
+        : context.category === 'character'
+          ? 'A failed canvas, alpha or spritesheet contract is not a user decision. Preserve the best generated PNG, return its real path, and let the application validate and retry it. Return needs_user_decision only after registry.propose_project_settings created a genuine settings proposal.'
         : 'If the built-in transparent workflow is genuinely unsuitable, do not use fallback; return status needs_user_decision and explain why in message.',
   ].filter(Boolean).join('\n\n');
 }
@@ -1030,7 +1529,13 @@ function buildPivotInstruction(
     const pivotY = 1 - (tileHeight / 2) / canvasHeight;
     return `Pivot recommendation: anchor the center of the top walkable diamond. For this exact canvas return normalized sprite pivot {"x":0.5,"y":${Number(pivotY.toFixed(6))}}.`;
   }
-  if (category === 'building' || category === 'character' || category === 'vegetation' || category === 'prop') {
+  if (category === 'character') {
+    return [
+      'Pivot recommendation: return the shared ground-contact pivot normalized inside ONE frame cell, not inside the complete spritesheet.',
+      'Use the same bottom-center foot anchor for idle and every walk frame; account for transparent padding so the feet remain fixed while the gait animates.',
+    ].join(' ');
+  }
+  if (category === 'building' || category === 'vegetation' || category === 'prop') {
     return [
       aiVerificationEnabled
         ? 'Pivot recommendation: inspect the finished alpha silhouette and place the anchor at its logical ground-contact point, usually bottom-center at the feet or base.'
@@ -1041,6 +1546,31 @@ function buildPivotInstruction(
   return aiVerificationEnabled
     ? 'Pivot recommendation: inspect the finished asset and choose its logical runtime anchor. Return normalized sprite coordinates, x left-to-right and y bottom-to-top, accounting for transparent padding.'
     : 'Pivot recommendation: use the logical runtime anchor established during composition. Return normalized sprite coordinates, x left-to-right and y bottom-to-top, accounting for planned transparent padding.';
+}
+
+function buildCharacterAnimationInstructions(
+  context: JobContext,
+  projection: ProjectProjection,
+  frameSize: { width: number; height: number } | null,
+  sheetSize: { width: number; height: number },
+): string {
+  if (!context.characterAnimation || !frameSize) {
+    throw new Error('Brakuje rozmiaru lub konfiguracji animacji postaci.');
+  }
+  const directions = characterDirectionsForProjection(projection);
+  return [
+    'Asset type: DIRECTIONAL CHARACTER ANIMATION SPRITESHEET. Generate one coherent playable character, not a portrait, pose sheet, turnaround, illustration or scene.',
+    `The application-delivered sheet will be exactly ${sheetSize.width}x${sheetSize.height}px with 5 columns and 4 rows. Imagegen may return a supported native canvas size; keep an equal 5-column by 4-row logical grid across that canvas and let the application extract and normalize every cell.`,
+    `Each delivered frame cell is ${frameSize.width}x${frameSize.height}px. Keep every source cell equal, leave transparent padding on all four cell edges, and never let a silhouette or equipped item cross into a neighboring cell.`,
+    `Rows from top to bottom are exactly: ${directions.map((direction) => `${direction.shortLabel} (${direction.id})`).join(', ')}.`,
+    'Column 1 is a grounded idle pose. Columns 2-5 are one chronological in-place walk loop: left-contact, passing, right-contact, passing.',
+    'This idle-and-walk contract overrides any additional request for a one-off action pose such as chopping, attacking or casting; express the profession through identity and equipment while keeping every required frame a valid idle or walk phase.',
+    `Playback speed is ${context.characterAnimation.framesPerSecond} FPS. The four walk frames must show real alternating gait phases rather than duplicated poses.`,
+    'Keep exactly the same character identity, face, outfit, colors, proportions, scale, lighting and silhouette language in all 20 cells.',
+    'Each row must face and visually move in its declared direction. Keep the root and shared ground-contact pivot fixed in every frame; animate limbs without foot sliding, body teleportation or camera movement.',
+    'The fourth walk frame must connect smoothly back to the first walk frame. Keep baseline, centroid, occupied area and transparent padding stable; do not crop the character or create extra/missing limbs.',
+    'Leave every cell background transparent, including all four cell corners. Held or worn equipment explicitly belonging to the character is allowed but must stay inside its cell. Do not draw a floor, cast shadow, unrelated props, arrows, text, direction names or a surrounding scene.',
+  ].join('\n');
 }
 
 function buildRoadMaterialInstructions(
@@ -1061,6 +1591,53 @@ function buildRoadMaterialInstructions(
       ? 'Inspect that the entire frame is useful road material with no visible layout or background. The application will create and validate all sixteen transparent variants after the turn.'
       : 'The application will create and validate all sixteen transparent variants from this opaque source.',
   ].filter(Boolean).join('\n');
+}
+
+function buildCharacterRetryPrompt(
+  context: JobContext,
+  projection: ProjectProjection,
+  artBrief: string,
+  styleSummary: string,
+  tileWidth: number,
+  tileHeight: number,
+  stagingPath: string,
+  verificationFeedback: string,
+  projectReferences: ProjectReference[],
+  hasPreviousCandidate: boolean,
+): string {
+  const frameSize = characterAnimationFrameSize(
+    { tileWidthPx: tileWidth, tileHeightPx: tileHeight },
+    context,
+  );
+  const sheetSize = characterAnimationSheetSize(
+    { tileWidthPx: tileWidth, tileHeightPx: tileHeight },
+    context,
+    context.characterAnimation!,
+  );
+  return [
+    '$imagegen',
+    'Use case: stylized-concept',
+    hasPreviousCandidate
+      ? 'Intent: repair the attached failed character animation spritesheet. It is Image 1. Preserve character identity and art direction while correcting the reported animation defects.'
+      : 'Intent: generate a replacement character animation spritesheet because the previous attempt did not preserve a usable PNG. Preserve the requested identity and art direction while satisfying the complete output contract.',
+    `Asset title: ${context.assetName}`,
+    context.prompt ? `Original additional request: ${context.prompt}` : '',
+    context.feedback ? `Requested user change: ${context.feedback}` : '',
+    `Mandatory deterministic/motion analyzer feedback: ${verificationFeedback}`,
+    `Project art brief: ${artBrief || '(not established)'}`,
+    `Canonical approved style summary: ${styleSummary || '(no approved assets yet)'}`,
+    formatProjectReferences(projectReferences),
+    buildCharacterAnimationInstructions(context, projection, frameSize, sheetSize),
+    hasPreviousCandidate
+      ? 'Inspect the failed sheet before editing. Correct every reported direction and loop issue; do not merely copy the failed frames or hide motion defects with blur, shadows or duplicated poses.'
+      : 'Create a fresh sheet that corrects every reported contract or animation defect; do not hide motion defects with blur, shadows or duplicated poses.',
+    'Use exactly one built-in image generation/edit call for this application retry. Never switch to CLI/API or request OPENAI_API_KEY. Do not launch a second generative background-removal pass; the application validates alpha numerically and controls further retries.',
+    `Copy the best native repaired PNG unchanged to exactly ${path.join(stagingPath, 'final.png')}, even if its native canvas dimensions differ from the delivery dimensions.`,
+    buildPivotInstruction('character', tileHeight, 0, frameSize.height, true),
+    'Finish with JSON matching the supplied schema, return category exactly as character, and put that actual PNG path in finalPath.',
+    'A failed canvas, alpha or spritesheet contract is not a user decision. Preserve the best generated PNG and return its path so the application can validate and retry it. Return needs_user_decision only after registry.propose_project_settings created a genuine settings proposal.',
+    'The application will run a fresh mandatory motion-analysis turn. Do not claim a pass yourself.',
+  ].filter(Boolean).join('\n\n');
 }
 
 function buildTerrainRetryPrompt(
@@ -1197,6 +1774,12 @@ function parseJson(value: string): unknown {
   return JSON.parse(trimmed);
 }
 
+function isProjectSettingsProposalNotification(notification: CodexNotification): boolean {
+  if (!notification.method.startsWith('item/')) return false;
+  const item = notification.params.item as Record<string, unknown> | undefined;
+  return Boolean(item && describeRegistryCall(item).details.tool === 'registry.propose_project_settings');
+}
+
 function generatorProviderLabel(provider: GeneratorProvider | undefined): string {
   if (provider === 'comfyui') return 'ComfyUI';
   if (provider === 'stable_diffusion_cpp') return 'stable-diffusion.cpp';
@@ -1221,6 +1804,86 @@ function summarizeTerrainSeamResult(
       ? 'Wymagana korekta: zachowaj pełny kwadrat 1:1 i bieżący canvas; usuń obrysy, cienie, uskoki oraz zmianę koloru na krawędziach; dopasuj lewą krawędź do prawej i górną do dolnej. Nie maskuj błędu overlapem, paddingiem, skalą ani zmianą offsetu siatki.'
       : 'Wymagana korekta: zachowaj dokładny romb 2:1 i bieżący canvas; usuń obrysy, cienie, uskoki oraz zmianę koloru na krawędziach; dopasuj top-left do bottom-right i top-right do bottom-left. Nie maskuj błędu overlapem, paddingiem, skalą ani zmianą offsetu siatki.',
   ].join(' ');
+}
+
+async function resolveCharacterGeneratedFile(
+  database: ProjectDatabase,
+  stagingPath: string,
+  reportedPath: string,
+  items: Array<Record<string, unknown>>,
+  expectedSize: { width: number; height: number },
+): Promise<string> {
+  const candidates: string[] = [];
+  const reported = reportedPath
+    ? (path.isAbsolute(reportedPath) ? reportedPath : path.resolve(stagingPath, reportedPath))
+    : '';
+  const expected = path.join(stagingPath, 'final.png');
+  if (existsSync(expected)) candidates.push(expected);
+  if (reported) candidates.push(reported);
+  for (const item of items) {
+    if (item.type === 'imageGeneration' && typeof item.savedPath === 'string') candidates.push(item.savedPath);
+  }
+  const stagedPngs = existsSync(stagingPath)
+    ? readdirSync(stagingPath).filter((name) => name.toLocaleLowerCase().endsWith('.png'))
+      .map((name) => path.join(stagingPath, name)).sort((left, right) => statSync(right).mtimeMs - statSync(left).mtimeMs)
+    : [];
+  candidates.push(...stagedPngs);
+
+  const projectPrefix = `${database.rootPath}${path.sep}`.toLocaleLowerCase();
+  const codexRoot = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'generated_images');
+  const codexPrefix = `${codexRoot}${path.sep}`.toLocaleLowerCase();
+  const allowed = [...new Set(candidates.map((candidate) => path.resolve(candidate)))].filter((candidate) => {
+    const lowered = candidate.toLocaleLowerCase();
+    return existsSync(candidate) && (lowered.startsWith(projectPrefix) || lowered.startsWith(codexPrefix));
+  });
+  if (!allowed.length) throw new Error('Generator nie zapisał finalnego PNG w katalogu projektu.');
+
+  const frameWidthPx = expectedSize.width / 5;
+  const frameHeightPx = expectedSize.height / 4;
+  if (!Number.isInteger(frameWidthPx) || !Number.isInteger(frameHeightPx)) {
+    throw new Error('Docelowy arkusz postaci nie dzieli się na kanoniczną siatkę 5×4.');
+  }
+  const projection = database.getProject().projection;
+  let selected = allowed[0];
+  let selectedScore = -1;
+  for (const [index, candidate] of allowed.entries()) {
+    let score = 0;
+    const evaluationPath = path.join(stagingPath, `.candidate-evaluation-${index}.png`);
+    try {
+      const inspection = await inspectCharacterAnimationSource(candidate);
+      if (inspection.usable) {
+        score = inspection.width === expectedSize.width && inspection.height === expectedSize.height ? 2 : 1;
+        try {
+          await normalizeCharacterAnimationSource({
+            sourcePath: candidate,
+            outputPath: evaluationPath,
+            frameWidthPx,
+            frameHeightPx,
+          });
+          await validateCharacterAnimationSheet({
+            filePath: evaluationPath,
+            projection,
+            frameWidthPx,
+            frameHeightPx,
+          });
+          score += 2;
+        } finally {
+          rmSync(evaluationPath, { force: true });
+        }
+      }
+    } catch {
+      // Unreadable candidates remain last-resort sources so validation can return actionable feedback.
+      rmSync(evaluationPath, { force: true });
+    }
+    if (score > selectedScore) {
+      selected = candidate;
+      selectedScore = score;
+    }
+  }
+
+  const stagedSource = path.join(stagingPath, 'selected-source.png');
+  if (path.resolve(selected) !== path.resolve(stagedSource)) copyFileSync(selected, stagedSource);
+  return stagedSource;
 }
 
 function resolveGeneratedFile(
@@ -1260,4 +1923,14 @@ function defaultPivot(category: AssetCategory): { x: number; y: number } {
   return isTileAssetCategory(category) || isRoadAssetCategory(category)
     ? { x: 0.5, y: 0.5 }
     : { x: 0.5, y: 0 };
+}
+
+function characterPivotFromValidationReport(
+  report: CharacterAnimationValidationReport,
+): { x: number; y: number } {
+  const lowestVisiblePixel = Math.max(
+    ...report.directions.flatMap((direction) => direction.frames.map((frame) => frame.bounds.bottom)),
+  );
+  const y = Math.max(0, Math.min(1, 1 - (lowestVisiblePixel + 1) / report.frameHeightPx));
+  return { x: 0.5, y: Number(y.toFixed(6)) };
 }

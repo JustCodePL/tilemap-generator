@@ -13,6 +13,8 @@ import {
   Layers3,
   LoaderCircle,
   PanelRight,
+  Pause,
+  PersonStanding,
   Play,
   RefreshCw,
   RotateCcw,
@@ -38,6 +40,7 @@ import type {
   GenerationJob,
   GenerationLogEntry,
   GenerationMode,
+  GeneratorProvider,
   ProjectInfo,
   ProjectProjection,
   ProjectReference,
@@ -53,6 +56,9 @@ import type {
 import {
   assetCategories,
   assetPixelSize,
+  characterAnimationFrameSize,
+  characterAnimationSheetSize,
+  characterDirectionsForProjection,
   defaultAssetSizing,
   isRelativeSizeCategory,
   isRoadAssetCategory,
@@ -61,7 +67,7 @@ import {
   tileHeightForProjection,
 } from '../../shared/domain';
 
-type View = 'project' | 'generate' | 'export' | 'diagnostics';
+type View = 'project' | 'generate' | 'characters' | 'export' | 'diagnostics';
 
 const categoryLabels: Record<AssetCategory, string> = {
   road_tile: 'Road tile',
@@ -79,10 +85,56 @@ const projectionLabels: Record<ProjectProjection, string> = {
   top_down: 'Top-down 1:1',
 };
 
+const generatorProviderOrder: readonly GeneratorProvider[] = ['codex', 'comfyui', 'stable_diffusion_cpp'];
+
+function newAssetGeneratorProviders(project: ProjectInfo): GeneratorProvider[] {
+  const selected = generatorProviderOrder.filter((provider) => provider === 'codex'
+    ? (project.codexGenerationEnabled ?? true)
+    : provider === 'comfyui'
+      ? (project.comfyUiEnabled ?? false)
+      : (project.stableDiffusionCppEnabled ?? false));
+  return selected.length ? selected : ['codex'];
+}
+
+function generatorProviderState(
+  provider: GeneratorProvider,
+  codexHealth?: CodexHealth,
+  comfyHealth?: ComfyUiHealth,
+  stableDiffusionCppHealth?: StableDiffusionCppHealth,
+): { ready: boolean; detail: string; message: string } {
+  if (provider === 'codex') return {
+    ready: codexHealth?.state === 'ready',
+    detail: codexHealth?.state === 'ready' ? 'Gotowy' : codexHealth?.message ?? 'Sprawdzanie…',
+    message: codexHealth?.message ?? 'Codex: sprawdzanie gotowości…',
+  };
+  if (provider === 'comfyui') return {
+    ready: comfyHealth?.state === 'ready',
+    detail: comfyHealth?.state === 'ready'
+      ? 'API gotowe'
+      : comfyHealth?.installed
+        ? `Comfy Desktop wykryty · API ${comfyHealth.server ? 'niegotowe' : 'offline'}`
+        : 'Comfy Desktop nie został wykryty',
+    message: comfyHealth?.message ?? 'ComfyUI: sprawdzanie gotowości…',
+  };
+  return {
+    ready: stableDiffusionCppHealth?.state === 'ready',
+    detail: stableDiffusionCppHealth?.state === 'ready'
+      ? 'CLI gotowe'
+      : stableDiffusionCppHealth?.installed
+        ? 'CLI wykryte · model niegotowy'
+        : 'CLI nie zostało wykryte',
+    message: stableDiffusionCppHealth?.message ?? 'stable-diffusion.cpp: sprawdzanie gotowości…',
+  };
+}
+
 function assetCategoriesForProjection(projection: ProjectProjection): readonly AssetCategory[] {
   return projection === 'top_down'
     ? assetCategories.filter((category) => category !== 'elevated_tile')
     : assetCategories;
+}
+
+function studioAssetCategoriesForProjection(projection: ProjectProjection): readonly AssetCategory[] {
+  return assetCategoriesForProjection(projection).filter((category) => category !== 'character');
 }
 
 export function App() {
@@ -106,6 +158,14 @@ export function App() {
     }
   }), [queryClient]);
 
+  useEffect(() => window.tilemap.projects.onChanged((project) => {
+    setSelectedAssetId(null);
+    setView('generate');
+    queryClient.clear();
+    queryClient.setQueryData(['project'], project);
+    void queryClient.invalidateQueries();
+  }), [queryClient]);
+
   if (projectQuery.isLoading) return <FullScreenLoader label="Otwieranie aplikacji…" />;
   if (!projectQuery.data) {
     return <Welcome onOpened={(project) => {
@@ -118,10 +178,14 @@ export function App() {
     <Workspace
       project={projectQuery.data}
       selectedAssetId={selectedAssetId}
-      onSelectAsset={(id) => { setSelectedAssetId(id); setView('generate'); }}
+      onSelectAsset={(id, category) => {
+        setSelectedAssetId(id);
+        setView(category === 'character' ? 'characters' : 'generate');
+      }}
       onNewAsset={() => { setSelectedAssetId(null); setView('generate'); }}
+      onNewCharacter={() => { setSelectedAssetId(null); setView('characters'); }}
       view={view}
-      onView={(next) => { setView(next); if (next !== 'generate') setSelectedAssetId(null); }}
+      onView={(next) => { setView(next); setSelectedAssetId(null); }}
       onClose={async () => {
         await window.tilemap.projects.close();
         setSelectedAssetId(null);
@@ -247,8 +311,9 @@ function Welcome({ onOpened }: { onOpened: (project: ProjectInfo) => void }) {
 function Workspace(props: {
   project: ProjectInfo;
   selectedAssetId: string | null;
-  onSelectAsset: (id: string) => void;
+  onSelectAsset: (id: string, category: AssetCategory) => void;
   onNewAsset: () => void;
+  onNewCharacter: () => void;
   view: View;
   onView: (view: View) => void;
   onClose: () => void;
@@ -256,7 +321,7 @@ function Workspace(props: {
   const assets = useQuery({ queryKey: ['assets'], queryFn: () => window.tilemap.assets.list(), refetchInterval: 5_000 });
   const jobs = useQuery({ queryKey: ['jobs'], queryFn: () => window.tilemap.generation.jobs(), refetchInterval: 2_000 });
   const health = useQuery({ queryKey: ['codex-health'], queryFn: () => window.tilemap.codex.health(), refetchInterval: 10_000 });
-  const comfyHealth = useQuery({ queryKey: ['comfy-health'], queryFn: () => window.tilemap.comfy.health(), refetchInterval: 10_000 });
+  const comfyHealth = useQuery({ queryKey: ['comfy-health'], queryFn: () => window.tilemap.comfy.refresh(), refetchInterval: 10_000 });
   const stableDiffusionCppHealth = useQuery({
     queryKey: ['stable-diffusion-cpp-health'],
     queryFn: () => window.tilemap.stableDiffusionCpp.health(),
@@ -278,6 +343,7 @@ function Workspace(props: {
         <button className={`project-title ${props.view === 'project' ? 'active' : ''}`} aria-label={`Strona główna projektu ${props.project.name}`} onClick={() => props.onView('project')}><div className="brand-mark small"><Layers3 size={20} /></div><div><strong>{props.project.name}</strong><span>baza {props.project.tileWidthPx}×{props.project.tileHeightPx}px · {props.project.projection === 'isometric' ? '2:1' : '1:1'}</span></div><ChevronRight /></button>
         <nav>
           <button className={props.view === 'generate' ? 'active' : ''} onClick={() => props.onView('generate')}><Sparkles /> Studio</button>
+          <button className={props.view === 'characters' ? 'active' : ''} onClick={() => props.onView('characters')}><PersonStanding /> Postacie</button>
           <button className={props.view === 'export' ? 'active' : ''} onClick={() => props.onView('export')}><Download /> Eksport</button>
           <button className={props.view === 'diagnostics' ? 'active' : ''} onClick={() => props.onView('diagnostics')}><Settings2 /> Diagnostyka</button>
         </nav>
@@ -285,15 +351,18 @@ function Workspace(props: {
       </header>
       <div className="workspace-grid">
         <aside className="asset-sidebar">
-          <button className="new-asset" onClick={props.onNewAsset}><ImagePlus /> Nowy asset</button>
+          <button className="new-asset" onClick={props.view === 'characters' ? props.onNewCharacter : props.onNewAsset}>
+            {props.view === 'characters' ? <PersonStanding /> : <ImagePlus />}
+            {props.view === 'characters' ? 'Nowa postać' : 'Nowy asset'}
+          </button>
           <div className="search-box"><Search size={16} /><input placeholder="Szukaj po nazwie lub tagu" value={filter} onChange={(event) => setFilter(event.target.value)} /></div>
           <div className="sidebar-label"><span>REGISTRY</span><small>{assets.data?.length ?? 0}</small></div>
           <div className="asset-list">
-            {visibleAssets.map((asset) => <AssetListItem key={asset.id} asset={asset} active={props.selectedAssetId === asset.id} onClick={() => props.onSelectAsset(asset.id)} />)}
+            {visibleAssets.map((asset) => <AssetListItem key={asset.id} asset={asset} active={props.selectedAssetId === asset.id} onClick={() => props.onSelectAsset(asset.id, asset.latestVersion?.category ?? asset.category)} />)}
             {!visibleAssets.length && <div className="empty-compact"><SquareStack /><span>Brak assetów</span></div>}
           </div>
         </aside>
-        <section className={`content-area ${props.view === 'generate' && props.selectedAssetId ? 'asset-review-content' : ''}`}>
+        <section className={`content-area ${['generate', 'characters'].includes(props.view) && props.selectedAssetId ? 'asset-review-content' : ''}`}>
           <ProjectSettingsProposalNotice onOpen={() => props.onView('project')} />
           {props.view === 'project' && <ProjectHome project={props.project} codexHealth={health.data} comfyHealth={comfyHealth.data} stableDiffusionCppHealth={stableDiffusionCppHealth.data} />}
           {props.view === 'generate' && (props.selectedAssetId
@@ -305,10 +374,24 @@ function Workspace(props: {
               onSelectVersion={setSelectedVersionId}
             />
             : <GenerationStudio project={props.project} codexHealth={health.data} comfyHealth={comfyHealth.data} stableDiffusionCppHealth={stableDiffusionCppHealth.data} />)}
+          {props.view === 'characters' && (props.selectedAssetId
+            ? <AssetReview
+              assetId={props.selectedAssetId}
+              jobs={jobs.data ?? []}
+              project={props.project}
+              selectedVersionId={selectedVersionId}
+              onSelectVersion={setSelectedVersionId}
+            />
+            : <CharacterStudio
+              project={props.project}
+              codexHealth={health.data}
+              comfyHealth={comfyHealth.data}
+              stableDiffusionCppHealth={stableDiffusionCppHealth.data}
+            />)}
           {props.view === 'export' && <ExportView project={props.project} assets={assets.data ?? []} />}
           {props.view === 'diagnostics' && <DiagnosticsView codexHealth={health.data} comfyHealth={comfyHealth.data} stableDiffusionCppHealth={stableDiffusionCppHealth.data} />}
         </section>
-        {props.view === 'generate' && props.selectedAssetId
+        {['generate', 'characters'].includes(props.view) && props.selectedAssetId
           ? <AssetAttemptsSidebar
             assetId={props.selectedAssetId}
             selectedVersionId={selectedVersionId}
@@ -423,10 +506,10 @@ export function ProjectHome({
         <p>Określa, ile różnych assetów kolejka może generować równolegle. Zmniejszenie limitu nie przerywa już uruchomionych zadań.</p>
         <label className="ai-verification-toggle">
           <input type="checkbox" checked={aiVerificationEnabled} onChange={(event) => setAiVerificationEnabled(event.target.checked)} />
-          <span><strong>Weryfikacja AI po generowaniu</strong><small>Codex ogląda wynik i może wykonać automatyczną korektę. Po wyłączeniu gotowy asset można sprawdzić później przyciskiem Weryfikacja. Kontrole techniczne PNG pozostają aktywne.</small></span>
+          <span><strong>Weryfikacja AI po generowaniu</strong><small>Codex ogląda wynik i może wykonać automatyczną korektę. Po wyłączeniu gotowy asset można sprawdzić później przyciskiem Weryfikacja. Kontrole techniczne PNG oraz obowiązkowa analiza ruchu postaci pozostają aktywne.</small></span>
         </label>
         <div className="generator-settings">
-          <p><strong>Generatory wariantów</strong><small>Każdy aktywny generator tworzy osobną wersję tego samego assetu.</small></p>
+          <p><strong>Domyślne generatory nowych assetów</strong><small>Każdy wybrany generator tworzy osobny wariant. Wybór z ostatnio uruchomionej generacji jest zapamiętywany tutaj.</small></p>
           <label className="ai-verification-toggle">
             <input type="checkbox" checked={codexGenerationEnabled} onChange={(event) => setCodexGenerationEnabled(event.target.checked)} />
             <span><strong>Codex + imagegen</strong><small>{codexHealth?.state === 'ready' ? 'Online' : codexHealth?.message ?? 'Sprawdzanie…'}</small></span>
@@ -582,7 +665,9 @@ function AssetListItem({ asset, active, onClick }: { asset: AssetSummary; active
   const category = version?.category ?? asset.category;
   const relativeWidth = version?.relativeWidth ?? asset.relativeWidth;
   const relativeHeight = version?.relativeHeight ?? asset.relativeHeight;
-  const dimensionSummary = isRelativeSizeCategory(category)
+  const dimensionSummary = category === 'character' && version?.characterAnimation
+    ? ` · Chód · ${version.characterAnimation.directions.length} kierunki · ${version.characterAnimation.settings.framesPerDirection} kl./kierunek`
+    : isRelativeSizeCategory(category)
     ? ` · obraz ${relativeWidth}×${relativeHeight}${version ? ` · siatka ${version.footprint.x}×${version.footprint.y}` : ''}`
     : '';
   return <button className={`asset-row ${active ? 'active' : ''}`} onClick={onClick}>
@@ -590,6 +675,53 @@ function AssetListItem({ asset, active, onClick }: { asset: AssetSummary; active
     <div className="asset-row-copy"><strong>{asset.name}</strong><span>{categoryLabels[category]}{category === 'elevated_tile' ? ` · h${version?.elevationLevels ?? asset.elevationLevels}` : ''}{dimensionSummary} · {asset.versionCount} wer.</span><StatusBadge status={version?.status ?? 'queued'} /></div>
     <ChevronRight size={16} />
   </button>;
+}
+
+function GeneratorProviderPicker({
+  selected,
+  onChange,
+  codexHealth,
+  comfyHealth,
+  stableDiffusionCppHealth,
+}: {
+  selected: GeneratorProvider[];
+  onChange: (providers: GeneratorProvider[]) => void;
+  codexHealth?: CodexHealth;
+  comfyHealth?: ComfyUiHealth;
+  stableDiffusionCppHealth?: StableDiffusionCppHealth;
+}) {
+  const labels: Record<GeneratorProvider, { name: string; description: string }> = {
+    codex: { name: 'Codex imagegen', description: 'Generacja przez Codex i model obrazowy.' },
+    comfyui: { name: 'ComfyUI', description: 'Lokalny workflow uruchomiony przez Comfy Desktop.' },
+    stable_diffusion_cpp: { name: 'stable-diffusion.cpp', description: 'Lokalny, natywny generator uruchamiany z CLI.' },
+  };
+  const toggle = (provider: GeneratorProvider, checked: boolean) => {
+    const next = checked
+      ? generatorProviderOrder.filter((candidate) => candidate === provider || selected.includes(candidate))
+      : selected.filter((candidate) => candidate !== provider);
+    if (next.length) onChange([...next]);
+  };
+
+  return <fieldset className="generator-picker">
+    <legend>Generatory tego assetu</legend>
+    <p>Wybierz jeden lub kilka wariantów. Po uruchomieniu generacji ten wybór zostanie zapamiętany dla następnego nowego assetu w projekcie.</p>
+    <div className="generator-options">
+      {generatorProviderOrder.map((provider) => {
+        const state = generatorProviderState(provider, codexHealth, comfyHealth, stableDiffusionCppHealth);
+        const label = labels[provider];
+        return <label className={`generator-option ${selected.includes(provider) ? 'selected' : ''} ${state.ready ? 'ready' : 'unavailable'}`} key={provider}>
+          <input
+            type="checkbox"
+            checked={selected.includes(provider)}
+            disabled={selected.length === 1 && selected.includes(provider)}
+            onChange={(event) => toggle(provider, event.target.checked)}
+          />
+          <span className="generator-option-copy"><strong>{label.name}</strong><small>{label.description}</small></span>
+          <span className="generator-option-status">{state.ready ? <Check /> : <CircleDot />}{state.detail}</span>
+        </label>;
+      })}
+    </div>
+  </fieldset>;
 }
 
 function GenerationStudio({
@@ -612,7 +744,14 @@ function GenerationStudio({
   const [relativeHeight, setRelativeHeight] = useState(1);
   const [footprintX, setFootprintX] = useState(1);
   const [footprintY, setFootprintY] = useState(1);
+  const [selectedProviders, setSelectedProviders] = useState<GeneratorProvider[]>(() => newAssetGeneratorProviders(project));
   const [error, setError] = useState('');
+  useEffect(() => setSelectedProviders(newAssetGeneratorProviders(project)), [
+    project.id,
+    project.codexGenerationEnabled,
+    project.comfyUiEnabled,
+    project.stableDiffusionCppEnabled,
+  ]);
   const fixedFootprint = isTileAssetCategory(category) || isRoadAssetCategory(category);
   const mutation = useMutation({
     mutationFn: () => window.tilemap.generation.enqueue({
@@ -624,39 +763,33 @@ function GenerationStudio({
       relativeWidth: isRelativeSizeCategory(category) ? relativeWidth : undefined,
       relativeHeight: isRelativeSizeCategory(category) ? relativeHeight : undefined,
       footprint: fixedFootprint ? { x: 1, y: 1 } : { x: footprintX, y: footprintY },
+      generatorProviders: selectedProviders,
     }),
     onSuccess: () => {
       setName(''); setPrompt(''); setError('');
       void queryClient.invalidateQueries({ queryKey: ['jobs'] });
       void queryClient.invalidateQueries({ queryKey: ['assets'] });
+      void queryClient.invalidateQueries({ queryKey: ['project'] });
     },
     onError: (reason) => setError(errorMessage(reason)),
   });
-  const codexEnabled = project.codexGenerationEnabled ?? true;
-  const comfyEnabled = project.comfyUiEnabled ?? false;
-  const stableDiffusionCppEnabled = project.stableDiffusionCppEnabled ?? false;
-  const codexReady = !codexEnabled || codexHealth?.state === 'ready';
-  const comfyReady = !comfyEnabled || comfyHealth?.state === 'ready';
-  const stableDiffusionCppReady = !stableDiffusionCppEnabled || stableDiffusionCppHealth?.state === 'ready';
-  const ready = (codexEnabled || comfyEnabled || stableDiffusionCppEnabled)
-    && codexReady
-    && comfyReady
-    && stableDiffusionCppReady;
-  const generatorCount = Number(codexEnabled) + Number(comfyEnabled) + Number(stableDiffusionCppEnabled);
-  const readinessMessage = !codexReady
-    ? codexHealth?.message
-    : !comfyReady
-      ? comfyHealth?.message
-      : !stableDiffusionCppReady
-        ? stableDiffusionCppHealth?.message
-        : 'Włącz co najmniej jeden generator w ustawieniach projektu.';
+  const selectedProviderStates = selectedProviders.map((provider) => ({
+    provider,
+    ...generatorProviderState(provider, codexHealth, comfyHealth, stableDiffusionCppHealth),
+  }));
+  const unavailableProvider = selectedProviderStates.find((provider) => !provider.ready);
+  const ready = selectedProviders.length > 0 && !unavailableProvider;
+  const generatorCount = selectedProviders.length;
+  const readinessMessage = selectedProviders.length === 0
+    ? 'Wybierz co najmniej jeden generator dla tego assetu.'
+    : unavailableProvider?.message;
   const expectedSize = assetPixelSize(project, {
     category,
     elevationLevels,
     relativeWidth,
     relativeHeight,
   });
-  const availableCategories = assetCategoriesForProjection(project.projection);
+  const availableCategories = studioAssetCategoriesForProjection(project.projection);
   const changeCategory = (next: AssetCategory) => {
     if (project.projection === 'top_down' && next === 'elevated_tile') return;
     const defaults = defaultAssetSizing(next);
@@ -671,7 +804,7 @@ function GenerationStudio({
   };
 
   return <div className="studio-page">
-    <div className="section-heading"><div><p className="eyebrow">NOWA GENERACJA</p><h2>Co budujemy?</h2><p>Podaj nazwę assetu. Każdy aktywny generator przygotuje osobny wariant do porównania.</p></div><div className="grid-chip"><span>{project.tileWidthPx}</span><small>×</small><span>{project.tileHeightPx}</span><em>px</em></div></div>
+    <div className="section-heading"><div><p className="eyebrow">NOWA GENERACJA</p><h2>Co budujemy?</h2><p>Podaj nazwę assetu i wybierz generatory, których chcesz użyć. Każdy z nich przygotuje osobny wariant do porównania.</p></div><div className="grid-chip"><span>{project.tileWidthPx}</span><small>×</small><span>{project.tileHeightPx}</span><em>px</em></div></div>
     {!ready && <ErrorBox message={readinessMessage ?? 'Generatory nie są jeszcze gotowe.'} />}
     <div className="request-card">
       <div className="form-grid two"><label>Nazwa assetu<input placeholder="Kamienna droga" value={name} onChange={(event) => setName(event.target.value)} /></label><label>Typ assetu<select value={category} onChange={(event) => changeCategory(event.target.value as AssetCategory)}>{availableCategories.map((item) => <option key={item} value={item}>{categoryLabels[item]}</option>)}</select></label></div>
@@ -680,6 +813,13 @@ function GenerationStudio({
       {category === 'flat_tile' && <AssetCanvasSummary size={expectedSize} base={project} detail={project.projection === 'isometric' ? 'Bazowy romb 2:1' : 'Bazowy kwadrat 1:1'} />}
       {category === 'road_tile' && <div className="road-settings"><RoadSetSummary projection={project.projection} /><AssetCanvasSummary size={expectedSize} base={project} detail="16 transparentnych nakładek 1×1" /></div>}
       <label>Opis dla agenta (opcjonalnie)<textarea className="hero-textarea" rows={8} placeholder="Możesz doprecyzować wygląd, materiały lub detale…" value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
+      <GeneratorProviderPicker
+        selected={selectedProviders}
+        onChange={setSelectedProviders}
+        codexHealth={codexHealth}
+        comfyHealth={comfyHealth}
+        stableDiffusionCppHealth={stableDiffusionCppHealth}
+      />
       <div className="request-footer">
         <div className="footprint-control">
           <span><strong>Zajęte komórki (footprint)</strong><small>{fixedFootprint ? 1 : footprintX * footprintY} {!fixedFootprint && footprintX * footprintY !== 1 ? 'pola' : 'pole'} łącznie</small></span>
@@ -693,6 +833,135 @@ function GenerationStudio({
     </div>
     <div className="process-strip"><ProcessStep number="01" title="Generacja" detail="Codex, ComfyUI i/lub stable-diffusion.cpp" /><ProcessStep number="02" title="Review" detail="Wspólna walidacja i wybór" /><ProcessStep number="03" title="Registry" detail="Provenance + historia" /></div>
   </div>;
+}
+
+function CharacterStudio({
+  project,
+  codexHealth,
+  comfyHealth,
+  stableDiffusionCppHealth,
+}: {
+  project: ProjectInfo;
+  codexHealth?: CodexHealth;
+  comfyHealth?: ComfyUiHealth;
+  stableDiffusionCppHealth?: StableDiffusionCppHealth;
+}) {
+  const queryClient = useQueryClient();
+  const [name, setName] = useState('');
+  const [prompt, setPrompt] = useState('');
+  const [relativeWidth, setRelativeWidth] = useState(0.5);
+  const [relativeHeight, setRelativeHeight] = useState(1.5);
+  const [footprintX, setFootprintX] = useState(1);
+  const [footprintY, setFootprintY] = useState(1);
+  const [framesPerSecond, setFramesPerSecond] = useState(8);
+  const [selectedProviders, setSelectedProviders] = useState<GeneratorProvider[]>(() => newAssetGeneratorProviders(project));
+  const [error, setError] = useState('');
+  useEffect(() => setSelectedProviders(newAssetGeneratorProviders(project)), [
+    project.id,
+    project.codexGenerationEnabled,
+    project.comfyUiEnabled,
+    project.stableDiffusionCppEnabled,
+  ]);
+  const directions = characterDirectionsForProjection(project.projection);
+  const animationSettings = { action: 'walk' as const, framesPerDirection: 4 as const, framesPerSecond };
+  const frameSize = characterAnimationFrameSize(project, { relativeWidth, relativeHeight });
+  const sheetSize = characterAnimationSheetSize(frameSize, animationSettings);
+  const selectedProviderStates = selectedProviders.map((provider) => ({
+    provider,
+    ...generatorProviderState(provider, codexHealth, comfyHealth, stableDiffusionCppHealth),
+  }));
+  const unavailableProvider = selectedProviderStates.find((provider) => !provider.ready);
+  const generatorCount = selectedProviders.length;
+  const analyzerReady = codexHealth?.state === 'ready';
+  const generatorsReady = generatorCount > 0 && !unavailableProvider;
+  const ready = analyzerReady && generatorsReady;
+  const readinessMessage = !analyzerReady
+    ? `Obowiązkowy analizator ruchu Codex nie jest gotowy. ${codexHealth?.message ?? 'Sprawdzanie połączenia…'}`
+    : generatorCount === 0
+      ? 'Wybierz co najmniej jeden generator dla tej postaci.'
+      : unavailableProvider?.message ?? '';
+  const valid = name.trim().length >= 2
+    && relativeWidth >= 0.25 && relativeWidth <= 16
+    && relativeHeight >= 0.25 && relativeHeight <= 16
+    && footprintX >= 1 && footprintX <= 64
+    && footprintY >= 1 && footprintY <= 64
+    && framesPerSecond >= 1 && framesPerSecond <= 24;
+  const mutation = useMutation({
+    mutationFn: () => window.tilemap.generation.enqueue({
+      name,
+      prompt,
+      mode: 'generate',
+      category: 'character',
+      relativeWidth,
+      relativeHeight,
+      footprint: { x: footprintX, y: footprintY },
+      characterAnimation: animationSettings,
+      generatorProviders: selectedProviders,
+    }),
+    onSuccess: () => {
+      setName(''); setPrompt(''); setError('');
+      void queryClient.invalidateQueries({ queryKey: ['jobs'] });
+      void queryClient.invalidateQueries({ queryKey: ['assets'] });
+      void queryClient.invalidateQueries({ queryKey: ['project'] });
+    },
+    onError: (reason) => setError(errorMessage(reason)),
+  });
+
+  return <div className="studio-page character-studio">
+    <div className="section-heading">
+      <div><p className="eyebrow">STUDIO POSTACI</p><h2>Postać gotowa do ruchu</h2><p>Wygeneruj spójny arkusz z bezruchem i chodem we wszystkich kierunkach bieżącej projekcji.</p></div>
+      <div className="grid-chip"><PersonStanding /><span>5</span><small>×</small><span>4</span><em>klatki</em></div>
+    </div>
+    {!ready && <ErrorBox message={readinessMessage || 'Generatory nie są jeszcze gotowe.'} />}
+    <div className="request-card character-request-card">
+      <div className="form-grid two">
+        <label>Nazwa postaci<input placeholder="Strażniczka lasu" value={name} onChange={(event) => setName(event.target.value)} /></label>
+        <label>Klatki na sekundę (FPS)<input type="number" min={1} max={24} step={1} value={framesPerSecond} onChange={(event) => setFramesPerSecond(Number(event.target.value))} /></label>
+      </div>
+      <CharacterDirectionSummary projection={project.projection} />
+      <div className="character-animation-settings">
+        <div className="form-grid two">
+          <label>Szerokość klatki (× tile)<input type="number" min={0.25} max={16} step={0.25} value={relativeWidth} onChange={(event) => setRelativeWidth(Number(event.target.value))} /></label>
+          <label>Wysokość klatki (× tile)<input type="number" min={0.25} max={16} step={0.25} value={relativeHeight} onChange={(event) => setRelativeHeight(Number(event.target.value))} /></label>
+        </div>
+        <div className="character-sheet-summary" role="note">
+          <SquareStack />
+          <div><strong>{frameSize.width}×{frameSize.height}px / klatkę</strong><span>Arkusz {sheetSize.width}×{sheetSize.height}px</span><small>Kolumna 1: idle · kolumny 2–5: chód</small></div>
+        </div>
+      </div>
+      <label>Opis postaci dla agenta (opcjonalnie)<textarea className="hero-textarea" rows={7} placeholder="Sylwetka, strój, wyposażenie, sposób poruszania się…" value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
+      <div className="mandatory-analysis-note" role="note">
+        <CircleDot />
+        <div><strong>Analiza ruchu jest obowiązkowa</strong><span>Po wygenerowaniu Codex obejrzy idle i pełną pętlę chodu w każdym z 4 kierunków. Dopiero zaliczony komplet trafi do review — niezależnie od ogólnego przełącznika weryfikacji AI.</span></div>
+      </div>
+      <GeneratorProviderPicker
+        selected={selectedProviders}
+        onChange={setSelectedProviders}
+        codexHealth={codexHealth}
+        comfyHealth={comfyHealth}
+        stableDiffusionCppHealth={stableDiffusionCppHealth}
+      />
+      <div className="request-footer">
+        <div className="footprint-control">
+          <span><strong>Zajęte komórki (footprint)</strong><small>{footprintX * footprintY} {footprintX * footprintY === 1 ? 'pole' : 'pola'} łącznie</small></span>
+          <input aria-label="Footprint X postaci — zajęte komórki" type="number" min={1} max={64} value={footprintX} onChange={(event) => setFootprintX(Number(event.target.value))} />
+          <small>×</small>
+          <input aria-label="Footprint Y postaci — zajęte komórki" type="number" min={1} max={64} value={footprintY} onChange={(event) => setFootprintY(Number(event.target.value))} />
+        </div>
+        <button className="primary" disabled={!ready || !valid || mutation.isPending} onClick={() => mutation.mutate()}>{mutation.isPending ? <LoaderCircle className="spin" /> : <PersonStanding />} Generuj {generatorCount > 1 ? `${generatorCount} warianty postaci` : 'postać'}</button>
+      </div>
+      {error && <ErrorBox message={error} />}
+    </div>
+    <div className="process-strip character-process-strip"><ProcessStep number="01" title="Arkusz" detail="Idle + 4 klatki chodu" /><ProcessStep number="02" title="Kierunki" detail={directions.map((direction) => direction.shortLabel).join(' / ')} /><ProcessStep number="03" title="Analiza ruchu" detail="Obowiązkowa kontrola Codex" /><ProcessStep number="04" title="Review" detail="Dopiero po zaliczeniu" /></div>
+  </div>;
+}
+
+function CharacterDirectionSummary({ projection }: { projection: ProjectProjection }) {
+  const directions = characterDirectionsForProjection(projection);
+  return <section className="character-direction-summary" aria-label="Kierunki animacji postaci">
+    <div><PersonStanding /><span><strong>Pełny zestaw 4 kierunków</strong><small>{projection === 'isometric' ? 'Izometryczne osie ekranu' : 'Top-down, osie świata'}</small></span></div>
+    <div className="character-direction-chips">{directions.map((direction) => <span className="direction-chip" key={direction.id} title={direction.label}><b>{direction.shortLabel}</b>{direction.label}</span>)}</div>
+  </section>;
 }
 
 function ProcessStep({ number, title, detail }: { number: string; title: string; detail: string }) {
@@ -737,6 +1006,8 @@ function AssetReview({
   const [repeatTerrain, setRepeatTerrain] = useState(false);
   const [singleZoom, setSingleZoom] = useState(100);
   const [seamZoom, setSeamZoom] = useState(100);
+  const [seamColumns, setSeamColumns] = useState(3);
+  const [seamRows, setSeamRows] = useState(3);
   const [showError, setShowError] = useState(false);
   const [retryError, setRetryError] = useState('');
   const [verificationError, setVerificationError] = useState('');
@@ -791,7 +1062,9 @@ function AssetReview({
   if (detail.isLoading || !asset || !version) return <FullScreenLoader label="Wczytywanie assetu…" compact />;
 
   const isTerrain = isTileAssetCategory(version.category);
-  const expectedAssetSize = assetPixelSize(project, version);
+  const expectedAssetSize = version.category === 'character' && version.characterAnimation
+    ? version.characterAnimation.sheetSize
+    : assetPixelSize(project, version);
   const assetSizeMismatch = expectedAssetSize && version.width !== null && version.height !== null
     && (version.width !== expectedAssetSize.width || version.height !== expectedAssetSize.height);
   const previewZoom = repeatTerrain ? seamZoom : singleZoom;
@@ -826,15 +1099,29 @@ function AssetReview({
     {verificationDetails && <p className="geometry-warning"><AlertTriangle /> Weryfikacja AI: {verificationDetails}</p>}
     <div className="review-layout">
       <div className="preview-column">
-        {version.imageUrl && <div className="preview-toolbar">
+        {version.imageUrl && version.category !== 'character' && <div className="preview-toolbar">
           {isTerrain && <div className="preview-mode-switch" aria-label="Tryb podglądu terenu">
             <button className={!repeatTerrain ? 'active' : ''} aria-pressed={!repeatTerrain} onClick={() => setRepeatTerrain(false)}>Pojedynczy tile</button>
             <button className={repeatTerrain ? 'active' : ''} aria-pressed={repeatTerrain} onClick={() => setRepeatTerrain(true)}><Layers3 /> Tile obok tile</button>
           </div>}
+          {isTerrain && repeatTerrain && <div
+            className="preview-grid-size-controls"
+            role="group"
+            aria-label="Rozmiar siatki podglądu"
+            title={project.projection === 'isometric' ? 'W izometrii szerokość i wysokość biegną po przekątnych siatki.' : undefined}
+          >
+            <label><span>Szerokość</span><input aria-label="Szerokość podglądu w kaflach" type="number" min={1} max={16} step={1} value={seamColumns} onChange={(event) => setSeamColumns(clampTerrainPreviewTiles(Number(event.target.value)))} /></label>
+            <label><span>Wysokość</span><input aria-label="Wysokość podglądu w kaflach" type="number" min={1} max={16} step={1} value={seamRows} onChange={(event) => setSeamRows(clampTerrainPreviewTiles(Number(event.target.value)))} /></label>
+          </div>}
           <PreviewZoomControls zoom={previewZoom} onZoom={setPreviewZoom} />
         </div>}
-        {version.category === 'road_tile' && version.roadVariants?.length
-          ? <RoadVariantGrid version={version} assetName={asset.name} projection={project.projection} zoom={singleZoom} />
+        {version.category === 'character' && version.characterAnimation && version.imageUrl
+          ? <div className="character-review-preview">
+            <CharacterAnimationPreview version={version} assetName={asset.name} />
+            <MovementAnalysisPanel animation={version.characterAnimation} />
+          </div>
+          : version.category === 'road_tile' && version.roadVariants?.length
+            ? <RoadVariantGrid version={version} assetName={asset.name} projection={project.projection} zoom={singleZoom} />
           : repeatTerrain && version.imageUrl
             ? <TerrainSeamPreview
             version={version}
@@ -843,6 +1130,8 @@ function AssetReview({
             tileHeight={project.tileHeightPx}
             projection={project.projection}
             spriteHeight={expectedAssetSize?.height}
+            columns={seamColumns}
+            rows={seamRows}
             zoom={seamZoom}
             onZoom={setSeamZoom}
             />
@@ -853,7 +1142,7 @@ function AssetReview({
                 ? <div className="empty-preview failed-preview"><span>{statusLabels[version.status]}</span></div>
                 : <div className="empty-preview"><LoaderCircle className={version.status === 'generating' ? 'spin' : ''} /><span>{statusLabels[version.status]}</span></div>}
             </div>}
-        <div className="image-meta"><span>{version.width ?? '—'} × {version.height ?? '—'} px</span><span>{categoryLabels[version.category]}</span><GeneratorBadge version={version} compact />{version.category === 'road_tile' && <span>{version.roadVariants?.length ?? 0} wariantów</span>}{version.category === 'elevated_tile' && <span>Elevation {version.elevationLevels}</span>}{isRelativeSizeCategory(version.category) && <span>Size {version.relativeWidth}×{version.relativeHeight}</span>}<span>Footprint {version.footprint.x}×{version.footprint.y}</span>{version.imageUrl && <span>Pivot {version.pivot.x.toFixed(2)}, {version.pivot.y.toFixed(2)}</span>}{repeatTerrain && <span className="seam-legend">Różowe = szczelina</span>}</div>
+        <div className="image-meta"><span>{version.width ?? '—'} × {version.height ?? '—'} px</span><span>{categoryLabels[version.category]}</span><GeneratorBadge version={version} compact />{version.category === 'road_tile' && <span>{version.roadVariants?.length ?? 0} wariantów</span>}{version.category === 'elevated_tile' && <span>Elevation {version.elevationLevels}</span>}{version.category === 'character' && version.characterAnimation && <><span>Idle + {version.characterAnimation.settings.framesPerDirection} kl. chodu</span><span>{version.characterAnimation.settings.framesPerSecond} FPS</span><span>{version.characterAnimation.directions.length} kierunki</span></>}{isRelativeSizeCategory(version.category) && <span>Size {version.relativeWidth}×{version.relativeHeight}</span>}<span>Footprint {version.footprint.x}×{version.footprint.y}</span>{version.imageUrl && <span>Pivot {version.pivot.x.toFixed(2)}, {version.pivot.y.toFixed(2)}</span>}{repeatTerrain && <span className="seam-legend">Różowe = szczelina</span>}</div>
         {assetSizeMismatch && <p className="geometry-warning"><AlertTriangle /> Ten asset ma canvas {version.width}×{version.height}px zamiast {expectedAssetSize.width}×{expectedAssetSize.height}px wynikającego z parametrów tej wersji.</p>}
       </div>
       <ReviewControls asset={asset} version={version} project={project} onChanged={handleChanged} />
@@ -901,6 +1190,126 @@ function TileOverlay({ version }: { version: AssetVersion }) {
   </div>;
 }
 
+export function CharacterAnimationPreview({ version, assetName }: { version: AssetVersion; assetName: string }) {
+  const animation = version.characterAnimation;
+  const [action, setAction] = useState<'idle' | 'walk'>('walk');
+  const [selectedDirectionId, setSelectedDirectionId] = useState(animation?.directions[0]?.id ?? '');
+  const [playing, setPlaying] = useState(true);
+  const [frameIndex, setFrameIndex] = useState(0);
+  const directionCount = animation?.directions.length ?? 0;
+  const frameCount = action === 'idle' ? 1 : animation?.settings.framesPerDirection ?? 1;
+  const selectedDirectionIndex = Math.max(0, animation?.directions.findIndex((direction) => direction.id === selectedDirectionId) ?? 0);
+  const sheetColumn = action === 'idle' ? 0 : frameIndex + 1;
+
+  useEffect(() => {
+    setSelectedDirectionId(animation?.directions[0]?.id ?? '');
+    setAction('walk');
+    setPlaying(true);
+    setFrameIndex(0);
+  }, [version.id]);
+  useEffect(() => setFrameIndex(0), [action, selectedDirectionId]);
+  useEffect(() => {
+    if (!animation || action !== 'walk' || !playing || frameCount < 2) return undefined;
+    const timer = window.setInterval(
+      () => setFrameIndex((current) => (current + 1) % frameCount),
+      1_000 / animation.settings.framesPerSecond,
+    );
+    return () => window.clearInterval(timer);
+  }, [action, animation?.settings.framesPerSecond, frameCount, playing]);
+
+  if (!animation || !version.imageUrl || !directionCount) return null;
+  const selectedDirection = animation.directions[selectedDirectionIndex];
+  const previewScale = Math.min(360 / animation.frameSize.width, 300 / animation.frameSize.height);
+  const previewSize = {
+    width: Math.max(1, Math.round(animation.frameSize.width * previewScale)),
+    height: Math.max(1, Math.round(animation.frameSize.height * previewScale)),
+  };
+  const frameStyle = (column: number, row: number): React.CSSProperties => ({
+    backgroundImage: `url(${JSON.stringify(version.imageUrl)})`,
+    backgroundPosition: `${column * 25}% ${directionCount === 1 ? 0 : row * 100 / (directionCount - 1)}%`,
+  });
+
+  return <section className="character-animation-preview" aria-label="Podgląd animacji postaci">
+    <div className="character-animation-toolbar">
+      <div className="character-action-tabs" role="tablist" aria-label="Animacja postaci">
+        <button role="tab" aria-selected={action === 'idle'} className={action === 'idle' ? 'active' : ''} onClick={() => setAction('idle')}>Idle</button>
+        <button role="tab" aria-selected={action === 'walk'} className={action === 'walk' ? 'active' : ''} onClick={() => setAction('walk')}>Chód</button>
+      </div>
+      <div className="character-playback">
+        <button aria-label={playing ? 'Wstrzymaj animację' : 'Odtwórz animację'} disabled={action === 'idle'} onClick={() => setPlaying((current) => !current)}>{playing ? <Pause /> : <Play />}</button>
+        <span>{action === 'idle' ? 'Klatka idle' : `Klatka ${frameIndex + 1} / ${frameCount}`}</span>
+        <small>{animation.settings.framesPerSecond} FPS</small>
+      </div>
+    </div>
+    <div className="character-direction-tabs" role="tablist" aria-label="Kierunek ruchu postaci">
+      {animation.directions.map((direction) => <button
+        key={direction.id}
+        role="tab"
+        aria-selected={direction.id === selectedDirection?.id}
+        className={direction.id === selectedDirection?.id ? 'active' : ''}
+        title={direction.label}
+        onClick={() => setSelectedDirectionId(direction.id)}
+      ><b>{direction.shortLabel}</b><span>{direction.label}</span></button>)}
+    </div>
+    <div className="character-animation-stage">
+      <div
+        className="character-frame-preview"
+        role="img"
+        aria-label={`${assetName}: ${action === 'idle' ? 'idle' : 'chód'}, kierunek ${selectedDirection?.label}`}
+        data-column={sheetColumn}
+        data-row={selectedDirectionIndex}
+        style={{
+          ...frameStyle(sheetColumn, selectedDirectionIndex),
+          width: previewSize.width,
+          height: previewSize.height,
+        }}
+      ><TileOverlay version={version} /></div>
+    </div>
+    <div className="character-frame-strip" aria-label="Klatki wybranej animacji">
+      {Array.from({ length: frameCount }, (_, index) => {
+        const column = action === 'idle' ? 0 : index + 1;
+        return <button
+          key={`${action}-${index}`}
+          className={index === frameIndex ? 'active' : ''}
+          aria-label={action === 'idle' ? 'Pokaż klatkę idle' : `Pokaż klatkę chodu ${index + 1}`}
+          aria-pressed={index === frameIndex}
+          onClick={() => { setFrameIndex(index); setPlaying(false); }}
+        ><span data-column={column} data-row={selectedDirectionIndex} style={{ ...frameStyle(column, selectedDirectionIndex), aspectRatio: `${animation.frameSize.width} / ${animation.frameSize.height}` }} /><small>{action === 'idle' ? 'idle' : index + 1}</small></button>;
+      })}
+    </div>
+  </section>;
+}
+
+export function MovementAnalysisPanel({ animation }: { animation: NonNullable<AssetVersion['characterAnimation']> }) {
+  const analysis = animation.movementAnalysis;
+  const statusLabel = analysis.status === 'passed' ? 'Zaliczona' : analysis.status === 'failed' ? 'Niezaliczona' : 'W toku';
+  return <section
+    className={`movement-analysis ${analysis.status}`}
+    role={analysis.status === 'failed' ? 'alert' : 'status'}
+    aria-live="polite"
+    aria-label="Analiza ruchu postaci"
+  >
+    <div className="movement-analysis-heading">
+      <span>{analysis.status === 'passed' ? <Check /> : analysis.status === 'failed' ? <AlertTriangle /> : <LoaderCircle className="spin" />}</span>
+      <div><p className="eyebrow">OBOWIĄZKOWA ANALIZA AGENTA</p><strong>{statusLabel}</strong></div>
+      <b>{analysis.directions.filter((direction) => direction.status === 'passed').length} / {animation.directions.length} kierunki</b>
+    </div>
+    <p>{analysis.summary || 'Codex analizuje ciągłość sylwetki, kierunek kroku i płynność pełnej pętli.'}</p>
+    <div className="movement-direction-results">
+      {animation.directions.map((direction) => {
+        const result = analysis.directions.find((item) => item.direction === direction.id);
+        const status = result?.status ?? 'pending';
+        return <div className={status} key={direction.id}>
+          <span>{status === 'passed' ? <Check /> : status === 'failed' ? <X /> : <LoaderCircle className="spin" />}</span>
+          <strong>{direction.shortLabel}</strong>
+          <div><b>{direction.label}</b><small>{result?.message || 'Oczekuje na analizę ruchu.'}</small></div>
+        </div>;
+      })}
+    </div>
+    {analysis.analyzedAt && <small className="movement-analyzed-at">Analiza zakończona {formatDate(analysis.analyzedAt)}</small>}
+  </section>;
+}
+
 function RoadVariantGrid({
   version,
   assetName,
@@ -934,9 +1343,19 @@ function clampPreviewZoom(value: number): number {
   return Math.min(300, Math.max(50, value));
 }
 
-const terrainPreviewCells = Array.from({ length: 3 }, (_, row) => row - 1)
-  .flatMap((y) => Array.from({ length: 3 }, (_, column) => ({ x: column - 1, y })))
-  .sort((left, right) => (left.x + left.y) - (right.x + right.y) || left.x - right.x);
+function clampTerrainPreviewTiles(value: number): number {
+  if (!Number.isFinite(value)) return 3;
+  return Math.min(16, Math.max(1, Math.round(value)));
+}
+
+function createTerrainPreviewCells(columns: number, rows: number) {
+  return Array.from({ length: rows }, (_, row) => row)
+    .flatMap((row) => Array.from({ length: columns }, (_, column) => ({
+      column,
+      row,
+    })))
+    .sort((left, right) => (left.column + left.row) - (right.column + right.row) || left.column - right.column);
+}
 
 export function TerrainSeamPreview({
   version,
@@ -945,6 +1364,8 @@ export function TerrainSeamPreview({
   tileHeight,
   projection = 'isometric',
   spriteHeight,
+  columns = 3,
+  rows = 3,
   zoom = 100,
   onZoom,
 }: {
@@ -954,6 +1375,8 @@ export function TerrainSeamPreview({
   tileHeight: number;
   projection?: ProjectProjection;
   spriteHeight?: number;
+  columns?: number;
+  rows?: number;
   zoom?: number;
   onZoom: (zoom: number) => void;
 }) {
@@ -964,8 +1387,20 @@ export function TerrainSeamPreview({
   const scaledTileHeight = Math.round(tileHeight * zoom / 100);
   const scaledSpriteHeight = Math.round((spriteHeight ?? tileHeight) * zoom / 100);
   const topDown = projection === 'top_down';
+  const visibleColumns = clampTerrainPreviewTiles(columns);
+  const visibleRows = clampTerrainPreviewTiles(rows);
+  const terrainPreviewCells = useMemo(
+    () => createTerrainPreviewCells(visibleColumns, visibleRows),
+    [visibleColumns, visibleRows],
+  );
+  const gridWidth = topDown
+    ? scaledTileWidth * visibleColumns
+    : (visibleColumns + visibleRows) * scaledTileWidth / 2;
+  const gridHeight = topDown
+    ? scaledTileHeight * visibleRows
+    : (visibleColumns + visibleRows) * scaledTileHeight / 2 + Math.max(0, scaledSpriteHeight - scaledTileHeight);
 
-  useEffect(() => setPan({ x: 0, y: 0 }), [version.id]);
+  useEffect(() => setPan({ x: 0, y: 0 }), [version.id, visibleColumns, visibleRows]);
 
   const handleWheel = (event: React.WheelEvent<HTMLDivElement>) => {
     if (!event.deltaY) return;
@@ -1021,9 +1456,9 @@ export function TerrainSeamPreview({
 
   return <div
     className={`seam-stage${dragging ? ' dragging' : ''}`}
-    role="img"
+    role="region"
     tabIndex={0}
-    aria-label={`Podgląd powtarzania terenu ${assetName}. Przeciągnij, aby przesunąć. Użyj kółka myszy, aby zmienić zoom.`}
+    aria-label={`Podgląd powtarzania terenu ${assetName}: ${topDown ? 'top-down' : 'izometryczny'}, siatka ${visibleColumns}×${visibleRows}. Przeciągnij lub użyj strzałek, aby przesunąć. Kółko myszy albo klawisze plus i minus zmieniają zoom; klawisz 0 resetuje widok.`}
     title="Przeciągnij, aby przesunąć · kółko myszy zmienia zoom · klawisz 0 resetuje widok"
     onWheel={handleWheel}
     onPointerDown={handlePointerDown}
@@ -1034,20 +1469,23 @@ export function TerrainSeamPreview({
     onKeyDown={handleKeyDown}
   >
     <div className="seam-grid" style={{
-      width: `${topDown ? scaledTileWidth * 3 : scaledTileWidth}px`,
-      height: `${topDown ? scaledTileHeight * 3 : scaledTileHeight}px`,
+      width: `${gridWidth}px`,
+      height: `${gridHeight}px`,
       '--preview-pan-x': `${pan.x}px`,
       '--preview-pan-y': `${pan.y}px`,
     } as React.CSSProperties}>
-      {terrainPreviewCells.map(({ x, y }) => <img
-        key={`${x}:${y}`}
+      {terrainPreviewCells.map(({ column, row }) => <img
+        key={`${column}:${row}`}
         className="seam-tile"
         src={version.imageUrl!}
-        alt={`${assetName} — sąsiad ${x + 2},${y + 2}`}
+        alt=""
+        aria-hidden="true"
+        data-column={column + 1}
+        data-row={row + 1}
         draggable={false}
         style={{
-          left: `${topDown ? (x + 1.5) * scaledTileWidth : scaledTileWidth / 2 + (x - y) * (scaledTileWidth / 2)}px`,
-          top: `${topDown ? (y + 1.5) * scaledTileHeight : scaledTileHeight / 2 + (x + y) * (scaledTileHeight / 2)}px`,
+          left: `${topDown ? (column + 0.5) * scaledTileWidth : (visibleRows + column - row) * (scaledTileWidth / 2)}px`,
+          top: `${topDown ? (row + 0.5) * scaledTileHeight : (column + row + 1) * (scaledTileHeight / 2)}px`,
           width: `${scaledTileWidth}px`,
           height: `${scaledSpriteHeight}px`,
           transform: topDown ? 'translate(-50%, -50%)' : `translate(-50%, -${scaledTileHeight / 2}px)`,
@@ -1235,6 +1673,7 @@ export function ReviewControls({
   const [elevationLevels, setElevationLevels] = useState(version.elevationLevels);
   const [relativeWidth, setRelativeWidth] = useState(version.relativeWidth);
   const [relativeHeight, setRelativeHeight] = useState(version.relativeHeight);
+  const [characterFramesPerSecond, setCharacterFramesPerSecond] = useState(version.characterAnimation?.settings.framesPerSecond ?? 8);
   const [tags, setTags] = useState(version.tags.join(', '));
   const [fx, setFx] = useState(version.footprint.x);
   const [fy, setFy] = useState(version.footprint.y);
@@ -1248,22 +1687,30 @@ export function ReviewControls({
   );
   const versionHasFixedFootprint = isTileAssetCategory(version.category) || isRoadAssetCategory(version.category);
   const nextHasFixedFootprint = isTileAssetCategory(category) || isRoadAssetCategory(category);
+  const movementAnalysisPassed = version.category !== 'character'
+    || version.characterAnimation?.movementAnalysis.status === 'passed';
 
   useEffect(() => {
     setCategory(version.category); setTags(version.tags.join(', '));
     setElevationLevels(version.elevationLevels);
     setRelativeWidth(version.relativeWidth);
     setRelativeHeight(version.relativeHeight);
+    setCharacterFramesPerSecond(version.characterAnimation?.settings.framesPerSecond ?? 8);
     setFx(version.footprint.x); setFy(version.footprint.y); setPx(version.pivot.x); setPy(version.pivot.y);
   }, [version.id, version.footprint.x, version.footprint.y, version.pivot.x, version.pivot.y]);
 
   const review = useMutation({
-    mutationFn: (decision: 'approved' | 'rejected') => window.tilemap.assets.review({
-      versionId: version.id, decision,
-      tags: tags.split(',').map((tag) => tag.trim()).filter(Boolean),
-      rejectionReason: decision === 'rejected' ? rejection : undefined,
-      footprint: versionHasFixedFootprint ? { x: 1, y: 1 } : { x: fx, y: fy }, pivot: { x: px, y: py },
-    }),
+    mutationFn: (decision: 'approved' | 'rejected') => {
+      if (decision === 'approved' && !movementAnalysisPassed) {
+        throw new Error('Postać można zatwierdzić dopiero po zaliczeniu obowiązkowej analizy ruchu.');
+      }
+      return window.tilemap.assets.review({
+        versionId: version.id, decision,
+        tags: tags.split(',').map((tag) => tag.trim()).filter(Boolean),
+        rejectionReason: decision === 'rejected' ? rejection : undefined,
+        footprint: versionHasFixedFootprint ? { x: 1, y: 1 } : { x: fx, y: fy }, pivot: { x: px, y: py },
+      });
+    },
     onSuccess: () => { setError(''); onChanged(); },
     onError: (reason) => setError(errorMessage(reason)),
   });
@@ -1275,6 +1722,9 @@ export function ReviewControls({
       relativeWidth: isRelativeSizeCategory(category) ? relativeWidth : undefined,
       relativeHeight: isRelativeSizeCategory(category) ? relativeHeight : undefined,
       footprint: nextHasFixedFootprint ? { x: 1, y: 1 } : { x: fx, y: fy },
+      characterAnimation: category === 'character'
+        ? { action: 'walk', framesPerDirection: 4, framesPerSecond: characterFramesPerSecond }
+        : undefined,
     }),
     onSuccess: (jobs) => { setFeedback(''); setError(''); onChanged(jobs[0]?.versionId); },
     onError: (reason) => setError(errorMessage(reason)),
@@ -1290,7 +1740,9 @@ export function ReviewControls({
     onError: (reason) => setError(errorMessage(reason)),
   });
   const nextExpectedSize = assetPixelSize(project, { category, elevationLevels, relativeWidth, relativeHeight });
-  const availableCategories = assetCategoriesForProjection(project.projection);
+  const availableCategories = version.category === 'character'
+    ? ['character'] as const
+    : studioAssetCategoriesForProjection(project.projection);
   const changeCategory = (next: AssetCategory) => {
     if (project.projection === 'top_down' && next === 'elevated_tile') return;
     const defaults = next === version.category
@@ -1310,16 +1762,18 @@ export function ReviewControls({
     <p className="eyebrow">METADANE</p>
     <label>Typ tej wersji<input value={categoryLabels[version.category]} readOnly /></label>
     {version.category === 'road_tile' && <label>Warianty drogi<input value={`${version.roadVariants?.length ?? 0} / 16`} readOnly /></label>}
+    {version.category === 'character' && version.characterAnimation && <label>Animacja tej wersji<input value={`Idle + ${version.characterAnimation.settings.framesPerDirection} klatki chodu · ${version.characterAnimation.settings.framesPerSecond} FPS · ${version.characterAnimation.directions.length} kierunki`} readOnly /></label>}
     <label>Tagi AI <input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="kamień, droga, mech" /></label>
     {isRelativeSizeCategory(version.category) && <div className="dimension-explainer" role="note">
-      <strong>Canvas obrazu: {version.relativeWidth}×{version.relativeHeight} tile</strong>
-      <span>To rozmiar PNG. Footprint poniżej określa osobno liczbę komórek zajętych na logicznej siatce.</span>
+      <strong>{version.category === 'character' ? 'Klatka animacji' : 'Canvas obrazu'}: {version.relativeWidth}×{version.relativeHeight} tile</strong>
+      <span>{version.category === 'character' ? 'Arkusz zawiera 5 kolumn i 4 wiersze kierunków.' : 'To rozmiar PNG.'} Footprint poniżej określa osobno liczbę komórek zajętych na logicznej siatce.</span>
     </div>}
     <div className="form-grid two"><label>Footprint X — zajęte komórki<input type="number" min={1} max={64} value={versionHasFixedFootprint ? 1 : fx} disabled={versionHasFixedFootprint} onChange={(event) => setFx(Number(event.target.value))} /></label><label>Footprint Y — zajęte komórki<input type="number" min={1} max={64} value={versionHasFixedFootprint ? 1 : fy} disabled={versionHasFixedFootprint} onChange={(event) => setFy(Number(event.target.value))} /></label></div>
     {version.imageUrl && <div className="form-grid two"><label>Pivot X (propozycja AI)<input type="number" min={0} max={1} step={0.01} value={px} onChange={(event) => setPx(Number(event.target.value))} /></label><label>Pivot Y (propozycja AI)<input type="number" min={0} max={1} step={0.01} value={py} onChange={(event) => setPy(Number(event.target.value))} /></label></div>}
     {version.status === 'needs_review' && <>
       {anotherVersionApproved && <p className="inline-warning"><AlertTriangle /> Najpierw cofnij zatwierdzenie obecnej wersji. Tylko jedna wersja assetu może być zatwierdzona.</p>}
-      <div className="decision-row"><button className="approve" disabled={review.isPending || anotherVersionApproved} onClick={() => review.mutate('approved')}><Check /> Zatwierdź</button><button className="reject" disabled={review.isPending} onClick={() => review.mutate('rejected')}><X /> Odrzuć</button></div>
+      {!movementAnalysisPassed && <p className="inline-warning"><AlertTriangle /> Agent musi najpierw zaliczyć analizę ruchu we wszystkich 4 kierunkach. Tej kontroli nie można pominąć.</p>}
+      <div className="decision-row"><button className="approve" disabled={review.isPending || anotherVersionApproved || !movementAnalysisPassed} onClick={() => review.mutate('approved')}><Check /> Zatwierdź</button><button className="reject" disabled={review.isPending} onClick={() => review.mutate('rejected')}><X /> Odrzuć</button></div>
       <label className="small-label">Powód odrzucenia (opcjonalny)<input value={rejection} onChange={(event) => setRejection(event.target.value)} /></label>
     </>}
     {version.status === 'approved' && <button className="secondary wide undo-approval" disabled={undoApproval.isPending} onClick={() => undoApproval.mutate()}>
@@ -1330,10 +1784,13 @@ export function ReviewControls({
     </button>}
     {version.imageUrl && <div className="iteration-box">
       <p className="eyebrow">PARAMETRY KOLEJNEJ ITERACJI</p>
-      <label>Typ assetu<select value={category} onChange={(event) => changeCategory(event.target.value as AssetCategory)}>{availableCategories.map((item) => <option key={item} value={item}>{categoryLabels[item]}</option>)}</select></label>
+      {version.category === 'character'
+        ? <label>Typ assetu<input value={categoryLabels.character} readOnly /></label>
+        : <label>Typ assetu<select value={category} onChange={(event) => changeCategory(event.target.value as AssetCategory)}>{availableCategories.map((item) => <option key={item} value={item}>{categoryLabels[item]}</option>)}</select></label>}
       {category === 'road_tile' && <RoadSetSummary projection={project.projection} />}
       {category === 'elevated_tile' && <label>Elevation height (poziomy)<input type="number" min={1} max={16} step={1} value={elevationLevels} onChange={(event) => setElevationLevels(Number(event.target.value))} /></label>}
       {isRelativeSizeCategory(category) && <div className="form-grid two"><label>Szerokość canvasa (× tile)<input type="number" min={0.25} max={16} step={0.25} value={relativeWidth} onChange={(event) => setRelativeWidth(Number(event.target.value))} /></label><label>Wysokość canvasa (× tile)<input type="number" min={0.25} max={16} step={0.25} value={relativeHeight} onChange={(event) => setRelativeHeight(Number(event.target.value))} /></label></div>}
+      {category === 'character' && <div className="character-iteration-summary" role="note"><PersonStanding /><div><strong>Idle + 4 klatki chodu × 4 kierunki</strong><span>{characterDirectionsForProjection(project.projection).map((direction) => direction.shortLabel).join(' / ')}</span></div><label>FPS<input type="number" min={1} max={24} step={1} value={characterFramesPerSecond} onChange={(event) => setCharacterFramesPerSecond(Number(event.target.value))} /></label></div>}
       {nextExpectedSize && <AssetCanvasSummary size={nextExpectedSize} base={project} detail={category === 'elevated_tile' ? `Elevation ${elevationLevels}` : category === 'road_tile' ? 'Transparentna nakładka 1×1' : category === 'flat_tile' ? project.projection === 'isometric' ? 'Bazowy romb 2:1' : 'Bazowy kwadrat 1:1' : `${relativeWidth}×${relativeHeight} jednostki tile`} />}
       <textarea rows={4} placeholder="Opcjonalnie opisz zmianę. Bez opisu możesz wygenerować nowy wariant." value={feedback} onChange={(event) => setFeedback(event.target.value)} />
       <div><button className="secondary" disabled={feedback.trim().length < 3 || iterate.isPending} onClick={() => iterate.mutate('edit')}><RefreshCw /> Edytuj obraz</button><button className="ghost" disabled={iterate.isPending} onClick={() => iterate.mutate('variant')}><SquareStack /> Przegeneruj</button></div>
@@ -1632,7 +2089,7 @@ function DiagnosticsView({
     ['Comfy Desktop', Boolean(comfyHealth?.installed), comfyHealth?.installed ? 'Wykryty' : 'Nie wykryto'],
     ['ComfyUI API', Boolean(comfyHealth?.server), comfyHealth?.server ? comfyHealth.endpoint : `${comfyHealth?.endpoint ?? '127.0.0.1:8188'} · offline`],
     ['ComfyUI Z-Image Turbo', comfyHealth?.state === 'ready', comfyHealth?.state === 'ready' ? comfyHealth.model : [...(comfyHealth?.missingModels ?? []), ...(comfyHealth?.missingNodes ?? [])].join(', ') || 'Niegotowy'],
-    ['stable-diffusion.cpp CLI', Boolean(stableDiffusionCppHealth?.installed), stableDiffusionCppHealth?.executablePath ?? 'Nie wykryto sd-cli.exe'],
+    ['stable-diffusion.cpp CLI', Boolean(stableDiffusionCppHealth?.installed), stableDiffusionCppHealth?.executablePath ?? 'Nie wykryto sd-cli'],
     ['stable-diffusion.cpp Z-Image Turbo', stableDiffusionCppHealth?.state === 'ready', stableDiffusionCppHealth?.state === 'ready' ? stableDiffusionCppHealth.model : stableDiffusionCppHealth?.missingFiles.join(', ') || 'Niegotowy'],
     ['Log aplikacji', Boolean(codexHealth?.logPath), codexHealth?.logPath ?? 'Niedostępny'],
   ] as const;

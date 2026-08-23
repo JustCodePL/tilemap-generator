@@ -2,6 +2,8 @@ import { expect, it } from 'vitest';
 import terrainBlendImporterSource from '../main/unity-package/TerrainBlendImporter.cs?raw';
 import terrainBlendBrushSource from '../main/unity-package/TerrainBlendBrush.cs?raw';
 import buildingPlacementBrushSource from '../main/unity-package/BuildingPlacementBrush.cs?raw';
+import characterDefinitionSource from '../main/unity-package/CharacterDefinition.cs?raw';
+import directionalCharacterAnimatorSource from '../main/unity-package/DirectionalCharacterAnimator.cs?raw';
 
 it('mapuje maski blob na osie izometrycznego Gridu Unity', () => {
   expect(terrainBlendImporterSource).toContain('new(1, new Vector3Int(0, 1, 0), 0, 0)');
@@ -22,8 +24,8 @@ it('mapuje drogi top-down na N/E/S/W i tworzy zwykły RuleTile', () => {
   expect(terrainBlendImporterSource).toContain('return LoadOrCreate<IsometricRuleTile>(assetPath, out _)');
 });
 
-it('ustawia prostokątny Grid i Palette dla top-down wyłącznie z manifestu v8', () => {
-  expect(terrainBlendImporterSource).toContain('manifest.schemaVersion != 8');
+it('ustawia prostokątny Grid i Palette dla top-down wyłącznie z manifestu v9', () => {
+  expect(terrainBlendImporterSource).toContain('manifest.schemaVersion != 9');
   expect(terrainBlendImporterSource).toContain('manifest.project.projection == "top_down"');
   expect(terrainBlendImporterSource).toContain('Guid.TryParse(manifest.project.id, out _)');
   expect(terrainBlendImporterSource).toContain('manifest.tile.pixelsPerUnit <= 0');
@@ -34,6 +36,34 @@ it('ustawia prostokątny Grid i Palette dla top-down wyłącznie z manifestu v8'
   expect(terrainBlendImporterSource).toContain('GridLayout.CellLayout.Rectangle');
   expect(terrainBlendImporterSource).toContain('GridLayout.CellLayout.Isometric');
   expect(terrainBlendImporterSource).not.toContain('manifest.schemaVersion >= 7');
+});
+
+it('importuje ścisły arkusz postaci 5×4 jako stabilne sprite, klipy, controller i prefab', () => {
+  expect(terrainBlendImporterSource).toContain('animation.sheet.columns != 5');
+  expect(terrainBlendImporterSource).toContain('animation.sheet.rows != 4');
+  expect(terrainBlendImporterSource).toContain('animation.sheet.origin != "top_left"');
+  expect(terrainBlendImporterSource).toContain('CharacterSpriteName(direction.Id, "idle", 0)');
+  expect(terrainBlendImporterSource).toContain('previousIds.TryGetValue(spriteName');
+  expect(terrainBlendImporterSource).toContain('BuildCharacterClip(');
+  expect(terrainBlendImporterSource).toContain('BuildCharacterController(');
+  expect(terrainBlendImporterSource).toContain('BlendTreeType.SimpleDirectional2D');
+  expect(terrainBlendImporterSource).toContain('AnimatorConditionMode.If, 0f, "IsMoving"');
+  expect(terrainBlendImporterSource).toContain('AnimatorConditionMode.IfNot, 0f, "IsMoving"');
+  expect(terrainBlendImporterSource).toContain('DirectionalCharacterAnimator');
+  expect(terrainBlendImporterSource).toContain('Character.prefab');
+  expect(terrainBlendImporterSource).toContain('var characterDirectory = $"Characters/{asset.id}";');
+  expect(terrainBlendImporterSource).toContain('planned.Add($"{characterDirectory}/Clips/idle_{direction.Id}.anim");');
+  expect(characterDefinitionSource).toContain('public sealed class CharacterDefinition');
+  expect(characterDefinitionSource).toContain('RuntimeAnimatorController');
+  expect(directionalCharacterAnimatorSource).toContain('this component never moves');
+  expect(directionalCharacterAnimatorSource).toContain('targetAnimator.SetFloat(DirectionY, -value.y)');
+});
+
+it('wymaga passed analizy Codexa dla wszystkich kierunków postaci', () => {
+  expect(terrainBlendImporterSource).toContain('analysis.status != "passed"');
+  expect(terrainBlendImporterSource).toContain('analysis.analyzer.provider != "codex"');
+  expect(terrainBlendImporterSource).toContain('result.direction != expectedDirections[index].Id');
+  expect(terrainBlendImporterSource).toContain('result.status != "passed"');
 });
 
 it('odnajduje manifest integracji Unity w dowolnym katalogu docelowym pod Assets', () => {

@@ -17,14 +17,20 @@ import {
 import path from 'node:path';
 import {
   assetPixelSize,
+  characterAnimationFrameSize,
+  characterAnimationSheetSize,
+  characterDirectionsForProjection,
   isTileAssetCategory,
   roadConnectionLabels,
+  type AssetVersion,
+  type CharacterDirection,
   type ExportIntegration,
   type ExportIntegrationDescriptor,
   type ExportFilePreview,
   type ExportPreview,
   type ExportPreviewInput,
   type ExportRunResult,
+  type ProjectInfo,
 } from '../../shared/domain';
 import type { ProjectDatabase } from '../db/project-database';
 import { slugify } from './project-manager';
@@ -47,8 +53,10 @@ import buildingInstanceSource from '../unity-package/BuildingInstance.cs?raw';
 import buildingMapSource from '../unity-package/BuildingMap.cs?raw';
 import buildingPlacementBrushSource from '../unity-package/BuildingPlacementBrush.cs?raw';
 import buildingSetSource from '../unity-package/BuildingSet.cs?raw';
+import characterDefinitionSource from '../unity-package/CharacterDefinition.cs?raw';
+import directionalCharacterAnimatorSource from '../unity-package/DirectionalCharacterAnimator.cs?raw';
 
-const EXPORT_SCHEMA_VERSION = 8;
+const EXPORT_SCHEMA_VERSION = 9;
 const MANIFEST_NAME = 'tilemap-assets.json';
 const UNITY_INTEGRATION_DIRECTORY = 'TilemapGeneratorIntegration';
 const UNITY_INTEGRATION_MANIFEST = 'tilemap-generator-integration.json';
@@ -65,6 +73,8 @@ const UNITY_SUPPORT_FILES = [
   { relativePath: path.join('Runtime', 'BuildingInstance.cs'), source: buildingInstanceSource },
   { relativePath: path.join('Runtime', 'BuildingMap.cs'), source: buildingMapSource },
   { relativePath: path.join('Runtime', 'BuildingSet.cs'), source: buildingSetSource },
+  { relativePath: path.join('Runtime', 'CharacterDefinition.cs'), source: characterDefinitionSource },
+  { relativePath: path.join('Runtime', 'DirectionalCharacterAnimator.cs'), source: directionalCharacterAnimatorSource },
   { relativePath: path.join('Runtime', 'TilemapGenerator.TerrainBlend.Runtime.asmdef'), source: terrainBlendRuntimeAsmdef },
   { relativePath: path.join('Editor', 'TerrainBlendImporter.cs'), source: terrainBlendEditorSource },
   { relativePath: path.join('Editor', 'TerrainBlendBrush.cs'), source: terrainBlendBrushSource },
@@ -213,9 +223,13 @@ export class UnityExporter {
       }
     }
     const generatedFiles = new Map<string, string>();
+    for (const { version } of approved) {
+      if (version.category === 'character') assertExportableCharacterAnimation(project, version);
+    }
     const hasGeneratedUnityAuthoring = terrainBlends.size > 0
       || approved.some(({ version }) => (
         version.category === 'building'
+        || version.category === 'character'
         || (version.category === 'road_tile' && version.roadVariants?.length === 16)
       ));
     if (hasGeneratedUnityAuthoring) {
@@ -246,7 +260,14 @@ export class UnityExporter {
         heightPx: project.tileHeightPx,
         pixelsPerUnit: project.pixelsPerUnit,
       },
-      assets: approved.map(({ asset, version }) => ({
+      assets: approved.map(({ asset, version }) => {
+        const assetFile = version.category === 'road_tile'
+          ? null
+          : path.relative(
+            exportRoot,
+            files.find((file) => file.assetId === asset.id && file.role === 'asset')!.destinationPath,
+          ).split(path.sep).join('/');
+        return {
         id: asset.id,
         versionId: version.id,
         name: asset.name,
@@ -280,7 +301,9 @@ export class UnityExporter {
             ).split(path.sep).join('/'),
           }
           : null,
-        expectedCanvasPx: assetPixelSize(project, version),
+        expectedCanvasPx: version.category === 'character' && version.characterAnimation
+          ? version.characterAnimation.sheetSize
+          : assetPixelSize(project, version),
         tags: version.tags,
         generatedBy: {
           provider: version.generatorProvider ?? 'codex',
@@ -289,18 +312,17 @@ export class UnityExporter {
           runId: version.providerRunId || null,
           metadata: version.generationMetadata,
         },
-        file: version.category === 'road_tile'
-          ? null
-          : path.relative(
-            exportRoot,
-            files.find((file) => file.assetId === asset.id && file.role === 'asset')!.destinationPath,
-          ).split(path.sep).join('/'),
+        file: assetFile,
+        characterAnimation: version.category === 'character'
+          ? characterAnimationManifest(project, version, assetFile!)
+          : null,
         width: version.width,
         height: version.height,
         footprintCells: version.footprint,
         pivotNormalized: version.pivot,
         pixelsPerUnit: project.pixelsPerUnit,
-      })),
+      };
+      }),
     };
     const deleteRoots = new Map<string, string>();
     for (const file of files.filter((candidate) => candidate.action === 'delete')) {
@@ -403,6 +425,138 @@ export class UnityExporter {
   }
 }
 
+function assertExportableCharacterAnimation(
+  project: ProjectInfo,
+  version: AssetVersion,
+): asserts version is AssetVersion & { characterAnimation: NonNullable<AssetVersion['characterAnimation']> } {
+  const animation = version.characterAnimation;
+  if (!animation) {
+    throw new Error('Zatwierdzona postać nie zawiera kompletnego arkusza animacji v1.');
+  }
+  const expectedDirections = characterDirectionsForProjection(project.projection);
+  if (animation.settings.action !== 'walk'
+    || animation.settings.framesPerDirection !== 4
+    || !Number.isInteger(animation.settings.framesPerSecond)
+    || animation.settings.framesPerSecond < 1
+    || animation.settings.framesPerSecond > 24) {
+    throw new Error('Animacja postaci ma nieobsługiwane ustawienia. Unity wymaga walk v1: idle + 4 klatki chodu.');
+  }
+  const expectedFrame = characterAnimationFrameSize(project, version);
+  const expectedSheet = characterAnimationSheetSize(expectedFrame, animation.settings);
+  if (animation.frameSize.width !== expectedFrame.width
+    || animation.frameSize.height !== expectedFrame.height
+    || animation.sheetSize.width !== expectedSheet.width
+    || animation.sheetSize.height !== expectedSheet.height
+    || version.width !== expectedSheet.width
+    || version.height !== expectedSheet.height) {
+    throw new Error('Arkusz zatwierdzonej postaci nie odpowiada wymiarom klatki i układowi 5×4 bieżącego projektu.');
+  }
+  if (!sameCharacterDirections(animation.directions, expectedDirections)) {
+    throw new Error('Arkusz postaci nie zawiera dokładnego zestawu kierunków bieżącej projekcji.');
+  }
+  const analysis = animation.movementAnalysis;
+  if (analysis.status !== 'passed'
+    || !analysis.summary.trim()
+    || !analysis.turnId?.trim()
+    || !analysis.analyzedAt
+    || Number.isNaN(Date.parse(analysis.analyzedAt))
+    || analysis.directions.length !== expectedDirections.length
+    || analysis.directions.some((item, index) => (
+      item.direction !== expectedDirections[index].id
+      || item.status !== 'passed'
+      || !item.message.trim()
+    ))) {
+    throw new Error('Eksport postaci jest zablokowany: końcowa analiza ruchu nie potwierdza wszystkich kierunków.');
+  }
+}
+
+function sameCharacterDirections(
+  actual: readonly CharacterDirection[],
+  expected: readonly CharacterDirection[],
+): boolean {
+  return actual.length === expected.length && actual.every((direction, index) => {
+    const target = expected[index];
+    return direction.id === target.id
+      && direction.shortLabel === target.shortLabel
+      && direction.screenDelta.x === target.screenDelta.x
+      && direction.screenDelta.y === target.screenDelta.y
+      && direction.gridDelta.x === target.gridDelta.x
+      && direction.gridDelta.y === target.gridDelta.y;
+  });
+}
+
+function characterAnimationManifest(
+  project: ProjectInfo,
+  version: AssetVersion,
+  sheetFile: string,
+): Record<string, unknown> {
+  assertExportableCharacterAnimation(project, version);
+  const animation = version.characterAnimation;
+  const frameRect = (row: number, column: number) => ({
+    x: column * animation.frameSize.width,
+    y: row * animation.frameSize.height,
+    width: animation.frameSize.width,
+    height: animation.frameSize.height,
+  });
+  const directions = characterDirectionsForProjection(project.projection).map((direction, row) => ({
+    id: direction.id,
+    label: direction.shortLabel,
+    row,
+    screenDelta: direction.screenDelta,
+    gridDelta: direction.gridDelta,
+  }));
+  const clips = directions.flatMap((direction) => [
+    {
+      id: `idle_${direction.id}`,
+      action: 'idle',
+      direction: direction.id,
+      framesPerSecond: animation.settings.framesPerSecond,
+      loop: true,
+      frames: [{ index: 0, column: 0, row: direction.row, rectPx: frameRect(direction.row, 0) }],
+    },
+    {
+      id: `walk_${direction.id}`,
+      action: 'walk',
+      direction: direction.id,
+      framesPerSecond: animation.settings.framesPerSecond,
+      loop: true,
+      frames: Array.from({ length: animation.settings.framesPerDirection }, (_, frameIndex) => ({
+        index: frameIndex,
+        column: frameIndex + 1,
+        row: direction.row,
+        rectPx: frameRect(direction.row, frameIndex + 1),
+      })),
+    },
+  ]);
+  return {
+    schemaVersion: 1,
+    settings: animation.settings,
+    sheet: {
+      file: sheetFile,
+      widthPx: animation.sheetSize.width,
+      heightPx: animation.sheetSize.height,
+      frameWidthPx: animation.frameSize.width,
+      frameHeightPx: animation.frameSize.height,
+      columns: 5,
+      rows: 4,
+      origin: 'top_left',
+    },
+    directions,
+    clips,
+    sharedPivotNormalized: version.pivot,
+    movementAnalysis: {
+      status: 'passed',
+      summary: animation.movementAnalysis.summary,
+      directions: animation.movementAnalysis.directions,
+      analyzer: {
+        provider: 'codex',
+        turnId: animation.movementAnalysis.turnId,
+        analyzedAt: animation.movementAnalysis.analyzedAt,
+      },
+    },
+  };
+}
+
 function resolveUnityTarget(targetDirectory: string): UnityTarget {
   const resolved = path.resolve(targetDirectory);
   if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
@@ -494,7 +648,7 @@ function readExistingDelivery(
     throw new Error(`Manifest ${manifestPath} należy do innego projektu. Wybierz pusty katalog docelowy.`);
   }
 
-  const relativeFiles = readSchemaV8ManagedFiles(manifest);
+  const relativeFiles = readCurrentManagedFiles(manifest);
   const managedFiles = new Set(relativeFiles.map((relativePath) => (
     resolveManagedPath(rootDirectory, relativePath)
   )));
@@ -505,12 +659,12 @@ function readExistingDelivery(
   };
 }
 
-function readSchemaV8ManagedFiles(manifest: Record<string, unknown>): string[] {
-  if (!Array.isArray(manifest.managedFiles)) throw new Error('Manifest v8 nie zawiera listy managedFiles.');
+function readCurrentManagedFiles(manifest: Record<string, unknown>): string[] {
+  if (!Array.isArray(manifest.managedFiles)) throw new Error('Manifest v9 nie zawiera listy managedFiles.');
   const managedFiles = manifest.managedFiles.map((candidate) => validateManagedRelativePath(candidate));
-  if (!managedFiles.includes(MANIFEST_NAME)) throw new Error('Manifest v8 nie deklaruje własności własnego pliku.');
+  if (!managedFiles.includes(MANIFEST_NAME)) throw new Error('Manifest v9 nie deklaruje własności własnego pliku.');
   const uniqueFiles = [...new Set(managedFiles)];
-  if (uniqueFiles.length !== managedFiles.length) throw new Error('Manifest v8 zawiera powtórzone ścieżki managedFiles.');
+  if (uniqueFiles.length !== managedFiles.length) throw new Error('Manifest v9 zawiera powtórzone ścieżki managedFiles.');
   return uniqueFiles;
 }
 

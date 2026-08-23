@@ -3,12 +3,14 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using UnityEditor;
+using UnityEditor.Animations;
 using UnityEditor.SceneManagement;
 using UnityEditor.Tilemaps;
 using UnityEditor.U2D.Sprites;
 using UnityEngine;
 using UnityEngine.Tilemaps;
 using TilemapGenerator.Buildings;
+using TilemapGenerator.Characters;
 
 namespace TilemapGenerator.TerrainBlend.Editor
 {
@@ -38,6 +40,29 @@ namespace TilemapGenerator.TerrainBlend.Editor
         {
             "BuildingDefinition.asset",
             "Building.prefab",
+        };
+
+        private static readonly string[] CharacterBaseGeneratedFileNames =
+        {
+            "CharacterDefinition.asset",
+            "Character.controller",
+            "Character.prefab",
+        };
+
+        private static readonly CharacterDirectionSpec[] IsometricCharacterDirections =
+        {
+            new("north_west", 0, -1, -1, -1, 0),
+            new("north_east", 1, 1, -1, 0, -1),
+            new("south_east", 2, 1, 1, 1, 0),
+            new("south_west", 3, -1, 1, 0, 1),
+        };
+
+        private static readonly CharacterDirectionSpec[] TopDownCharacterDirections =
+        {
+            new("north", 0, 0, -1, 0, 1),
+            new("east", 1, 1, 0, 1, 0),
+            new("south", 2, 0, 1, 0, -1),
+            new("west", 3, -1, 0, -1, 0),
         };
 
         private static readonly NeighborSpec[] Neighbors =
@@ -182,7 +207,7 @@ namespace TilemapGenerator.TerrainBlend.Editor
             if (textAsset == null) return;
             var manifest = JsonUtility.FromJson<ExportManifest>(textAsset.text);
             if (manifest == null
-                || manifest.schemaVersion != 8
+                || manifest.schemaVersion != 9
                 || manifest.project == null
                 || !Guid.TryParse(manifest.project.id, out _)
                 || (manifest.project.projection != "isometric"
@@ -201,6 +226,7 @@ namespace TilemapGenerator.TerrainBlend.Editor
             var terrainRoot = $"{generatedRoot}/Terrains";
             var buildingRoot = $"{generatedRoot}/Buildings";
             var roadRoot = $"{generatedRoot}/Roads";
+            var characterRoot = $"{generatedRoot}/Characters";
             var ownershipPath = $"{generatedRoot}/{GeneratedOwnershipFileName}";
             if (!TryReadGeneratedOwnership(
                 generatedRoot,
@@ -230,10 +256,12 @@ namespace TilemapGenerator.TerrainBlend.Editor
             EnsureFolder(terrainRoot);
             EnsureFolder(buildingRoot);
             EnsureFolder(roadRoot);
+            EnsureFolder(characterRoot);
 
             var terrainDefinitions = new List<TerrainBlendDefinition>();
             var buildingDefinitions = new List<BuildingDefinition>();
             var roadTiles = new List<RuleTile>();
+            var characterDefinitions = new List<CharacterDefinition>();
             foreach (var asset in manifest.assets)
             {
                 if (asset.terrainBlend != null
@@ -271,31 +299,52 @@ namespace TilemapGenerator.TerrainBlend.Editor
                     }
                     roadTiles.Add(roadTile);
                 }
+
+                if (asset.category == "character" && asset.characterAnimation != null)
+                {
+                    var characterDefinition = BuildCharacter(
+                        exportRoot,
+                        characterRoot,
+                        manifest.tile,
+                        manifest.project.projection,
+                        asset);
+                    if (characterDefinition == null)
+                    {
+                        Debug.LogError($"Tilemap Generator: nie udało się zbudować postaci {asset.id}.");
+                        return;
+                    }
+                    characterDefinitions.Add(characterDefinition);
+                }
             }
 
-            var setPath = $"{generatedRoot}/TerrainBlendSet.asset";
-            var terrainSet = LoadOrCreate<TerrainBlendSet>(setPath, out _);
-            terrainSet.ConfigureGenerated(terrainDefinitions);
-            EditorUtility.SetDirty(terrainSet);
-            var buildingSetPath = $"{generatedRoot}/BuildingSet.asset";
-            var buildingSet = LoadOrCreate<BuildingSet>(buildingSetPath, out _);
-            buildingSet.ConfigureGenerated(buildingDefinitions);
-            EditorUtility.SetDirty(buildingSet);
-            BuildBuildingPalette(generatedRoot, manifest.tile, buildingDefinitions, isTopDown);
-            var supportTilePath = $"{generatedRoot}/TerrainBlendSupportTile.asset";
-            var supportTile = LoadOrCreate<TerrainBlendSupportTile>(supportTilePath, out _);
-            supportTile.name = "TerrainBlendSupportTile";
-            supportTile.sprite = null;
-            supportTile.colliderType = Tile.ColliderType.None;
-            EditorUtility.SetDirty(supportTile);
-            BuildGridPrefab(
-                generatedRoot,
-                manifest.tile,
-                terrainSet,
-                supportTile,
-                buildingSet,
-                roadTiles.Count > 0,
-                isTopDown);
+            TerrainBlendSet terrainSet = null;
+            BuildingSet buildingSet = null;
+            if (terrainDefinitions.Count > 0 || buildingDefinitions.Count > 0 || roadTiles.Count > 0)
+            {
+                var setPath = $"{generatedRoot}/TerrainBlendSet.asset";
+                terrainSet = LoadOrCreate<TerrainBlendSet>(setPath, out _);
+                terrainSet.ConfigureGenerated(terrainDefinitions);
+                EditorUtility.SetDirty(terrainSet);
+                var buildingSetPath = $"{generatedRoot}/BuildingSet.asset";
+                buildingSet = LoadOrCreate<BuildingSet>(buildingSetPath, out _);
+                buildingSet.ConfigureGenerated(buildingDefinitions);
+                EditorUtility.SetDirty(buildingSet);
+                BuildBuildingPalette(generatedRoot, manifest.tile, buildingDefinitions, isTopDown);
+                var supportTilePath = $"{generatedRoot}/TerrainBlendSupportTile.asset";
+                var supportTile = LoadOrCreate<TerrainBlendSupportTile>(supportTilePath, out _);
+                supportTile.name = "TerrainBlendSupportTile";
+                supportTile.sprite = null;
+                supportTile.colliderType = Tile.ColliderType.None;
+                EditorUtility.SetDirty(supportTile);
+                BuildGridPrefab(
+                    generatedRoot,
+                    manifest.tile,
+                    terrainSet,
+                    supportTile,
+                    buildingSet,
+                    roadTiles.Count > 0,
+                    isTopDown);
+            }
             AssetDatabase.SaveAssets();
             if (desiredGeneratedFiles.Any(relativePath => (
                 !AssetDatabase.AssetPathExists($"{generatedRoot}/{relativePath}")
@@ -314,8 +363,8 @@ namespace TilemapGenerator.TerrainBlend.Editor
                 manifestPath,
                 manifest.project.id,
                 retainedOwnership);
-            RefreshLoadedMaps(terrainSet);
-            RefreshLoadedBuildingMaps(buildingSet);
+            if (terrainSet != null) RefreshLoadedMaps(terrainSet);
+            if (buildingSet != null) RefreshLoadedBuildingMaps(buildingSet);
         }
 
         private static TerrainBlendDefinition BuildTerrain(
@@ -435,6 +484,289 @@ namespace TilemapGenerator.TerrainBlend.Editor
                 UnityEngine.Object.DestroyImmediate(prefabRoot);
             }
             return definition;
+        }
+
+        private static CharacterDefinition BuildCharacter(
+            string exportRoot,
+            string characterRoot,
+            TileSettings tileSettings,
+            string projection,
+            TerrainAsset character)
+        {
+            var animation = character.characterAnimation;
+            var texturePath = ResolveAssetPath(exportRoot, character.file);
+            if (AssetImporter.GetAtPath(texturePath) is not TextureImporter) return null;
+            var pivotData = animation.sharedPivotNormalized;
+            var pivot = new Vector2(pivotData.x, pivotData.y);
+            var expectedDirections = projection == "top_down"
+                ? TopDownCharacterDirections
+                : IsometricCharacterDirections;
+            ConfigureCharacterSheet(texturePath, tileSettings.pixelsPerUnit, character.id, animation, expectedDirections, pivot);
+            var sprites = AssetDatabase.LoadAllAssetsAtPath(texturePath)
+                .OfType<Sprite>()
+                .ToDictionary(sprite => sprite.name, sprite => sprite, StringComparer.Ordinal);
+            if (sprites.Count != 20) return null;
+
+            var assetDirectory = $"{characterRoot}/{character.id}";
+            var clipsDirectory = $"{assetDirectory}/Clips";
+            EnsureFolder(assetDirectory);
+            EnsureFolder(clipsDirectory);
+            var directionalAnimations = new List<CharacterDirectionalAnimation>();
+            var idleClips = new Dictionary<string, AnimationClip>(StringComparer.Ordinal);
+            var walkClips = new Dictionary<string, AnimationClip>(StringComparer.Ordinal);
+            foreach (var direction in expectedDirections)
+            {
+                var idleSpriteName = CharacterSpriteName(direction.Id, "idle", 0);
+                if (!sprites.TryGetValue(idleSpriteName, out var idleSprite)) return null;
+                var walkSprites = Enumerable.Range(0, 4)
+                    .Select(index => sprites.TryGetValue(
+                        CharacterSpriteName(direction.Id, "walk", index),
+                        out var sprite) ? sprite : null)
+                    .ToArray();
+                if (walkSprites.Any(sprite => sprite == null)) return null;
+
+                var idleClip = BuildCharacterClip(
+                    $"{clipsDirectory}/idle_{direction.Id}.anim",
+                    $"idle_{direction.Id}",
+                    new[] { idleSprite },
+                    animation.settings.framesPerSecond);
+                var walkClip = BuildCharacterClip(
+                    $"{clipsDirectory}/walk_{direction.Id}.anim",
+                    $"walk_{direction.Id}",
+                    walkSprites,
+                    animation.settings.framesPerSecond);
+                idleClips.Add(direction.Id, idleClip);
+                walkClips.Add(direction.Id, walkClip);
+                var directional = new CharacterDirectionalAnimation();
+                directional.ConfigureGenerated(
+                    direction.Id,
+                    new Vector2(direction.ScreenX, direction.ScreenY),
+                    new Vector2Int(direction.GridX, direction.GridY),
+                    idleClip,
+                    walkClip);
+                directionalAnimations.Add(directional);
+            }
+
+            var controllerPath = $"{assetDirectory}/Character.controller";
+            var controller = BuildCharacterController(controllerPath, expectedDirections, idleClips, walkClips);
+            if (controller == null) return null;
+            var texture = AssetDatabase.LoadAssetAtPath<Texture2D>(texturePath);
+            if (texture == null) return null;
+            var definitionPath = $"{assetDirectory}/CharacterDefinition.asset";
+            var definition = LoadOrCreate<CharacterDefinition>(definitionPath, out _);
+            definition.ConfigureGenerated(
+                character.id,
+                character.versionId,
+                character.name,
+                projection,
+                pivot,
+                texture,
+                controller,
+                directionalAnimations);
+            definition.name = "CharacterDefinition";
+            EditorUtility.SetDirty(definition);
+
+            var defaultDirection = expectedDirections.First(direction => direction.ScreenY > 0);
+            var defaultSprite = sprites[CharacterSpriteName(defaultDirection.Id, "idle", 0)];
+            var prefabRoot = new GameObject(
+                character.name,
+                typeof(SpriteRenderer),
+                typeof(Animator),
+                typeof(DirectionalCharacterAnimator));
+            try
+            {
+                var renderer = prefabRoot.GetComponent<SpriteRenderer>();
+                renderer.sprite = defaultSprite;
+                renderer.spriteSortPoint = SpriteSortPoint.Pivot;
+                renderer.sortingOrder = 200;
+                var animator = prefabRoot.GetComponent<Animator>();
+                animator.runtimeAnimatorController = controller;
+                animator.applyRootMotion = false;
+                prefabRoot.GetComponent<DirectionalCharacterAnimator>().ConfigureGenerated(
+                    definition,
+                    new Vector2(defaultDirection.ScreenX, defaultDirection.ScreenY));
+                var prefab = PrefabUtility.SaveAsPrefabAsset(prefabRoot, $"{assetDirectory}/Character.prefab");
+                definition.SetGeneratedPrefab(prefab);
+                EditorUtility.SetDirty(definition);
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(prefabRoot);
+            }
+            return definition;
+        }
+
+        private static void ConfigureCharacterSheet(
+            string assetPath,
+            float pixelsPerUnit,
+            string assetId,
+            CharacterAnimationData animation,
+            IReadOnlyList<CharacterDirectionSpec> directions,
+            Vector2 pivot)
+        {
+            var importer = (TextureImporter)AssetImporter.GetAtPath(assetPath);
+            importer.textureType = TextureImporterType.Sprite;
+            importer.spriteImportMode = SpriteImportMode.Multiple;
+            importer.spritePixelsPerUnit = pixelsPerUnit;
+            importer.mipmapEnabled = false;
+            importer.alphaIsTransparency = true;
+            importer.textureCompression = TextureImporterCompression.Uncompressed;
+            importer.filterMode = FilterMode.Point;
+            importer.wrapMode = TextureWrapMode.Clamp;
+            importer.SaveAndReimport();
+
+            var factories = new SpriteDataProviderFactories();
+            factories.Init();
+            var dataProvider = factories.GetSpriteEditorDataProviderFromObject(importer);
+            dataProvider.InitSpriteEditorDataProvider();
+            var previousIds = dataProvider.GetSpriteRects()
+                .ToDictionary(rect => rect.name, rect => rect.spriteID, StringComparer.Ordinal);
+            var spriteRects = new List<SpriteRect>();
+            foreach (var direction in directions)
+            {
+                for (var column = 0; column < 5; column++)
+                {
+                    var action = column == 0 ? "idle" : "walk";
+                    var frameIndex = column == 0 ? 0 : column - 1;
+                    var spriteName = CharacterSpriteName(direction.Id, action, frameIndex);
+                    spriteRects.Add(new SpriteRect
+                    {
+                        name = spriteName,
+                        rect = new Rect(
+                            column * animation.sheet.frameWidthPx,
+                            animation.sheet.heightPx - (direction.Row + 1) * animation.sheet.frameHeightPx,
+                            animation.sheet.frameWidthPx,
+                            animation.sheet.frameHeightPx),
+                        alignment = SpriteAlignment.Custom,
+                        pivot = pivot,
+                        spriteID = previousIds.TryGetValue(spriteName, out var previousId)
+                            ? previousId
+                            : UnityEngine.GUID.Generate(),
+                    });
+                }
+            }
+            dataProvider.SetSpriteRects(spriteRects.ToArray());
+            dataProvider.Apply();
+            importer.SaveAndReimport();
+        }
+
+        private static AnimationClip BuildCharacterClip(
+            string assetPath,
+            string clipName,
+            IReadOnlyList<Sprite> sprites,
+            float framesPerSecond)
+        {
+            var clip = AssetDatabase.LoadAssetAtPath<AnimationClip>(assetPath);
+            if (clip == null)
+            {
+                if (AssetDatabase.AssetPathExists(assetPath)) AssetDatabase.DeleteAsset(assetPath);
+                clip = new AnimationClip();
+                AssetDatabase.CreateAsset(clip, assetPath);
+            }
+            clip.ClearCurves();
+            clip.name = clipName;
+            clip.frameRate = framesPerSecond;
+            var keyframes = new List<ObjectReferenceKeyframe>();
+            for (var index = 0; index < sprites.Count; index++)
+            {
+                keyframes.Add(new ObjectReferenceKeyframe
+                {
+                    time = index / framesPerSecond,
+                    value = sprites[index],
+                });
+            }
+            keyframes.Add(new ObjectReferenceKeyframe
+            {
+                time = sprites.Count / framesPerSecond,
+                value = sprites[0],
+            });
+            AnimationUtility.SetObjectReferenceCurve(
+                clip,
+                EditorCurveBinding.PPtrCurve("", typeof(SpriteRenderer), "m_Sprite"),
+                keyframes.ToArray());
+            var serializedClip = new SerializedObject(clip);
+            var loopTime = serializedClip.FindProperty("m_AnimationClipSettings.m_LoopTime");
+            if (loopTime != null) loopTime.boolValue = true;
+            serializedClip.ApplyModifiedPropertiesWithoutUndo();
+            EditorUtility.SetDirty(clip);
+            return clip;
+        }
+
+        private static AnimatorController BuildCharacterController(
+            string assetPath,
+            IReadOnlyList<CharacterDirectionSpec> directions,
+            IReadOnlyDictionary<string, AnimationClip> idleClips,
+            IReadOnlyDictionary<string, AnimationClip> walkClips)
+        {
+            var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>(assetPath);
+            if (controller == null)
+            {
+                if (AssetDatabase.AssetPathExists(assetPath)) AssetDatabase.DeleteAsset(assetPath);
+                controller = AnimatorController.CreateAnimatorControllerAtPath(assetPath);
+            }
+            if (controller == null || controller.layers.Length == 0) return null;
+            var stateMachine = controller.layers[0].stateMachine;
+            foreach (var state in stateMachine.states) stateMachine.RemoveState(state.state);
+            foreach (var child in stateMachine.stateMachines) stateMachine.RemoveStateMachine(child.stateMachine);
+            foreach (var transition in stateMachine.anyStateTransitions) stateMachine.RemoveAnyStateTransition(transition);
+            foreach (var blendTree in AssetDatabase.LoadAllAssetsAtPath(assetPath).OfType<BlendTree>())
+            {
+                UnityEngine.Object.DestroyImmediate(blendTree, true);
+            }
+            controller.parameters = new[]
+            {
+                new AnimatorControllerParameter { name = "DirectionX", type = AnimatorControllerParameterType.Float },
+                new AnimatorControllerParameter { name = "DirectionY", type = AnimatorControllerParameterType.Float, defaultFloat = -1f },
+                new AnimatorControllerParameter { name = "Speed", type = AnimatorControllerParameterType.Float },
+                new AnimatorControllerParameter { name = "IsMoving", type = AnimatorControllerParameterType.Bool },
+            };
+
+            var idleTree = CreateDirectionalBlendTree(controller, "Idle Directions", directions, idleClips);
+            var walkTree = CreateDirectionalBlendTree(controller, "Walk Directions", directions, walkClips);
+            var idleState = stateMachine.AddState("Idle");
+            idleState.motion = idleTree;
+            var walkState = stateMachine.AddState("Walk");
+            walkState.motion = walkTree;
+            stateMachine.defaultState = idleState;
+            var toWalk = idleState.AddTransition(walkState);
+            toWalk.hasExitTime = false;
+            toWalk.duration = 0f;
+            toWalk.AddCondition(AnimatorConditionMode.If, 0f, "IsMoving");
+            var toIdle = walkState.AddTransition(idleState);
+            toIdle.hasExitTime = false;
+            toIdle.duration = 0f;
+            toIdle.AddCondition(AnimatorConditionMode.IfNot, 0f, "IsMoving");
+            EditorUtility.SetDirty(controller);
+            return controller;
+        }
+
+        private static BlendTree CreateDirectionalBlendTree(
+            AnimatorController controller,
+            string name,
+            IReadOnlyList<CharacterDirectionSpec> directions,
+            IReadOnlyDictionary<string, AnimationClip> clips)
+        {
+            var tree = new BlendTree
+            {
+                name = name,
+                blendType = BlendTreeType.SimpleDirectional2D,
+                blendParameter = "DirectionX",
+                blendParameterY = "DirectionY",
+                useAutomaticThresholds = false,
+            };
+            AssetDatabase.AddObjectToAsset(tree, controller);
+            foreach (var direction in directions)
+            {
+                var threshold = new Vector2(direction.ScreenX, -direction.ScreenY).normalized;
+                tree.AddChild(clips[direction.Id], threshold);
+            }
+            EditorUtility.SetDirty(tree);
+            return tree;
+        }
+
+        private static string CharacterSpriteName(string directionId, string action, int frameIndex)
+        {
+            return $"character_{directionId}_{action}_{frameIndex:D2}";
         }
 
         private static void BuildBuildingPalette(
@@ -765,7 +1097,8 @@ namespace TilemapGenerator.TerrainBlend.Editor
             var isGeneratedDataType = typeof(T) == typeof(TerrainBlendDefinition)
                 || typeof(T) == typeof(TerrainBlendSet)
                 || typeof(T) == typeof(BuildingDefinition)
-                || typeof(T) == typeof(BuildingSet);
+                || typeof(T) == typeof(BuildingSet)
+                || typeof(T) == typeof(CharacterDefinition);
             if (asset != null && isGeneratedDataType && HasMissingScript(asset))
             {
                 AssetDatabase.DeleteAsset(assetPath);
@@ -818,6 +1151,7 @@ namespace TilemapGenerator.TerrainBlend.Editor
         {
             var planned = new HashSet<string>(StringComparer.Ordinal);
             var hasBuilding = false;
+            var hasWorldAuthoring = false;
             foreach (var asset in manifest.assets)
             {
                 if (asset.terrainBlend != null
@@ -825,6 +1159,7 @@ namespace TilemapGenerator.TerrainBlend.Editor
                     && !string.IsNullOrWhiteSpace(asset.terrainBlend.atlasFile)
                     && !string.IsNullOrWhiteSpace(asset.terrainBlend.wallFile))
                 {
+                    hasWorldAuthoring = true;
                     foreach (var fileName in TerrainGeneratedFileNames)
                     {
                         planned.Add($"Terrains/{asset.id}/{fileName}");
@@ -833,6 +1168,7 @@ namespace TilemapGenerator.TerrainBlend.Editor
                 if (asset.category == "building" && !string.IsNullOrWhiteSpace(asset.file))
                 {
                     hasBuilding = true;
+                    hasWorldAuthoring = true;
                     foreach (var fileName in BuildingGeneratedFileNames)
                     {
                         planned.Add($"Buildings/{asset.id}/{fileName}");
@@ -840,11 +1176,28 @@ namespace TilemapGenerator.TerrainBlend.Editor
                 }
                 if (asset.category == "road_tile" && asset.roadVariants?.Length == 16)
                 {
+                    hasWorldAuthoring = true;
                     planned.Add($"Roads/{asset.id}/RoadRuleTile.asset");
+                }
+                if (asset.category == "character" && asset.characterAnimation != null)
+                {
+                    var characterDirectory = $"Characters/{asset.id}";
+                    foreach (var fileName in CharacterBaseGeneratedFileNames)
+                    {
+                        planned.Add($"{characterDirectory}/{fileName}");
+                    }
+                    var directions = manifest.project.projection == "top_down"
+                        ? TopDownCharacterDirections
+                        : IsometricCharacterDirections;
+                    foreach (var direction in directions)
+                    {
+                        planned.Add($"{characterDirectory}/Clips/idle_{direction.Id}.anim");
+                        planned.Add($"{characterDirectory}/Clips/walk_{direction.Id}.anim");
+                    }
                 }
             }
             if (planned.Count == 0) return planned;
-            planned.UnionWith(FixedGeneratedFiles);
+            if (hasWorldAuthoring) planned.UnionWith(FixedGeneratedFiles);
             if (hasBuilding) planned.Add("Palettes/Buildings.prefab");
             return planned;
         }
@@ -1035,10 +1388,27 @@ namespace TilemapGenerator.TerrainBlend.Editor
             ))) return false;
             if (FixedGeneratedFiles.Contains(relativePath)
                 || relativePath == "Palettes/Buildings.prefab") return true;
+            if (segments.Length == 4
+                && segments[0] == "Characters"
+                && Guid.TryParse(segments[1], out _)
+                && segments[2] == "Clips")
+            {
+                return IsSafeCharacterClipFileName(segments[3]);
+            }
             if (segments.Length != 3 || !Guid.TryParse(segments[1], out _)) return false;
             if (segments[0] == "Terrains") return TerrainGeneratedFileNames.Contains(segments[2]);
             if (segments[0] == "Buildings") return BuildingGeneratedFileNames.Contains(segments[2]);
-            return segments[0] == "Roads" && segments[2] == "RoadRuleTile.asset";
+            if (segments[0] == "Roads") return segments[2] == "RoadRuleTile.asset";
+            return segments[0] == "Characters" && CharacterBaseGeneratedFileNames.Contains(segments[2]);
+        }
+
+        private static bool IsSafeCharacterClipFileName(string fileName)
+        {
+            var directionIds = IsometricCharacterDirections.Concat(TopDownCharacterDirections)
+                .Select(direction => direction.Id)
+                .ToHashSet(StringComparer.Ordinal);
+            return directionIds.Any(direction => fileName == $"idle_{direction}.anim"
+                || fileName == $"walk_{direction}.anim");
         }
 
         private static bool IsSafeManifestAssetPath(string manifestPath)
@@ -1077,10 +1447,133 @@ namespace TilemapGenerator.TerrainBlend.Editor
                 if (asset.terrainBlend != null
                     && (!IsOwnedAssetPath(asset.terrainBlend.atlasFile, managedFiles, false)
                         || !IsOwnedAssetPath(asset.terrainBlend.wallFile, managedFiles, false))) return false;
-                if (asset.roadVariants == null) continue;
-                if (asset.roadVariants.Any(variant => (
+                if (asset.category == "character")
+                {
+                    if (!HasValidCharacterAnimation(manifest.project.projection, asset, managedFiles)) return false;
+                }
+                else if (asset.characterAnimation != null) return false;
+                if (asset.roadVariants != null && asset.roadVariants.Any(variant => (
                     variant == null || !IsOwnedAssetPath(variant.file, managedFiles, false)
                 ))) return false;
+            }
+            return true;
+        }
+
+        private static bool HasValidCharacterAnimation(
+            string projection,
+            TerrainAsset asset,
+            HashSet<string> managedFiles)
+        {
+            var animation = asset.characterAnimation;
+            if (animation == null
+                || animation.schemaVersion != 1
+                || animation.settings == null
+                || animation.settings.action != "walk"
+                || animation.settings.framesPerDirection != 4
+                || animation.settings.framesPerSecond < 1
+                || animation.settings.framesPerSecond > 24
+                || animation.sheet == null
+                || animation.sheet.file != asset.file
+                || !IsOwnedAssetPath(animation.sheet.file, managedFiles, false)
+                || animation.sheet.columns != 5
+                || animation.sheet.rows != 4
+                || animation.sheet.origin != "top_left"
+                || animation.sheet.frameWidthPx <= 0
+                || animation.sheet.frameHeightPx <= 0
+                || animation.sheet.widthPx != animation.sheet.frameWidthPx * 5
+                || animation.sheet.heightPx != animation.sheet.frameHeightPx * 4
+                || animation.sharedPivotNormalized == null
+                || animation.sharedPivotNormalized.x < 0f
+                || animation.sharedPivotNormalized.x > 1f
+                || animation.sharedPivotNormalized.y < 0f
+                || animation.sharedPivotNormalized.y > 1f) return false;
+
+            var expectedDirections = projection == "top_down"
+                ? TopDownCharacterDirections
+                : IsometricCharacterDirections;
+            if (animation.directions == null
+                || animation.directions.Length != expectedDirections.Length
+                || animation.clips == null
+                || animation.clips.Length != expectedDirections.Length * 2) return false;
+            for (var index = 0; index < expectedDirections.Length; index++)
+            {
+                var expected = expectedDirections[index];
+                var actual = animation.directions[index];
+                if (actual == null
+                    || actual.id != expected.Id
+                    || actual.row != expected.Row
+                    || actual.screenDelta == null
+                    || actual.screenDelta.x != expected.ScreenX
+                    || actual.screenDelta.y != expected.ScreenY
+                    || actual.gridDelta == null
+                    || actual.gridDelta.x != expected.GridX
+                    || actual.gridDelta.y != expected.GridY) return false;
+                if (!HasValidCharacterClip(
+                    animation.clips[index * 2],
+                    "idle",
+                    expected,
+                    animation.settings.framesPerSecond,
+                    new[] { 0 },
+                    animation.sheet)) return false;
+                if (!HasValidCharacterClip(
+                    animation.clips[index * 2 + 1],
+                    "walk",
+                    expected,
+                    animation.settings.framesPerSecond,
+                    new[] { 1, 2, 3, 4 },
+                    animation.sheet)) return false;
+            }
+
+            var analysis = animation.movementAnalysis;
+            if (analysis == null
+                || analysis.status != "passed"
+                || string.IsNullOrWhiteSpace(analysis.summary)
+                || analysis.directions == null
+                || analysis.directions.Length != expectedDirections.Length
+                || analysis.analyzer == null
+                || analysis.analyzer.provider != "codex"
+                || string.IsNullOrWhiteSpace(analysis.analyzer.turnId)
+                || !DateTimeOffset.TryParse(analysis.analyzer.analyzedAt, out _)) return false;
+            for (var index = 0; index < expectedDirections.Length; index++)
+            {
+                var result = analysis.directions[index];
+                if (result == null
+                    || result.direction != expectedDirections[index].Id
+                    || result.status != "passed"
+                    || string.IsNullOrWhiteSpace(result.message)) return false;
+            }
+            return true;
+        }
+
+        private static bool HasValidCharacterClip(
+            CharacterClipData clip,
+            string action,
+            CharacterDirectionSpec direction,
+            int framesPerSecond,
+            IReadOnlyList<int> columns,
+            CharacterSheetData sheet)
+        {
+            if (clip == null
+                || clip.id != $"{action}_{direction.Id}"
+                || clip.action != action
+                || clip.direction != direction.Id
+                || clip.framesPerSecond != framesPerSecond
+                || !clip.loop
+                || clip.frames == null
+                || clip.frames.Length != columns.Count) return false;
+            for (var index = 0; index < columns.Count; index++)
+            {
+                var frame = clip.frames[index];
+                var column = columns[index];
+                if (frame == null
+                    || frame.index != index
+                    || frame.column != column
+                    || frame.row != direction.Row
+                    || frame.rectPx == null
+                    || frame.rectPx.x != column * sheet.frameWidthPx
+                    || frame.rectPx.y != direction.Row * sheet.frameHeightPx
+                    || frame.rectPx.width != sheet.frameWidthPx
+                    || frame.rectPx.height != sheet.frameHeightPx) return false;
             }
             return true;
         }
@@ -1160,6 +1653,32 @@ namespace TilemapGenerator.TerrainBlend.Editor
             }
         }
 
+        private readonly struct CharacterDirectionSpec
+        {
+            public readonly string Id;
+            public readonly int Row;
+            public readonly int ScreenX;
+            public readonly int ScreenY;
+            public readonly int GridX;
+            public readonly int GridY;
+
+            public CharacterDirectionSpec(
+                string id,
+                int row,
+                int screenX,
+                int screenY,
+                int gridX,
+                int gridY)
+            {
+                Id = id;
+                Row = row;
+                ScreenX = screenX;
+                ScreenY = screenY;
+                GridX = gridX;
+                GridY = gridY;
+            }
+        }
+
         [Serializable]
         private sealed class ExportManifest
         {
@@ -1209,6 +1728,101 @@ namespace TilemapGenerator.TerrainBlend.Editor
             public PivotData pivotNormalized;
             public TerrainBlendData terrainBlend;
             public RoadVariantData[] roadVariants;
+            public CharacterAnimationData characterAnimation;
+        }
+
+        [Serializable]
+        private sealed class CharacterAnimationData
+        {
+            public int schemaVersion;
+            public CharacterAnimationSettingsData settings;
+            public CharacterSheetData sheet;
+            public CharacterDirectionData[] directions;
+            public CharacterClipData[] clips;
+            public PivotData sharedPivotNormalized;
+            public CharacterMovementAnalysisData movementAnalysis;
+        }
+
+        [Serializable]
+        private sealed class CharacterAnimationSettingsData
+        {
+            public string action;
+            public int framesPerDirection;
+            public int framesPerSecond;
+        }
+
+        [Serializable]
+        private sealed class CharacterSheetData
+        {
+            public string file;
+            public int widthPx;
+            public int heightPx;
+            public int frameWidthPx;
+            public int frameHeightPx;
+            public int columns;
+            public int rows;
+            public string origin;
+        }
+
+        [Serializable]
+        private sealed class CharacterDirectionData
+        {
+            public string id;
+            public int row;
+            public IntVectorData screenDelta;
+            public IntVectorData gridDelta;
+        }
+
+        [Serializable]
+        private sealed class CharacterClipData
+        {
+            public string id;
+            public string action;
+            public string direction;
+            public int framesPerSecond;
+            public bool loop;
+            public CharacterFrameData[] frames;
+        }
+
+        [Serializable]
+        private sealed class CharacterFrameData
+        {
+            public int index;
+            public int column;
+            public int row;
+            public RectData rectPx;
+        }
+
+        [Serializable]
+        private sealed class CharacterMovementAnalysisData
+        {
+            public string status;
+            public string summary;
+            public CharacterMovementDirectionAnalysisData[] directions;
+            public CharacterMovementAnalyzerData analyzer;
+        }
+
+        [Serializable]
+        private sealed class CharacterMovementDirectionAnalysisData
+        {
+            public string direction;
+            public string status;
+            public string message;
+        }
+
+        [Serializable]
+        private sealed class CharacterMovementAnalyzerData
+        {
+            public string provider;
+            public string turnId;
+            public string analyzedAt;
+        }
+
+        [Serializable]
+        private sealed class IntVectorData
+        {
+            public int x;
+            public int y;
         }
 
         [Serializable]

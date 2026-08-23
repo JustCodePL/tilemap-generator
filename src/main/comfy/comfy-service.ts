@@ -5,10 +5,12 @@ import path from 'node:path';
 import sharp from 'sharp';
 import type {
   AssetCategory,
+  CharacterAnimationSettings,
   ComfyUiHealth,
   ComfyUiProfile,
   ProjectProjection,
 } from '../../shared/domain';
+import { characterDirectionsForProjection } from '../../shared/domain';
 import { nullLogger, type Logger } from '../services/app-logger';
 
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8188';
@@ -50,6 +52,7 @@ export interface ComfyGenerationRequest {
   styleSummary: string;
   outputPath: string;
   outputSize: { width: number; height: number } | null;
+  characterAnimation?: CharacterAnimationSettings | null;
   roadAtlas: boolean;
   attempt: number;
   verificationFeedback: string;
@@ -65,6 +68,21 @@ export interface ComfyGenerationResult {
   metadata: Record<string, unknown>;
 }
 
+export interface ComfyDesktopInstallation {
+  installed: boolean;
+  localBackendConfigured: boolean;
+  updating: boolean;
+  version: string | null;
+  missingModels: string[];
+}
+
+export interface ComfyDesktopDetectionOptions {
+  platform?: NodeJS.Platform;
+  homeDirectory?: string;
+  environment?: NodeJS.ProcessEnv;
+  macApplicationDirectories?: string[];
+}
+
 interface ComfyImageDescriptor {
   filename: string;
   subfolder?: string;
@@ -76,7 +94,11 @@ export class ComfyService {
   private endpointValue: string;
   private readonly autoDetectEndpoint: boolean;
 
-  constructor(private readonly logger: Logger = nullLogger, endpoint?: string) {
+  constructor(
+    private readonly logger: Logger = nullLogger,
+    endpoint?: string,
+    private readonly detectInstallation: () => ComfyDesktopInstallation = detectDesktopInstallation,
+  ) {
     const configuredEndpoint = endpoint ?? process.env.TILEMAP_COMFY_URL ?? DEFAULT_ENDPOINT;
     this.endpointValue = normalizeLoopbackEndpoint(configuredEndpoint);
     this.autoDetectEndpoint = endpoint === undefined && !process.env.TILEMAP_COMFY_URL;
@@ -93,7 +115,7 @@ export class ComfyService {
 
   async refresh(): Promise<ComfyUiHealth> {
     this.healthValue = checkingHealth(this.endpoint);
-    const installation = detectDesktopInstallation();
+    const installation = this.detectInstallation();
     try {
       let system: Record<string, unknown>;
       try {
@@ -119,7 +141,7 @@ export class ComfyService {
       const missingTransparencyModels = missingModels.filter((model) => model === BACKGROUND_MODEL);
       this.healthValue = {
         state: ready ? 'ready' : 'detected',
-        installed: true,
+        installed: installation.installed,
         server: true,
         endpoint: this.endpoint,
         version,
@@ -152,7 +174,9 @@ export class ComfyService {
         missingNodes: [],
         missingModels: installation.missingModels,
         message: installation.installed
-          ? `Wykryto Comfy Desktop${installation.updating ? ' (aktualizacja w toku)' : ''}, ale lokalny serwer nie odpowiada pod ${this.endpoint}.`
+          ? installation.localBackendConfigured
+            ? `Wykryto Comfy Desktop${installation.updating ? ' (aktualizacja w toku)' : ''} i skonfigurowaną lokalną instancję, ale jej serwer nie odpowiada pod ${this.endpoint}. Uruchom tę instancję w Comfy Desktop.`
+            : 'Wykryto Comfy Desktop, ale nie skonfigurowano lokalnej instancji ComfyUI. Utwórz lokalną instalację w Comfy Desktop i uruchom ją.'
           : `Nie wykryto działającego ComfyUI pod ${this.endpoint}.`,
       };
       this.logger.warn('comfy.health.unavailable', { endpoint: this.endpoint, message });
@@ -422,6 +446,8 @@ function buildPrompt(request: ComfyGenerationRequest): string {
         : 'Create one seamless 2:1 isometric terrain diamond that reaches all four canvas edges and tiles without gaps.'
       : request.category === 'elevated_tile'
         ? 'Create one elevated 2:1 isometric terrain tile with a readable top diamond and vertical walls.'
+        : request.category === 'character'
+          ? buildCharacterAnimationInstruction(request)
         : `Create one isolated game asset in a fixed ${isTopDown ? 'orthographic top-down' : 'isometric'} view.`;
   return [
     `Asset: ${request.assetName}`,
@@ -437,6 +463,27 @@ function buildPrompt(request: ComfyGenerationRequest): string {
       ? 'Fill the entire frame with useful opaque material. Do not add a background or leave empty margins.'
       : 'Use a simple high-contrast background so the configured BiRefNet stage can extract a clean alpha silhouette.',
   ].filter(Boolean).join('\n\n');
+}
+
+function buildCharacterAnimationInstruction(request: ComfyGenerationRequest): string {
+  const settings = request.characterAnimation;
+  const directions = characterDirectionsForProjection(request.projection);
+  const columns = 1 + (settings?.framesPerDirection ?? 4);
+  const rows = directions.length;
+  const frameWidth = request.outputSize ? request.outputSize.width / columns : null;
+  const frameHeight = request.outputSize ? request.outputSize.height / rows : null;
+  return [
+    'Create one transparent directional CHARACTER ANIMATION SPRITESHEET, not a character portrait or a single pose.',
+    `The sheet is an exact ${columns}-column by ${rows}-row grid with no gutters, labels, guides, borders or grid lines.`,
+    frameWidth && frameHeight
+      ? `Every frame cell is exactly ${frameWidth}x${frameHeight}px; the complete sheet is exactly ${request.outputSize!.width}x${request.outputSize!.height}px.`
+      : '',
+    `Rows from top to bottom are exactly: ${directions.map((direction) => `${direction.shortLabel} (${direction.id})`).join(', ')}.`,
+    'Column 1 is a grounded idle pose. Columns 2-5 are one chronological in-place walk loop: left contact, passing, right contact, passing.',
+    'Keep the same character identity, outfit, proportions, scale, lighting and ground-contact pivot in every cell. The root stays fixed; only the gait animates.',
+    'Each row must face and move in its declared direction. Alternate arms and legs naturally, avoid foot sliding, duplicate frames, teleportation, cropping and extra limbs, and make the last walk frame loop smoothly into the first walk frame.',
+    'Leave transparent padding inside every cell around the silhouette. Do not draw a floor, cast shadow, text, arrows, direction names or a surrounding scene.',
+  ].filter(Boolean).join('\n');
 }
 
 function chooseGenerationSize(target: { width: number; height: number } | null): { width: number; height: number } {
@@ -469,36 +516,101 @@ function findOutputImage(value: unknown): ComfyImageDescriptor | null {
   return null;
 }
 
-function detectDesktopInstallation(): { installed: boolean; updating: boolean; version: string | null; missingModels: string[] } {
-  if (process.platform !== 'win32') return { installed: false, updating: false, version: null, missingModels: [] };
-  const appData = process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming');
-  const localAppData = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local');
+export function detectDesktopInstallation(options: ComfyDesktopDetectionOptions = {}): ComfyDesktopInstallation {
+  const platform = options.platform ?? process.platform;
+  const homeDirectory = options.homeDirectory ?? os.homedir();
+  const environment = options.environment ?? process.env;
+  if (platform === 'darwin') return detectMacDesktopInstallation(homeDirectory, options.macApplicationDirectories);
+  if (platform !== 'win32') {
+    return { installed: false, localBackendConfigured: false, updating: false, version: null, missingModels: [] };
+  }
+  const appData = environment.APPDATA ?? path.join(homeDirectory, 'AppData', 'Roaming');
+  const localAppData = environment.LOCALAPPDATA ?? path.join(homeDirectory, 'AppData', 'Local');
   const installationsPath = path.join(appData, 'Comfy Desktop', 'installations.json');
-  let installPath = '';
-  let version: string | null = null;
+  const { installPath, version } = readDesktopInstallationRecord(installationsPath);
+  const desktopExecutable = path.join(environment.ProgramFiles ?? 'C:\\Program Files', 'Comfy Desktop', 'Comfy Desktop.exe');
+  const localBackendConfigured = Boolean(installPath && existsSync(installPath));
+  const installed = localBackendConfigured || existsSync(desktopExecutable);
+  const updating = Boolean(localBackendConfigured && existsSync(path.join(installPath, '.comfyui-op-in-progress.json')));
+  const sharedModels = path.join(localAppData, 'Comfy-Desktop', 'ComfyUI-Shared', 'models');
+  const missingModels = findMissingDesktopModels([sharedModels]);
+  return { installed, localBackendConfigured, updating, version, missingModels };
+}
+
+function detectMacDesktopInstallation(
+  homeDirectory: string,
+  applicationDirectories = ['/Applications', path.join(homeDirectory, 'Applications')],
+): ComfyDesktopInstallation {
+  const applicationBundle = applicationDirectories
+    .map((directory) => path.join(directory, 'Comfy Desktop.app'))
+    .find(isValidMacDesktopBundle);
+  const installationsPath = path.join(homeDirectory, 'Library', 'Application Support', 'Comfy Desktop', 'installations.json');
+  const installation = readDesktopInstallationRecord(installationsPath);
+  const version = applicationBundle
+    ? readMacBundleVersion(path.join(applicationBundle, 'Contents', 'Info.plist')) ?? installation.version
+    : installation.version;
+  const localBackendConfigured = Boolean(
+    installation.installPath
+    && existsSync(installation.installPath),
+  );
+  const updating = Boolean(
+    localBackendConfigured
+    && existsSync(path.join(installation.installPath, '.comfyui-op-in-progress.json')),
+  );
+  const modelRoots = [
+    path.join(homeDirectory, 'ComfyUI-Shared', 'models'),
+    path.join(homeDirectory, 'Library', 'Application Support', 'ComfyUI', 'models'),
+    path.join(homeDirectory, 'Library', 'Application Support', 'Comfy-Desktop', 'ComfyUI-Shared', 'models'),
+  ];
+  return {
+    installed: Boolean(applicationBundle || localBackendConfigured),
+    localBackendConfigured,
+    updating,
+    version,
+    missingModels: findMissingDesktopModels(modelRoots),
+  };
+}
+
+function isValidMacDesktopBundle(applicationBundle: string): boolean {
+  return existsSync(path.join(applicationBundle, 'Contents', 'MacOS', 'Comfy Desktop'))
+    && existsSync(path.join(applicationBundle, 'Contents', 'Resources', 'app.asar'));
+}
+
+function readMacBundleVersion(infoPlistPath: string): string | null {
+  try {
+    const infoPlist = readFileSync(infoPlistPath, 'utf8');
+    const match = infoPlist.match(/<key>\s*CFBundleShortVersionString\s*<\/key>\s*<string>([^<]+)<\/string>/);
+    return match?.[1]?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function readDesktopInstallationRecord(installationsPath: string): { installPath: string; version: string | null } {
   try {
     const installations = JSON.parse(readFileSync(installationsPath, 'utf8')) as Array<Record<string, unknown>>;
     const local = installations.find((item) => typeof item.installPath === 'string');
-    installPath = typeof local?.installPath === 'string' ? local.installPath : '';
     const comfyVersion = local?.comfyVersion as Record<string, unknown> | undefined;
-    version = typeof comfyVersion?.baseTag === 'string' ? comfyVersion.baseTag : null;
+    return {
+      installPath: typeof local?.installPath === 'string' ? local.installPath : '',
+      version: typeof comfyVersion?.baseTag === 'string' ? comfyVersion.baseTag : null,
+    };
   } catch {
-    // The process/file probes below still detect a manually installed Desktop build.
+    // Bundle/executable probes still detect a manually installed Desktop build.
+    return { installPath: '', version: null };
   }
-  const desktopExecutable = path.join(process.env.ProgramFiles ?? 'C:\\Program Files', 'Comfy Desktop', 'Comfy Desktop.exe');
-  const installed = Boolean(installPath) || existsSync(desktopExecutable);
-  const updating = Boolean(installPath && existsSync(path.join(installPath, '.comfyui-op-in-progress.json')));
-  const sharedModels = path.join(localAppData, 'Comfy-Desktop', 'ComfyUI-Shared', 'models');
+}
+
+function findMissingDesktopModels(modelRoots: string[]): string[] {
   const requirements = [
-    path.join(sharedModels, 'diffusion_models', PROFILE_MODEL),
-    path.join(sharedModels, 'text_encoders', PROFILE_CLIP),
-    path.join(sharedModels, 'vae', PROFILE_VAE),
-    path.join(sharedModels, 'background_removal', BACKGROUND_MODEL),
-  ];
-  const missingModels = requirements
-    .filter((file) => !existsSync(file) || fileSize(file) === 0)
-    .map((file) => path.basename(file));
-  return { installed, updating, version, missingModels };
+    ['diffusion_models', PROFILE_MODEL],
+    ['text_encoders', PROFILE_CLIP],
+    ['vae', PROFILE_VAE],
+    ['background_removal', BACKGROUND_MODEL],
+  ] as const;
+  return requirements
+    .filter(([directory, fileName]) => !modelRoots.some((root) => fileSize(path.join(root, directory, fileName)) > 0))
+    .map(([, fileName]) => fileName);
 }
 
 function fileSize(filePath: string): number {

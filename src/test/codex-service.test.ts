@@ -1,9 +1,24 @@
 import { expect, it, vi } from 'vitest';
 import {
   CodexService,
+  codexAppServerArgs,
   generationResponseSchema,
   resolveCodexExecutable,
 } from '../main/codex/codex-service';
+
+it('wyłącza własny MCP w wewnętrznym Codex App Serverze', () => {
+  expect(codexAppServerArgs([])).toEqual([
+    '-c', 'mcp_servers.tilemap_generator.command="tilemap-mcp-disabled"',
+    '-c', 'mcp_servers.tilemap_generator.enabled=false',
+    'app-server', '--listen', 'stdio://',
+  ]);
+  expect(codexAppServerArgs(['/path/to/codex.js'])).toEqual([
+    '/path/to/codex.js',
+    '-c', 'mcp_servers.tilemap_generator.command="tilemap-mcp-disabled"',
+    '-c', 'mcp_servers.tilemap_generator.enabled=false',
+    'app-server', '--listen', 'stdio://',
+  ]);
+});
 
 it('preferuje jawnie wskazane binarium Codexa', () => {
   expect(resolveCodexExecutable({
@@ -112,6 +127,54 @@ it('prowadzi równoległe turny na różnych wątkach', async () => {
     expect.objectContaining({ turnId: 'turn-thread-a', finalMessage: 'thread-a' }),
     expect.objectContaining({ turnId: 'turn-thread-b', finalMessage: 'thread-b' }),
   ]);
+});
+
+it('uruchamia analizatora postaci bez zapisu i bez mutujących narzędzi', async () => {
+  const request = vi.fn(async (method: string, params: unknown) => {
+    if (method === 'thread/start') return { thread: { id: 'thread-read-only' } };
+    if (method === 'turn/start') return { turn: { id: 'turn-read-only' } };
+    throw new Error(`Nieoczekiwana metoda ${method}: ${JSON.stringify(params)}`);
+  });
+  const service = new CodexService();
+  Object.assign(service as unknown as Record<string, unknown>, {
+    client: { request },
+    database: { rootPath: '/project' },
+    imagegenSkillPath: '/imagegen/SKILL.md',
+    healthValue: {
+      state: 'ready', version: '0.147.0', appServer: true, imageGeneration: true,
+      imagegenSkill: true, skillPath: '/imagegen/SKILL.md', logPath: null, message: 'ready',
+    },
+  });
+
+  const threadId = await service.startUtilityThread({
+    readOnly: true,
+    serviceName: 'tilemap-generator-character-analysis',
+  });
+  const turn = service.runTurn(threadId, [], {}, undefined, 5_000, undefined, { readOnly: true });
+  await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(2));
+
+  expect(request.mock.calls[0]).toEqual([
+    'thread/start',
+    expect.objectContaining({
+      sandbox: 'read-only', serviceName: 'tilemap-generator-character-analysis', ephemeral: true,
+    }),
+    45_000,
+  ]);
+  expect(request.mock.calls[0][1]).not.toHaveProperty('dynamicTools');
+  expect(request.mock.calls[1]).toEqual([
+    'turn/start',
+    expect.objectContaining({ sandboxPolicy: { type: 'readOnly', networkAccess: false } }),
+    60_000,
+  ]);
+
+  const notify = (service as unknown as {
+    handleNotification(notification: { method: string; params: Record<string, unknown> }): void;
+  }).handleNotification.bind(service);
+  notify({
+    method: 'turn/completed',
+    params: { turnId: 'turn-read-only', turn: { id: 'turn-read-only', status: 'completed' } },
+  });
+  await expect(turn).resolves.toMatchObject({ turnId: 'turn-read-only' });
 });
 
 it('anuluje wyłącznie turn wskazany przez sygnał zadania', async () => {

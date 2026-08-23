@@ -79,6 +79,20 @@ export const roadVariants = sqliteTable('road_variants', {
   height: integer('height').notNull(),
 }, (table) => [primaryKey({ columns: [table.versionId, table.connectionMask] })]);
 
+export const characterAnimationSets = sqliteTable('character_animation_sets', {
+  versionId: text('version_id').primaryKey().references(() => assetVersions.id, { onDelete: 'cascade' }),
+  action: text('action').notNull().default('walk'),
+  framesPerDirection: integer('frames_per_direction').notNull().default(4),
+  framesPerSecond: integer('frames_per_second').notNull().default(8),
+  frameWidth: integer('frame_width').notNull(),
+  frameHeight: integer('frame_height').notNull(),
+  analysisStatus: text('analysis_status').notNull().default('pending'),
+  analysisSummary: text('analysis_summary').notNull().default(''),
+  analysisJson: text('analysis_json').notNull().default('[]'),
+  analysisTurnId: text('analysis_turn_id'),
+  analyzedAt: text('analyzed_at'),
+});
+
 export const generationJobs = sqliteTable('generation_jobs', {
   id: text('id').primaryKey(),
   assetId: text('asset_id').notNull().references(() => assets.id, { onDelete: 'cascade' }),

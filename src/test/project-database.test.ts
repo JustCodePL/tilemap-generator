@@ -5,6 +5,12 @@ import sharp from 'sharp';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ProjectDatabase, normalizeTag } from '../main/db/project-database';
 import { handleRegistryTool } from '../main/codex/registry-tools';
+import {
+  characterDirectionsForProjection,
+  defaultCharacterAnimationSettings,
+  type CharacterAnimationSet,
+  type ProjectProjection,
+} from '../shared/domain';
 
 const temporaryDirectories: string[] = [];
 
@@ -13,6 +19,59 @@ afterEach(() => {
 });
 
 describe('ProjectDatabase', () => {
+  it('zapamiętuje projektowy zestaw generatorów nowych assetów', () => {
+    const root = temporaryProjectRoot();
+    const database = ProjectDatabase.create(root, {
+      name: 'Generatory', artBrief: '', tileWidthPx: 256,
+    });
+
+    expect(database.getProject()).toMatchObject({
+      codexGenerationEnabled: true,
+      comfyUiEnabled: false,
+      stableDiffusionCppEnabled: false,
+    });
+    database.setNewAssetGeneratorProviders(['comfyui', 'stable_diffusion_cpp']);
+    expect(database.getProject()).toMatchObject({
+      codexGenerationEnabled: false,
+      comfyUiEnabled: true,
+      stableDiffusionCppEnabled: true,
+    });
+    expect(() => database.setNewAssetGeneratorProviders([])).toThrow(/co najmniej jeden generator/);
+    database.close();
+
+    const reopened = new ProjectDatabase(root);
+    expect(reopened.getProject()).toMatchObject({
+      codexGenerationEnabled: false,
+      comfyUiEnabled: true,
+      stableDiffusionCppEnabled: true,
+    });
+    reopened.close();
+  });
+
+  it('odnajduje pojedynczy generator iteracji po wersji bazowej', () => {
+    const root = temporaryProjectRoot();
+    const database = ProjectDatabase.create(root, {
+      name: 'Dziedziczenie generatora', artBrief: '', tileWidthPx: 256,
+    });
+    const codexJob = database.enqueueGeneration({
+      name: 'Wieża', prompt: '', category: 'building', mode: 'generate',
+      footprint: { x: 1, y: 1 }, generatorProvider: 'codex',
+    });
+    const comfyJob = database.enqueueGeneration({
+      assetId: codexJob.assetId, name: 'Wieża', prompt: '', category: 'building', mode: 'generate',
+      footprint: { x: 1, y: 1 }, generatorProvider: 'comfyui',
+    });
+
+    expect(database.generatorProviderForIteration(codexJob.assetId, codexJob.versionId)).toBe('codex');
+    expect(database.generatorProviderForIteration(codexJob.assetId, comfyJob.versionId)).toBe('comfyui');
+    expect(database.generatorProviderForIteration(codexJob.assetId)).toBe('comfyui');
+    expect(() => database.generatorProviderForIteration(
+      codexJob.assetId,
+      '11111111-1111-4111-8111-111111111111',
+    )).toThrow(/Wersja bazowa/);
+    database.close();
+  });
+
   it('przechowuje cele i historię eksportu przez neutralny identyfikator integracji', () => {
     const root = temporaryProjectRoot();
     const database = ProjectDatabase.create(root, {
@@ -109,6 +168,120 @@ describe('ProjectDatabase', () => {
       })).toThrow(/footprint 1×1/);
     }
     database.close();
+  });
+
+  it('tworzy kierunkowy zestaw postaci z domyślnymi ustawieniami i zachowuje FPS iteracji', () => {
+    const root = temporaryProjectRoot();
+    const database = ProjectDatabase.create(root, {
+      name: 'Postacie', artBrief: '', tileWidthPx: 256,
+    });
+    const firstJob = database.enqueueGeneration({
+      name: 'Rycerz', prompt: '', mode: 'generate', category: 'character',
+      footprint: { x: 1, y: 1 },
+      characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 12 },
+    });
+
+    expect(database.getJobContext(firstJob.id).characterAnimation).toEqual({
+      action: 'walk', framesPerDirection: 4, framesPerSecond: 12,
+    });
+    const queuedVersion = database.getAsset(firstJob.assetId)?.versions[0];
+    expect(queuedVersion?.aiVerificationStatus).toBe('pending');
+    expect(queuedVersion?.characterAnimation).toMatchObject({
+      settings: { action: 'walk', framesPerDirection: 4, framesPerSecond: 12 },
+      directions: characterDirectionsForProjection('isometric'),
+      frameSize: { width: 128, height: 192 },
+      sheetSize: { width: 640, height: 768 },
+      movementAnalysis: {
+        status: 'pending', summary: '', directions: [], turnId: null, analyzedAt: null,
+      },
+    });
+
+    const secondJob = database.enqueueGeneration({
+      assetId: firstJob.assetId,
+      parentVersionId: firstJob.versionId,
+      name: 'Rycerz', prompt: '', mode: 'edit', category: 'character',
+      footprint: { x: 1, y: 1 },
+    });
+    expect(database.getJobContext(secondJob.id).characterAnimation).toEqual({
+      action: 'walk', framesPerDirection: 4, framesPerSecond: 12,
+    });
+    expect(database.getAsset(firstJob.assetId)?.versions.find((version) => version.id === secondJob.versionId)
+      ?.characterAnimation?.settings.framesPerSecond).toBe(12);
+
+    expect(() => database.enqueueGeneration({
+      name: 'Kamień', prompt: '', mode: 'generate', category: 'prop',
+      footprint: { x: 1, y: 1 },
+      characterAnimation: defaultCharacterAnimationSettings,
+    })).toThrow(/tylko dla kategorii character/);
+    database.close();
+  });
+
+  it('finalizuje i zatwierdza postać dopiero po kompletnej analizie ruchu', () => {
+    const root = temporaryProjectRoot();
+    const database = ProjectDatabase.create(root, {
+      name: 'Analiza postaci', artBrief: '', projection: 'top_down', tileWidthPx: 64,
+    });
+    const job = database.enqueueGeneration({
+      name: 'Łucznik', prompt: '', mode: 'generate', category: 'character',
+      relativeWidth: 1, relativeHeight: 1,
+      footprint: { x: 1, y: 1 },
+    });
+
+    expect(() => database.finalizeGeneration(job.id, {
+      finalPath: 'assets/archer/final.png', width: 320, height: 256,
+      category: 'character', tags: ['łucznik'], pivot: { x: 0.5, y: 0 }, description: 'Łucznik',
+    })).toThrow(/wymaga kompletnego zestawu animacji/);
+
+    const incomplete = passedCharacterAnimation('top_down', 64, 64);
+    incomplete.movementAnalysis.directions.pop();
+    expect(() => database.finalizeGeneration(job.id, {
+      finalPath: 'assets/archer/final.png', width: 320, height: 256,
+      category: 'character', tags: ['łucznik'], pivot: { x: 0.5, y: 0 }, description: 'Łucznik',
+      characterAnimation: incomplete,
+    })).toThrow(/każdy kanoniczny kierunek/);
+
+    const animation = passedCharacterAnimation('top_down', 64, 64);
+    database.finalizeGeneration(job.id, {
+      finalPath: 'assets/archer/final.png', width: 320, height: 256,
+      category: 'character', tags: ['łucznik'], pivot: { x: 0.5, y: 0 }, description: 'Łucznik',
+      characterAnimation: animation,
+    });
+    expect(database.getAsset(job.assetId)?.versions[0].characterAnimation).toEqual(animation);
+
+    database.reviewVersion({
+      versionId: job.versionId, decision: 'approved', tags: ['łucznik'],
+      footprint: { x: 1, y: 1 }, pivot: { x: 0.5, y: 0 },
+    });
+    expect(database.getAsset(job.assetId)?.currentApprovedVersionId).toBe(job.versionId);
+    database.close();
+  });
+
+  it('nie backfilluje statycznej postaci podczas migracji projektu v17', () => {
+    const root = temporaryProjectRoot();
+    const original = ProjectDatabase.create(root, {
+      name: 'Stara postać', artBrief: '', tileWidthPx: 256,
+    });
+    const job = original.enqueueGeneration({
+      name: 'Stary rycerz', prompt: '', mode: 'generate', category: 'character',
+      footprint: { x: 1, y: 1 },
+    });
+    original.sqlite.exec('DROP TABLE character_animation_sets; PRAGMA user_version = 17;');
+    original.close();
+
+    const migrated = new ProjectDatabase(root);
+    expect(migrated.getAsset(job.assetId)?.versions[0].characterAnimation).toBeNull();
+    expect(migrated.sqlite.prepare('SELECT COUNT(*) AS count FROM character_animation_sets').get())
+      .toMatchObject({ count: 0 });
+    expect(readdirSync(path.join(root, 'backups')).some((name) => name.startsWith('registry-v17-'))).toBe(true);
+    migrated.sqlite.prepare(`
+      UPDATE asset_versions SET status = 'needs_review', final_path = 'assets/legacy-character.png',
+        width = 128, height = 192 WHERE id = ?
+    `).run(job.versionId);
+    expect(() => migrated.reviewVersion({
+      versionId: job.versionId, decision: 'approved', tags: [],
+      footprint: { x: 1, y: 1 }, pivot: { x: 0.5, y: 0 },
+    })).toThrow(/bez kompletnej.*analizy ruchu/);
+    migrated.close();
   });
 
   it('przechowuje odrzucone wersje i zatwierdza kolejną bez kasowania historii', async () => {
@@ -862,6 +1035,31 @@ it('migrates a v14 project and preserves ComfyUI variant provenance', async () =
   expect(readdirSync(path.join(root, 'backups')).some((name) => name.startsWith('registry-v14-'))).toBe(true);
   migrated.close();
 });
+
+function passedCharacterAnimation(
+  projection: ProjectProjection,
+  frameWidth: number,
+  frameHeight: number,
+): CharacterAnimationSet {
+  const directions = [...characterDirectionsForProjection(projection)];
+  return {
+    settings: { ...defaultCharacterAnimationSettings },
+    directions,
+    frameSize: { width: frameWidth, height: frameHeight },
+    sheetSize: { width: frameWidth * 5, height: frameHeight * 4 },
+    movementAnalysis: {
+      status: 'passed',
+      summary: 'Postać porusza się płynnie i zachowuje spójność we wszystkich kierunkach.',
+      directions: directions.map((direction) => ({
+        direction: direction.id,
+        status: 'passed',
+        message: `Cykl ${direction.shortLabel} jest płynny i poprawnie zapętlony.`,
+      })),
+      turnId: 'turn-character-analysis',
+      analyzedAt: '2026-08-22T12:00:00.000Z',
+    },
+  };
+}
 
 function temporaryProjectRoot(): string {
   const parent = mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-db-'));

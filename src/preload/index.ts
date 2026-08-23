@@ -18,6 +18,11 @@ const api: TilemapGeneratorApi = {
     removeRecent: (rootPath) => ipcRenderer.invoke(ipcChannels.projectRemoveRecent, rootPath),
     settingsProposals: () => ipcRenderer.invoke(ipcChannels.projectSettingsProposals),
     reviewSettingsProposal: (input) => ipcRenderer.invoke(ipcChannels.projectSettingsProposalReview, input),
+    onChanged: (listener) => {
+      const handler = (_event: Electron.IpcRendererEvent, project: Parameters<typeof listener>[0]) => listener(project);
+      ipcRenderer.on(ipcChannels.projectChanged, handler);
+      return () => ipcRenderer.removeListener(ipcChannels.projectChanged, handler);
+    },
   },
   assets: {
     list: () => ipcRenderer.invoke(ipcChannels.assetsList),

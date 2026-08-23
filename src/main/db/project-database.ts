@@ -12,8 +12,16 @@ import path from 'node:path';
 import { drizzle, type BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import sharp from 'sharp';
 import {
+  characterAnimationFrameSize,
+  characterAnimationSettingsSchema,
+  characterAnimationSheetSize,
+  characterDirectionSchema,
+  characterDirectionsForProjection,
   defaultAssetSizing,
+  defaultCharacterAnimationSettings,
   exportIntegrationSchema,
+  generatorProviderSchema,
+  generatorProviderSelectionSchema,
   isRoadAssetCategory,
   isTileAssetCategory,
   projectProjectionSchema,
@@ -25,6 +33,10 @@ import type {
   AssetDetail,
   AssetSummary,
   AssetVersion,
+  CharacterAnimationSet,
+  CharacterAnimationSettings,
+  CharacterMovementAnalysis,
+  CharacterMovementDirectionAnalysis,
   CreateProjectSettingsProposalInput,
   CreateProjectInput,
   EnqueueGenerationInput,
@@ -48,7 +60,7 @@ import * as schema from './schema';
 
 const MANIFEST_NAME = 'tilemap-project.json';
 const DATABASE_NAME = 'registry.sqlite';
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 
 type Row = Record<string, unknown>;
 
@@ -69,6 +81,7 @@ export interface JobContext {
   relativeWidth: number;
   relativeHeight: number;
   footprint: { x: number; y: number };
+  characterAnimation: CharacterAnimationSettings | null;
 }
 
 export interface GeneratedVersionData {
@@ -89,6 +102,7 @@ export interface GeneratedVersionData {
   providerRunId?: string;
   generationMetadata?: Record<string, unknown>;
   roadVariants?: Array<Omit<RoadVariant, 'imageUrl'>>;
+  characterAnimation?: CharacterAnimationSet;
 }
 
 export interface AiVerificationContext {
@@ -232,6 +246,19 @@ export class ProjectDatabase {
           connection_mask INTEGER NOT NULL, final_path TEXT NOT NULL,
           width INTEGER NOT NULL, height INTEGER NOT NULL,
           PRIMARY KEY(version_id, connection_mask)
+        );
+        CREATE TABLE IF NOT EXISTS character_animation_sets (
+          version_id TEXT PRIMARY KEY REFERENCES asset_versions(id) ON DELETE CASCADE,
+          action TEXT NOT NULL DEFAULT 'walk',
+          frames_per_direction INTEGER NOT NULL DEFAULT 4,
+          frames_per_second INTEGER NOT NULL DEFAULT 8,
+          frame_width INTEGER NOT NULL,
+          frame_height INTEGER NOT NULL,
+          analysis_status TEXT NOT NULL DEFAULT 'pending',
+          analysis_summary TEXT NOT NULL DEFAULT '',
+          analysis_json TEXT NOT NULL DEFAULT '[]',
+          analysis_turn_id TEXT,
+          analyzed_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_asset_versions_asset ON asset_versions(asset_id, created_at DESC);
         CREATE TABLE IF NOT EXISTS generation_jobs (
@@ -518,6 +545,66 @@ export class ProjectDatabase {
     return this.getProject();
   }
 
+  setNewAssetGeneratorProviders(providers: readonly GeneratorProvider[]): ProjectInfo {
+    const selected = generatorProviderSelectionSchema.parse(providers);
+    const now = new Date().toISOString();
+    this.sqlite.prepare(`
+      UPDATE projects SET codex_generation_enabled = ?, comfyui_enabled = ?,
+        stable_diffusion_cpp_enabled = ?, updated_at = ?
+    `).run(
+      selected.includes('codex') ? 1 : 0,
+      selected.includes('comfyui') ? 1 : 0,
+      selected.includes('stable_diffusion_cpp') ? 1 : 0,
+      now,
+    );
+    return this.getProject();
+  }
+
+  generatorProviderForIteration(assetId: string, parentVersionId?: string): GeneratorProvider {
+    const row = parentVersionId
+      ? this.sqlite.prepare(`
+          SELECT generator_provider FROM asset_versions WHERE id = ? AND asset_id = ?
+        `).get(parentVersionId, assetId) as Row | undefined
+      : this.sqlite.prepare(`
+          SELECT generator_provider FROM asset_versions WHERE asset_id = ?
+          ORDER BY created_at DESC, rowid DESC LIMIT 1
+        `).get(assetId) as Row | undefined;
+    if (!row) {
+      throw new Error(parentVersionId
+        ? 'Wersja bazowa nie należy do wybranego assetu.'
+        : 'Asset nie ma wersji, z której można odziedziczyć generator.');
+    }
+    return generatorProviderSchema.parse(row.generator_provider);
+  }
+
+  enqueueNewAssetGenerations(
+    input: EnqueueGenerationInput,
+    providers: readonly GeneratorProvider[],
+    rememberSelection: boolean,
+  ): GenerationJob[] {
+    if (input.assetId) throw new Error('Fan-out generatorów jest dozwolony tylko dla nowego assetu.');
+    if (input.generatorProvider) {
+      throw new Error('Fan-out generatorów nie może zawierać pojedynczego generatora.');
+    }
+    const selected = generatorProviderSelectionSchema.parse(providers);
+    return this.sqlite.transaction(() => {
+      const jobs: GenerationJob[] = [];
+      let assetId: string | undefined;
+      for (const generatorProvider of selected) {
+        const job = this.enqueueGeneration({
+          ...input,
+          assetId,
+          generatorProvider,
+          generatorProviders: undefined,
+        });
+        jobs.push(job);
+        assetId ??= job.assetId;
+      }
+      if (rememberSelection) this.setNewAssetGeneratorProviders(selected);
+      return jobs;
+    })();
+  }
+
   enqueueGeneration(input: EnqueueGenerationInput): GenerationJob {
     const now = new Date().toISOString();
     const assetId = input.assetId ?? randomUUID();
@@ -532,8 +619,12 @@ export class ProjectDatabase {
       : undefined;
     if (input.assetId && !existingAsset) throw new Error('Nie znaleziono assetu dla iteracji.');
     const category = input.category ?? (existingAsset ? String(existingAsset.category) as AssetCategory : 'other');
-    if (this.getProject().projection === 'top_down' && category === 'elevated_tile') {
+    const project = this.getProject();
+    if (project.projection === 'top_down' && category === 'elevated_tile') {
       throw new Error('Elevated tile nie jest obsługiwany w projekcie top-down.');
+    }
+    if (input.characterAnimation && category !== 'character') {
+      throw new Error('Ustawienia animacji postaci są dozwolone tylko dla kategorii character.');
     }
     if ((isTileAssetCategory(category) || isRoadAssetCategory(category))
       && (input.footprint.x !== 1 || input.footprint.y !== 1)) {
@@ -550,6 +641,17 @@ export class ProjectDatabase {
     const relativeHeight = category === 'building' || category === 'character'
       ? input.relativeHeight ?? (preserveSizing ? Number(existingAsset.relative_height) : defaults.relativeHeight)
       : 1;
+    let characterAnimation: CharacterAnimationSettings | null = null;
+    let characterFrameSize: { width: number; height: number } | null = null;
+    if (category === 'character') {
+      const previousAnimation = preserveSizing && input.assetId
+        ? this.characterAnimationSettingsForIteration(input.assetId, input.parentVersionId)
+        : null;
+      characterAnimation = characterAnimationSettingsSchema.parse(
+        input.characterAnimation ?? previousAnimation ?? defaultCharacterAnimationSettings,
+      );
+      characterFrameSize = characterAnimationFrameSize(project, { relativeWidth, relativeHeight });
+    }
     const roadConnections = category === 'road_tile' ? 15 : 0;
     // The queued version needs a database value, but the asset worker replaces it
     // with a recommendation derived from the final PNG before review starts.
@@ -579,14 +681,32 @@ export class ProjectDatabase {
         INSERT INTO asset_versions (
           id, asset_id, parent_version_id, mode, status, prompt, feedback, category,
           elevation_levels, relative_width, relative_height, road_connections,
-          footprint_x, footprint_y, pivot_x, pivot_y, generator_provider, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          footprint_x, footprint_y, pivot_x, pivot_y, ai_verification_status,
+          generator_provider, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         versionId, assetId, input.parentVersionId ?? null, input.mode, input.prompt,
         input.feedback ?? '', category, elevationLevels, relativeWidth, relativeHeight, roadConnections,
         input.footprint.x, input.footprint.y,
-        provisionalPivot.x, provisionalPivot.y, generatorProvider, now, now,
+        provisionalPivot.x, provisionalPivot.y,
+        category === 'character' ? 'pending' : 'passed',
+        generatorProvider, now, now,
       );
+      if (characterAnimation && characterFrameSize) {
+        this.sqlite.prepare(`
+          INSERT INTO character_animation_sets (
+            version_id, action, frames_per_direction, frames_per_second,
+            frame_width, frame_height, analysis_status, analysis_summary, analysis_json
+          ) VALUES (?, ?, ?, ?, ?, ?, 'pending', '', '[]')
+        `).run(
+          versionId,
+          characterAnimation.action,
+          characterAnimation.framesPerDirection,
+          characterAnimation.framesPerSecond,
+          characterFrameSize.width,
+          characterFrameSize.height,
+        );
+      }
       this.sqlite.prepare(`
         INSERT INTO generation_jobs (
           id, asset_id, version_id, generator_provider, status, progress, created_at, updated_at
@@ -628,6 +748,7 @@ export class ProjectDatabase {
       WHERE j.id = ?
     `).get(jobId) as Row | undefined;
     if (!row) throw new Error('Nie znaleziono zadania generacji.');
+    const category = String(row.category) as AssetCategory;
     return {
       jobId: String(row.job_id), versionId: String(row.id), assetId: String(row.asset_id),
       assetName: String(row.asset_name), assetThreadId: row.asset_thread_id ? String(row.asset_thread_id) : null,
@@ -635,11 +756,14 @@ export class ProjectDatabase {
       parentFinalPath: row.parent_final_path ? String(row.parent_final_path) : null,
       mode: String(row.mode) as JobContext['mode'], prompt: String(row.prompt), feedback: String(row.feedback),
       generatorProvider: String(row.generator_provider) as GeneratorProvider,
-      category: String(row.category) as AssetCategory,
+      category,
       elevationLevels: Number(row.elevation_levels),
       relativeWidth: Number(row.relative_width),
       relativeHeight: Number(row.relative_height),
       footprint: { x: Number(row.footprint_x), y: Number(row.footprint_y) },
+      characterAnimation: category === 'character'
+        ? this.characterAnimationSettingsForIteration(String(row.asset_id), String(row.id))
+        : null,
     };
   }
 
@@ -661,6 +785,7 @@ export class ProjectDatabase {
 
   finalizeGeneration(jobId: string, data: GeneratedVersionData): void {
     const context = this.getJobContext(jobId);
+    const characterAnimation = this.validateCharacterAnimationForFinalization(context, data);
     const now = new Date().toISOString();
     this.sqlite.transaction(() => {
       this.sqlite.prepare(`
@@ -684,6 +809,37 @@ export class ProjectDatabase {
           VALUES (?, ?, ?, ?, ?)
         `).run(context.versionId, variant.connectionMask, variant.finalPath, variant.width, variant.height);
       }
+      if (characterAnimation) {
+        this.sqlite.prepare(`
+          INSERT INTO character_animation_sets (
+            version_id, action, frames_per_direction, frames_per_second,
+            frame_width, frame_height, analysis_status, analysis_summary,
+            analysis_json, analysis_turn_id, analyzed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'passed', ?, ?, ?, ?)
+          ON CONFLICT(version_id) DO UPDATE SET
+            action = excluded.action,
+            frames_per_direction = excluded.frames_per_direction,
+            frames_per_second = excluded.frames_per_second,
+            frame_width = excluded.frame_width,
+            frame_height = excluded.frame_height,
+            analysis_status = excluded.analysis_status,
+            analysis_summary = excluded.analysis_summary,
+            analysis_json = excluded.analysis_json,
+            analysis_turn_id = excluded.analysis_turn_id,
+            analyzed_at = excluded.analyzed_at
+        `).run(
+          context.versionId,
+          characterAnimation.settings.action,
+          characterAnimation.settings.framesPerDirection,
+          characterAnimation.settings.framesPerSecond,
+          characterAnimation.frameSize.width,
+          characterAnimation.frameSize.height,
+          characterAnimation.movementAnalysis.summary,
+          JSON.stringify(characterAnimation.movementAnalysis.directions),
+          characterAnimation.movementAnalysis.turnId,
+          characterAnimation.movementAnalysis.analyzedAt,
+        );
+      }
       this.sqlite.prepare(`
         UPDATE assets SET description = ?, updated_at = ? WHERE id = ?
       `).run(data.description, now, context.assetId);
@@ -692,6 +848,134 @@ export class ProjectDatabase {
           error = '', updated_at = ?, completed_at = ? WHERE id = ?
       `).run(now, now, jobId);
     })();
+  }
+
+  validateGenerationFinalization(jobId: string, data: GeneratedVersionData): void {
+    const context = this.getJobContext(jobId);
+    this.validateCharacterAnimationForFinalization(context, data);
+  }
+
+  recordRejectedCharacterMovementAnalysis(
+    versionId: string,
+    analysis: CharacterMovementAnalysis,
+  ): void {
+    const version = this.sqlite.prepare(`
+      SELECT category FROM asset_versions WHERE id = ?
+    `).get(versionId) as Row | undefined;
+    if (!version || String(version.category) !== 'character') {
+      throw new Error('Odrzuconą analizę ruchu można zapisać tylko dla wersji postaci.');
+    }
+    const expectedDirections = characterDirectionsForProjection(this.getProject().projection);
+    const expectedIds = expectedDirections.map((direction) => direction.id);
+    const analyzedIds = analysis.directions.map((direction) => direction.direction);
+    if (analysis.status !== 'failed'
+      || !analysis.summary.trim()
+      || !analysis.turnId?.trim()
+      || !analysis.analyzedAt
+      || Number.isNaN(Date.parse(analysis.analyzedAt))
+      || analyzedIds.length !== expectedIds.length
+      || analyzedIds.some((direction, index) => direction !== expectedIds[index])
+      || analysis.directions.some((direction) => !direction.message.trim())) {
+      throw new Error('Odrzucony raport ruchu postaci jest niekompletny.');
+    }
+    const now = new Date().toISOString();
+    this.sqlite.transaction(() => {
+      const result = this.sqlite.prepare(`
+        UPDATE character_animation_sets SET analysis_status = 'failed', analysis_summary = ?,
+          analysis_json = ?, analysis_turn_id = ?, analyzed_at = ? WHERE version_id = ?
+      `).run(
+        analysis.summary.trim(),
+        JSON.stringify(analysis.directions),
+        analysis.turnId,
+        analysis.analyzedAt,
+        versionId,
+      );
+      if (result.changes !== 1) throw new Error('Postać nie ma zapisanej konfiguracji animacji.');
+      this.sqlite.prepare(`
+        UPDATE asset_versions SET ai_verification_status = 'failed', ai_verification_message = ?,
+          updated_at = ? WHERE id = ?
+      `).run(analysis.summary.trim(), now, versionId);
+    })();
+  }
+
+  private validateCharacterAnimationForFinalization(
+    context: JobContext,
+    data: GeneratedVersionData,
+  ): CharacterAnimationSet | null {
+    if (context.category !== 'character') {
+      if (data.characterAnimation) {
+        throw new Error('Zestaw animacji postaci można zapisać tylko dla kategorii character.');
+      }
+      return null;
+    }
+    if (data.category !== 'character' || !context.characterAnimation || !data.characterAnimation) {
+      throw new Error('Postać wymaga kompletnego zestawu animacji kierunkowej przed finalizacją.');
+    }
+
+    const stored = this.sqlite.prepare(`
+      SELECT * FROM character_animation_sets WHERE version_id = ?
+    `).get(context.versionId) as Row | undefined;
+    if (!stored) throw new Error('Postać nie ma zapisanej konfiguracji animacji.');
+    const settings = characterAnimationSettingsSchema.parse(data.characterAnimation.settings);
+    if (settings.action !== context.characterAnimation.action
+      || settings.framesPerDirection !== context.characterAnimation.framesPerDirection
+      || settings.framesPerSecond !== context.characterAnimation.framesPerSecond) {
+      throw new Error('Wynik animacji postaci nie odpowiada konfiguracji zadania.');
+    }
+
+    const frameSize = { width: Number(stored.frame_width), height: Number(stored.frame_height) };
+    if (frameSize.width <= 0 || frameSize.height <= 0
+      || data.characterAnimation.frameSize.width !== frameSize.width
+      || data.characterAnimation.frameSize.height !== frameSize.height) {
+      throw new Error('Wynik animacji postaci ma nieprawidłowy rozmiar pojedynczej klatki.');
+    }
+    const sheetSize = characterAnimationSheetSize(frameSize, settings);
+    if (data.characterAnimation.sheetSize.width !== sheetSize.width
+      || data.characterAnimation.sheetSize.height !== sheetSize.height
+      || data.width !== sheetSize.width
+      || data.height !== sheetSize.height) {
+      throw new Error(`Arkusz animacji postaci musi mieć dokładnie ${sheetSize.width}×${sheetSize.height}px.`);
+    }
+
+    const expectedDirections = characterDirectionsForProjection(this.getProject().projection);
+    const resultDirectionIds = data.characterAnimation.directions.map((direction) => direction.id);
+    if (resultDirectionIds.length !== expectedDirections.length
+      || resultDirectionIds.some((direction, index) => direction !== expectedDirections[index].id)) {
+      throw new Error('Arkusz animacji postaci nie zawiera kanonicznego zestawu kierunków projektu.');
+    }
+    const analysis = data.characterAnimation.movementAnalysis;
+    if (analysis.status !== 'passed'
+      || !analysis.summary.trim()
+      || !analysis.turnId?.trim()
+      || !analysis.analyzedAt
+      || Number.isNaN(Date.parse(analysis.analyzedAt))) {
+      throw new Error('Postać nie przeszła obowiązkowej analizy poprawności ruchu.');
+    }
+    const expectedIds = expectedDirections.map((direction) => direction.id);
+    const analyzedIds = analysis.directions.map((direction) => direction.direction);
+    if (analyzedIds.length !== expectedIds.length
+      || analyzedIds.some((direction, index) => direction !== expectedIds[index])
+      || analysis.directions.some((direction) => direction.status !== 'passed' || !direction.message.trim())) {
+      throw new Error('Analiza ruchu musi zaliczyć każdy kanoniczny kierunek postaci.');
+    }
+
+    return {
+      settings,
+      directions: [...expectedDirections],
+      frameSize,
+      sheetSize,
+      movementAnalysis: {
+        status: 'passed',
+        summary: analysis.summary.trim(),
+        directions: analysis.directions.map((direction) => ({
+          direction: characterDirectionSchema.parse(direction.direction),
+          status: direction.status,
+          message: direction.message.trim(),
+        })),
+        turnId: analysis.turnId,
+        analyzedAt: analysis.analyzedAt,
+      },
+    };
   }
 
   getAiVerificationContext(versionId: string): AiVerificationContext {
@@ -1006,6 +1290,25 @@ export class ProjectDatabase {
       && (input.footprint.x !== 1 || input.footprint.y !== 1)) {
       throw new Error('Terrain tile i road tile muszą zachować footprint 1×1.');
     }
+    if (input.decision === 'approved' && category === 'character') {
+      const animation = this.mapCharacterAnimation(input.versionId, category);
+      const expectedDirections = characterDirectionsForProjection(this.getProject().projection)
+        .map((direction) => direction.id);
+      const analyzedDirections = animation?.movementAnalysis.directions ?? [];
+      if (!animation
+        || animation.movementAnalysis.status !== 'passed'
+        || !animation.movementAnalysis.summary.trim()
+        || !animation.movementAnalysis.turnId
+        || !animation.movementAnalysis.analyzedAt
+        || analyzedDirections.length !== expectedDirections.length
+        || analyzedDirections.some((direction, index) => (
+          direction.direction !== expectedDirections[index]
+          || direction.status !== 'passed'
+          || !direction.message.trim()
+        ))) {
+        throw new Error('Nie można zatwierdzić postaci bez kompletnej, zaliczonej analizy ruchu.');
+      }
+    }
     const now = new Date().toISOString();
     const assetId = String(row.asset_id);
     this.sqlite.transaction(() => {
@@ -1131,16 +1434,20 @@ export class ProjectDatabase {
       FROM asset_versions v JOIN assets a ON a.id = v.asset_id
       WHERE ${clauses.join(' AND ')} ORDER BY v.updated_at DESC LIMIT ?
     `).all(...params) as Row[];
-    return rows.map((row) => ({
-      assetId: row.asset_id, versionId: row.version_id, name: row.name,
-      category: row.category, status: row.status, description: row.ai_description,
-      elevationLevels: row.elevation_levels,
-      relativeSize: { width: row.relative_width, height: row.relative_height },
-      roadVariants: String(row.category) === 'road_tile' ? this.getRoadVariantMasks(String(row.version_id)) : [],
-      tags: this.getVersionTags(String(row.version_id)),
-      footprint: { x: row.footprint_x, y: row.footprint_y },
-      pivot: { x: row.pivot_x, y: row.pivot_y }, width: row.width, height: row.height,
-    }));
+    return rows.map((row) => {
+      const category = String(row.category) as AssetCategory;
+      return {
+        assetId: row.asset_id, versionId: row.version_id, name: row.name,
+        category, status: row.status, description: row.ai_description,
+        elevationLevels: row.elevation_levels,
+        relativeSize: { width: row.relative_width, height: row.relative_height },
+        roadVariants: category === 'road_tile' ? this.getRoadVariantMasks(String(row.version_id)) : [],
+        characterAnimation: this.mapCharacterAnimation(String(row.version_id), category),
+        tags: this.getVersionTags(String(row.version_id)),
+        footprint: { x: row.footprint_x, y: row.footprint_y },
+        pivot: { x: row.pivot_x, y: row.pivot_y }, width: row.width, height: row.height,
+      };
+    });
   }
 
   getAssetToolData(assetId: string, versionId?: string): { metadata: Record<string, unknown>; absolutePath: string } {
@@ -1149,13 +1456,15 @@ export class ProjectDatabase {
       WHERE a.id = ? AND v.id = COALESCE(?, a.current_approved_version_id)
     `).get(assetId, versionId ?? null) as Row | undefined;
     if (!row || !row.final_path) throw new Error('Asset nie ma dostępnej wersji obrazowej.');
+    const category = String(row.category) as AssetCategory;
     return {
       metadata: {
-        assetId, versionId: row.id, name: row.name, category: row.category,
+        assetId, versionId: row.id, name: row.name, category,
         status: row.status, tags: this.getVersionTags(String(row.id)),
         elevationLevels: row.elevation_levels,
         relativeSize: { width: row.relative_width, height: row.relative_height },
-        roadVariants: String(row.category) === 'road_tile' ? this.getRoadVariantMasks(String(row.id)) : [],
+        roadVariants: category === 'road_tile' ? this.getRoadVariantMasks(String(row.id)) : [],
+        characterAnimation: this.mapCharacterAnimation(String(row.id), category),
         description: row.ai_description,
         footprint: { x: row.footprint_x, y: row.footprint_y },
         pivot: { x: row.pivot_x, y: row.pivot_y }, width: row.width, height: row.height,
@@ -1165,7 +1474,9 @@ export class ProjectDatabase {
   }
 
   getStyleHistory(): StyleSummaryRevision[] {
-    return (this.sqlite.prepare('SELECT * FROM style_summary_revisions ORDER BY created_at DESC').all() as Row[])
+    return (this.sqlite.prepare(`
+      SELECT * FROM style_summary_revisions ORDER BY created_at DESC, rowid DESC
+    `).all() as Row[])
       .map(mapStyleRevision);
   }
 
@@ -1292,6 +1603,67 @@ export class ProjectDatabase {
     };
   }
 
+  private characterAnimationSettingsForIteration(
+    assetId: string,
+    parentVersionId?: string,
+  ): CharacterAnimationSettings | null {
+    const row = parentVersionId
+      ? this.sqlite.prepare(`
+          SELECT c.action, c.frames_per_direction, c.frames_per_second
+          FROM character_animation_sets c
+          JOIN asset_versions v ON v.id = c.version_id
+          WHERE v.asset_id = ? AND v.id = ?
+        `).get(assetId, parentVersionId) as Row | undefined
+      : this.sqlite.prepare(`
+          SELECT c.action, c.frames_per_direction, c.frames_per_second
+          FROM character_animation_sets c
+          JOIN asset_versions v ON v.id = c.version_id
+          WHERE v.asset_id = ?
+          ORDER BY v.created_at DESC, v.rowid DESC
+          LIMIT 1
+        `).get(assetId) as Row | undefined;
+    if (!row) return null;
+    return characterAnimationSettingsSchema.parse({
+      action: row.action,
+      framesPerDirection: Number(row.frames_per_direction),
+      framesPerSecond: Number(row.frames_per_second),
+    });
+  }
+
+  private mapCharacterAnimation(versionId: string, category: AssetCategory): CharacterAnimationSet | null {
+    if (category !== 'character') return null;
+    const row = this.sqlite.prepare(`
+      SELECT * FROM character_animation_sets WHERE version_id = ?
+    `).get(versionId) as Row | undefined;
+    if (!row) return null;
+    const settings = characterAnimationSettingsSchema.parse({
+      action: row.action,
+      framesPerDirection: Number(row.frames_per_direction),
+      framesPerSecond: Number(row.frames_per_second),
+    });
+    const frameSize = { width: Number(row.frame_width), height: Number(row.frame_height) };
+    if (frameSize.width <= 0 || frameSize.height <= 0) {
+      throw new Error('Baza zawiera nieprawidłowy rozmiar klatki animacji postaci.');
+    }
+    const status = String(row.analysis_status);
+    if (!['pending', 'passed', 'failed'].includes(status)) {
+      throw new Error('Baza zawiera nieprawidłowy status analizy ruchu postaci.');
+    }
+    return {
+      settings,
+      directions: [...characterDirectionsForProjection(this.getProject().projection)],
+      frameSize,
+      sheetSize: characterAnimationSheetSize(frameSize, settings),
+      movementAnalysis: {
+        status: status as CharacterMovementAnalysis['status'],
+        summary: String(row.analysis_summary),
+        directions: parseCharacterMovementDirectionAnalyses(row.analysis_json),
+        turnId: row.analysis_turn_id ? String(row.analysis_turn_id) : null,
+        analyzedAt: row.analyzed_at ? String(row.analyzed_at) : null,
+      },
+    };
+  }
+
   private mapVersion(row: Row): AssetVersion {
     const finalPath = row.final_path ? String(row.final_path) : null;
     const roadVariants = (this.sqlite.prepare(`
@@ -1304,16 +1676,18 @@ export class ProjectDatabase {
       width: Number(variant.width),
       height: Number(variant.height),
     }));
+    const category = String(row.category) as AssetCategory;
     return {
       id: String(row.id), assetId: String(row.asset_id),
       parentVersionId: row.parent_version_id ? String(row.parent_version_id) : null,
       mode: String(row.mode) as AssetVersion['mode'], status: String(row.status) as VersionStatus,
-      prompt: String(row.prompt), feedback: String(row.feedback), category: String(row.category) as AssetCategory,
+      prompt: String(row.prompt), feedback: String(row.feedback), category,
       elevationLevels: Number(row.elevation_levels),
       relativeWidth: Number(row.relative_width),
       relativeHeight: Number(row.relative_height),
       roadConnections: Number(row.road_connections),
       roadVariants,
+      characterAnimation: this.mapCharacterAnimation(String(row.id), category),
       tags: this.getVersionTags(String(row.id)), finalPath,
       imageUrl: finalPath ? makeAssetUrl(finalPath) : null,
       width: row.width === null ? null : Number(row.width), height: row.height === null ? null : Number(row.height),
@@ -1377,6 +1751,31 @@ function parseJsonRecord(value: unknown): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function parseCharacterMovementDirectionAnalyses(value: unknown): CharacterMovementDirectionAnalysis[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(String(value ?? '[]')) as unknown;
+  } catch {
+    throw new Error('Baza zawiera uszkodzony raport analizy ruchu postaci.');
+  }
+  if (!Array.isArray(parsed)) throw new Error('Raport analizy ruchu postaci nie jest listą kierunków.');
+  return parsed.map((entry) => {
+    if (!entry || typeof entry !== 'object') {
+      throw new Error('Raport analizy ruchu postaci zawiera nieprawidłowy wpis kierunku.');
+    }
+    const record = entry as Record<string, unknown>;
+    const status = String(record.status);
+    if (status !== 'passed' && status !== 'failed') {
+      throw new Error('Raport analizy ruchu postaci zawiera nieprawidłowy status kierunku.');
+    }
+    return {
+      direction: characterDirectionSchema.parse(record.direction),
+      status,
+      message: String(record.message ?? ''),
+    };
+  });
 }
 
 function mapGenerationLog(row: Row): GenerationLogEntry {

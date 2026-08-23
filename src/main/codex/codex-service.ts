@@ -5,6 +5,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { assetCategories, pivotSchema, type CodexHealth } from '../../shared/domain';
+import { tilemapMcpServerName } from '../../shared/mcp';
 import type { ProjectDatabase } from '../db/project-database';
 import { nullLogger, type Logger } from '../services/app-logger';
 import { CodexAppServerClient, type CodexNotification } from './app-server-client';
@@ -66,7 +67,7 @@ export class CodexService {
       this.client = new CodexAppServerClient(
         database.rootPath,
         (method, params) => this.handleServerRequest(method, params),
-        { command: detected.command, args: [...detected.prefixArgs, 'app-server', '--listen', 'stdio://'], shell: false },
+        { command: detected.command, args: codexAppServerArgs(detected.prefixArgs), shell: false },
       );
       this.client.on('notification', (notification: CodexNotification) => this.handleNotification(notification));
       this.client.on('stderr', (message) => {
@@ -182,16 +183,16 @@ export class CodexService {
     return threadId;
   }
 
-  async startUtilityThread(): Promise<string> {
+  async startUtilityThread(options: { readOnly?: boolean; serviceName?: string } = {}): Promise<string> {
     const { client, database } = this.requireReady();
     const response = await client.request('thread/start', {
       cwd: database.rootPath,
       runtimeWorkspaceRoots: [database.rootPath],
       approvalPolicy: 'never',
-      sandbox: 'workspace-write',
-      serviceName: 'tilemap-generator-style',
+      sandbox: options.readOnly ? 'read-only' : 'workspace-write',
+      serviceName: options.serviceName ?? 'tilemap-generator-style',
       developerInstructions: agentInstructions(),
-      dynamicTools: registryDynamicTools,
+      ...(options.readOnly ? {} : { dynamicTools: registryDynamicTools }),
       ephemeral: true,
     }, 45_000) as { thread?: { id?: string } };
     if (!response.thread?.id) throw new Error('Nie udało się utworzyć wątku pomocniczego.');
@@ -205,11 +206,12 @@ export class CodexService {
     onEvent?: (notification: CodexNotification) => void,
     timeoutMs = 15 * 60_000,
     signal?: AbortSignal,
+    options: { readOnly?: boolean } = {},
   ): Promise<TurnResult> {
     const previous = this.threadSerials.get(threadId) ?? Promise.resolve();
     const start = () => {
       if (signal?.aborted) throw cancellationError();
-      return this.runTurnNow(threadId, input, outputSchema, onEvent, timeoutMs, signal);
+      return this.runTurnNow(threadId, input, outputSchema, onEvent, timeoutMs, signal, options);
     };
     const next = previous.then(start, start);
     const settled = next.then(() => undefined, () => undefined);
@@ -227,16 +229,19 @@ export class CodexService {
     onEvent: ((notification: CodexNotification) => void) | undefined,
     timeoutMs: number,
     signal: AbortSignal | undefined,
+    options: { readOnly?: boolean },
   ): Promise<TurnResult> {
     const { client } = this.requireReady();
     const response = await client.request('turn/start', {
       threadId,
       input,
       approvalPolicy: 'never',
-      sandboxPolicy: {
-        type: 'workspaceWrite', writableRoots: [], networkAccess: false,
-        excludeTmpdirEnvVar: false, excludeSlashTmp: false,
-      },
+      sandboxPolicy: options.readOnly
+        ? { type: 'readOnly', networkAccess: false }
+        : {
+          type: 'workspaceWrite', writableRoots: [], networkAccess: false,
+          excludeTmpdirEnvVar: false, excludeSlashTmp: false,
+        },
       outputSchema,
     }, 60_000) as { turn?: { id?: string } };
     const turnId = response.turn?.id;
@@ -382,6 +387,19 @@ export class CodexService {
   }
 }
 
+export function codexAppServerArgs(prefixArgs: readonly string[]): string[] {
+  return [
+    ...prefixArgs,
+    '-c',
+    `mcp_servers.${tilemapMcpServerName}.command="tilemap-mcp-disabled"`,
+    '-c',
+    `mcp_servers.${tilemapMcpServerName}.enabled=false`,
+    'app-server',
+    '--listen',
+    'stdio://',
+  ];
+}
+
 function cancellationError(): Error {
   const error = new Error('Generacja została anulowana.');
   error.name = 'AbortError';
@@ -500,7 +518,7 @@ function agentInstructions(): string {
     'Operate only inside the current project workspace. Do not modify application source code.',
     'Use registry tools read-only when existing approved assets or tags can improve consistency.',
     'Use the explicitly supplied imagegen skill for raster generation and editing.',
-    'Never use the CLI/API fallback or ask for an API key. If built-in transparent workflow is unsuitable, report needs_user_decision.',
+    'Never use the CLI/API fallback or ask for an API key. Follow the task-specific output contract: for character jobs preserve the best native PNG and let the application validate and retry alpha or canvas defects; do not report needs_user_decision for those defects.',
     'Always preserve prior versions and write only into the exact staging directory named in the request.',
     'Finish with data matching the supplied output JSON schema.',
   ].join('\n');

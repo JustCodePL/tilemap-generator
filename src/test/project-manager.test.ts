@@ -9,6 +9,7 @@ vi.mock('electron', () => ({
 }));
 
 import { ProjectManager } from '../main/services/project-manager';
+import { ProjectDatabase } from '../main/db/project-database';
 import { dialog } from 'electron';
 
 let temporaryDirectory = '';
@@ -85,4 +86,61 @@ it('odrzuca niewybrany albo niepusty katalog biblioteki', async () => {
     filePaths: [nonEmptyDirectory],
   });
   await expect(manager.chooseStorageDirectory()).rejects.toThrow(/nie jest pusty/);
+});
+
+it('udostępnia MCP tylko poprawne ostatnie projekty i otwiera je po projectId', () => {
+  const firstRoot = path.join(temporaryDirectory, 'first-project');
+  const secondRoot = path.join(temporaryDirectory, 'second-project');
+  const first = ProjectDatabase.create(firstRoot, {
+    name: 'Pierwszy', artBrief: 'Leśny świat', projection: 'isometric', tileWidthPx: 64,
+  });
+  const firstId = first.getProject().id;
+  first.close();
+  const second = ProjectDatabase.create(secondRoot, {
+    name: 'Drugi', artBrief: 'Kosmiczny świat', projection: 'top_down', tileWidthPx: 65,
+  });
+  const secondId = second.getProject().id;
+  second.close();
+  const missingRoot = path.join(temporaryDirectory, 'missing-project');
+  writeFileSync(path.join(temporaryDirectory, 'settings.json'), JSON.stringify({ recentProjects: [
+    { name: 'Brakujący', rootPath: missingRoot, openedAt: '2026-08-07T12:00:00.000Z' },
+    { name: 'Drugi', rootPath: secondRoot, openedAt: '2026-08-07T11:00:00.000Z' },
+    { name: 'Pierwszy', rootPath: firstRoot, openedAt: '2026-08-07T10:00:00.000Z' },
+  ] }), 'utf8');
+  const manager = new ProjectManager();
+
+  expect(manager.availableProjects()).toMatchObject([
+    { projectId: secondId, name: 'Drugi', projection: 'top_down', active: false },
+    { projectId: firstId, name: 'Pierwszy', projection: 'isometric', active: false },
+  ]);
+  expect(manager.availableProjects().some((project) => project.rootPath === missingRoot)).toBe(false);
+
+  const opened = manager.openAvailableProject(secondId);
+  expect(opened.getProject().id).toBe(secondId);
+  expect(manager.availableProjects()[0]).toMatchObject({ projectId: secondId, active: true });
+  manager.close();
+});
+
+it('odrzuca zduplikowany projectId zamiast wybierać bibliotekę po cichu', () => {
+  const firstRoot = path.join(temporaryDirectory, 'first-copy');
+  const secondRoot = path.join(temporaryDirectory, 'second-copy');
+  mkdirSync(firstRoot);
+  mkdirSync(secondRoot);
+  const manifest = {
+    schemaVersion: 1,
+    id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    name: 'Ta sama gra',
+    projection: 'top_down',
+    database: 'registry.sqlite',
+  };
+  for (const rootPath of [firstRoot, secondRoot]) {
+    writeFileSync(path.join(rootPath, 'tilemap-project.json'), JSON.stringify(manifest), 'utf8');
+    writeFileSync(path.join(rootPath, 'registry.sqlite'), '', 'utf8');
+  }
+  writeFileSync(path.join(temporaryDirectory, 'settings.json'), JSON.stringify({ recentProjects: [
+    { name: 'Kopia 1', rootPath: firstRoot, openedAt: '2026-08-07T11:00:00.000Z' },
+    { name: 'Kopia 2', rootPath: secondRoot, openedAt: '2026-08-07T10:00:00.000Z' },
+  ] }), 'utf8');
+
+  expect(() => new ProjectManager().availableProjects()).toThrow(/więcej niż jednej bibliotece/);
 });

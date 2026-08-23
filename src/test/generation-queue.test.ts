@@ -1,8 +1,8 @@
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import sharp from 'sharp';
-import { afterEach, expect, it } from 'vitest';
+import sharp, { type OverlayOptions } from 'sharp';
+import { afterEach, expect, it, vi } from 'vitest';
 import type { GenerationEvent } from '../shared/domain';
 import type { CodexService } from '../main/codex/codex-service';
 import { ProjectDatabase } from '../main/db/project-database';
@@ -12,6 +12,45 @@ const temporaryDirectories: string[] = [];
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
+
+it('nie odłącza projektu, dopóki aktywne zadanie faktycznie nie zakończy anulowania', async () => {
+  const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-shutdown-')), 'project');
+  temporaryDirectories.push(path.dirname(root));
+  mkdirSync(root);
+  const database = ProjectDatabase.create(root, {
+    name: 'Bezpieczne zamykanie', artBrief: '', tileWidthPx: 64,
+  });
+  let releaseTurn: () => void = () => undefined;
+  let markStarted: () => void = () => undefined;
+  const started = new Promise<void>((resolve) => { markStarted = () => resolve(); });
+  const blockedTurn = new Promise<void>((resolve) => { releaseTurn = () => resolve(); });
+  const fakeCodex = {
+    runExclusive: async <T>(operation: () => Promise<T>) => operation(),
+    ensureAssetThread: async () => 'thread-blocked-shutdown',
+    skillPath: () => '/tmp/imagegen/SKILL.md',
+    interruptActiveTurn: async () => undefined,
+    runTurn: async () => {
+      markStarted();
+      await blockedTurn;
+      throw new Error('Testowe zadanie zakończone po zwolnieniu blokady.');
+    },
+  } as unknown as CodexService;
+  const queue = new GenerationQueue(fakeCodex);
+  queue.attach(database);
+  const terminal = waitForGenerationTerminal(queue);
+  queue.enqueue({
+    name: 'Wolny asset', prompt: '', mode: 'generate', category: 'other', footprint: { x: 1, y: 1 },
+  });
+  await started;
+
+  await expect(queue.shutdown(10)).rejects.toThrow('aktywne zadania nie zakończyły anulowania');
+  expect(database.getProject().name).toBe('Bezpieczne zamykanie');
+
+  releaseTurn();
+  await expect(terminal).resolves.toMatchObject({ type: 'failed' });
+  await queue.shutdown();
+  database.close();
 });
 
 it('uruchamia najwyżej skonfigurowaną liczbę różnych assetów jednocześnie', async () => {
@@ -156,7 +195,9 @@ it('automatycznie poprawia teren po nieudanym deterministycznym teście szwów',
     name: 'Łąka', prompt: '', mode: 'generate', category: 'flat_tile', footprint: { x: 1, y: 1 },
   });
 
-  await expect(terminal).resolves.toMatchObject({ type: 'completed', jobId: job.id });
+  const terminalEvent = await terminal;
+  if (terminalEvent.type === 'failed') throw new Error(terminalEvent.message);
+  expect(terminalEvent).toMatchObject({ type: 'completed', jobId: job.id });
   expect(turns).toBe(2);
   expect(generationPrompt).toContain('Asset title: Łąka');
   expect(generationPrompt).toContain('Generate the asset from its title and project context.');
@@ -249,7 +290,9 @@ it('generuje pełny kwadrat top-down i ponawia go na prostokątnej siatce', asyn
     name: 'Łąka z góry', prompt: '', mode: 'generate', category: 'flat_tile', footprint: { x: 1, y: 1 },
   });
 
-  await expect(terminal).resolves.toMatchObject({ type: 'completed', jobId: job.id });
+  const terminalEvent = await terminal;
+  if (terminalEvent.type === 'failed') throw new Error(terminalEvent.message);
+  expect(terminalEvent).toMatchObject({ type: 'completed', jobId: job.id });
   expect(turns).toBe(2);
   expect(generationPrompt).toContain('orthographic top-down');
   expect(generationPrompt).toContain('fixed 1:1 orthogonal grid');
@@ -579,7 +622,7 @@ it('automatycznie poprawia i zapisuje kompletny zestaw 16 road tile', async () =
   database.close();
 });
 
-it('tworzy osobny wariant Codex, ComfyUI i stable-diffusion.cpp dla jednego żądania', async () => {
+it('tworzy warianty tylko dla generatorów wybranych przy nowym assecie i zapamiętuje wybór', async () => {
   const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-provider-fanout-')), 'project');
   temporaryDirectories.push(path.dirname(root));
   mkdirSync(root);
@@ -607,15 +650,792 @@ it('tworzy osobny wariant Codex, ComfyUI i stable-diffusion.cpp dla jednego żą
   const jobs = queue.enqueueEnabled({
     name: 'Trzy chaty', prompt: 'Drewniana chata', mode: 'generate', category: 'building',
     relativeWidth: 2, relativeHeight: 2, footprint: { x: 2, y: 2 },
+    generatorProviders: ['codex', 'stable_diffusion_cpp'],
   });
 
-  expect(jobs).toHaveLength(3);
-  expect(jobs.map((job) => job.generatorProvider)).toEqual(['codex', 'comfyui', 'stable_diffusion_cpp']);
+  expect(jobs).toHaveLength(2);
+  expect(jobs.map((job) => job.generatorProvider)).toEqual(['codex', 'stable_diffusion_cpp']);
   expect(new Set(jobs.map((job) => job.assetId))).toEqual(new Set([jobs[0].assetId]));
   expect(database.getAsset(jobs[0].assetId)?.versions.map((version) => version.generatorProvider).sort())
-    .toEqual(['codex', 'comfyui', 'stable_diffusion_cpp'].sort());
+    .toEqual(['codex', 'stable_diffusion_cpp'].sort());
   expect(database.getAsset(jobs[0].assetId)?.versions.map((version) => version.footprint))
-    .toEqual([{ x: 2, y: 2 }, { x: 2, y: 2 }, { x: 2, y: 2 }]);
+    .toEqual([{ x: 2, y: 2 }, { x: 2, y: 2 }]);
+  expect(database.getProject()).toMatchObject({
+    codexGenerationEnabled: true,
+    comfyUiEnabled: false,
+    stableDiffusionCppEnabled: true,
+  });
   await queue.shutdown();
   database.close();
 });
+
+it('używa zapamiętanego zestawu dla kolejnego assetu, lecz iterację ogranicza do providera parenta', async () => {
+  const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-provider-memory-')), 'project');
+  temporaryDirectories.push(path.dirname(root));
+  mkdirSync(root);
+  const database = ProjectDatabase.create(root, {
+    name: 'Pamięć providerów', artBrief: '', tileWidthPx: 64,
+  });
+  database.setNewAssetGeneratorProviders(['comfyui', 'stable_diffusion_cpp']);
+  const unavailable = { health: () => ({ state: 'unavailable', message: 'Test enqueue.' }) };
+  const queue = new GenerationQueue(
+    unavailable as unknown as CodexService,
+    undefined,
+    unavailable as never,
+    unavailable as never,
+  );
+  queue.attach(database);
+
+  const initialJobs = queue.enqueueEnabled({
+    name: 'Kuźnia', prompt: '', mode: 'generate', category: 'building',
+    footprint: { x: 2, y: 2 },
+  });
+  expect(initialJobs.map((job) => job.generatorProvider)).toEqual(['comfyui', 'stable_diffusion_cpp']);
+  const comfyParent = initialJobs.find((job) => job.generatorProvider === 'comfyui')!;
+
+  const iterationJobs = queue.enqueueEnabled({
+    assetId: comfyParent.assetId,
+    parentVersionId: comfyParent.versionId,
+    name: 'Kuźnia', prompt: '', feedback: 'Więcej sadzy', mode: 'edit', category: 'building',
+    footprint: { x: 2, y: 2 },
+  });
+  expect(iterationJobs).toHaveLength(1);
+  expect(iterationJobs[0].generatorProvider).toBe('comfyui');
+  expect(database.getProject()).toMatchObject({
+    codexGenerationEnabled: false,
+    comfyUiEnabled: true,
+    stableDiffusionCppEnabled: true,
+  });
+
+  await queue.shutdown();
+  database.close();
+});
+
+it('wycofuje cały fan-out i preferencje bez zdarzeń, gdy zawiedzie wersja lub zapis wyboru', async () => {
+  for (const failure of ['second-version', 'preferences'] as const) {
+    const root = path.join(mkdtempSync(path.join(os.tmpdir(), `tilemap-generator-atomic-${failure}-`)), 'project');
+    temporaryDirectories.push(path.dirname(root));
+    mkdirSync(root);
+    const database = ProjectDatabase.create(root, {
+      name: 'Atomowy fan-out', artBrief: '', tileWidthPx: 64,
+    });
+    if (failure === 'second-version') {
+      database.sqlite.exec(`
+        CREATE TRIGGER inject_second_version_failure
+        BEFORE INSERT ON asset_versions
+        WHEN NEW.generator_provider = 'stable_diffusion_cpp'
+        BEGIN
+          SELECT RAISE(ABORT, 'injected second enqueue failure');
+        END;
+      `);
+    } else {
+      database.sqlite.exec(`
+        CREATE TRIGGER inject_preference_failure
+        BEFORE UPDATE OF codex_generation_enabled, comfyui_enabled, stable_diffusion_cpp_enabled ON projects
+        BEGIN
+          SELECT RAISE(ABORT, 'injected preference failure');
+        END;
+      `);
+    }
+    const unavailable = { health: () => ({ state: 'unavailable', message: 'Test enqueue.' }) };
+    const queue = new GenerationQueue(
+      unavailable as unknown as CodexService,
+      undefined,
+      unavailable as never,
+      unavailable as never,
+    );
+    const pump = vi.spyOn(queue as unknown as { pump(): Promise<void> }, 'pump');
+    queue.attach(database);
+    pump.mockClear();
+    const events: GenerationEvent[] = [];
+    queue.on('event', (event: GenerationEvent) => events.push(event));
+
+    expect(() => queue.enqueueEnabled({
+      name: 'Kuźnia', prompt: '', mode: 'generate', category: 'building',
+      footprint: { x: 2, y: 2 },
+      generatorProviders: ['comfyui', 'stable_diffusion_cpp'],
+    })).toThrow(failure === 'second-version' ? /second enqueue failure/ : /preference failure/);
+
+    for (const table of ['assets', 'asset_versions', 'generation_jobs']) {
+      expect(database.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get())
+        .toMatchObject({ count: 0 });
+    }
+    expect(database.getProject()).toMatchObject({
+      codexGenerationEnabled: true,
+      comfyUiEnabled: false,
+      stableDiffusionCppEnabled: false,
+    });
+    expect(events).toEqual([]);
+    expect(pump).not.toHaveBeenCalled();
+
+    await queue.shutdown();
+    database.close();
+  }
+});
+
+it('publikuje postać dopiero po obowiązkowej analizie ruchu we wszystkich kierunkach', async () => {
+  const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-character-')), 'project');
+  temporaryDirectories.push(path.dirname(root));
+  mkdirSync(root);
+  const database = ProjectDatabase.create(root, {
+    name: 'Postać izometryczna', artBrief: 'Czytelna bohaterka', tileWidthPx: 32,
+  });
+  database.updateProjectSettings({
+    name: 'Postać izometryczna', artBrief: 'Czytelna bohaterka', tileWidthPx: 32,
+    pixelsPerUnit: 32, maxConcurrentJobs: 1, aiVerificationEnabled: false,
+  });
+  const turnKinds: string[] = [];
+  let generationPrompt = '';
+  let analysisPrompt = '';
+  let analysisImages: Array<Record<string, unknown>> = [];
+  let analysisSawFinalOutput = true;
+  const fakeCodex = {
+    health: () => ({ state: 'ready', message: 'Gotowy' }),
+    runExclusive: async <T>(operation: () => Promise<T>) => operation(),
+    ensureAssetThread: async () => 'thread-character-generation',
+    startUtilityThread: async () => 'thread-character-analysis',
+    skillPath: () => '/Applications/ChatGPT.app/imagegen/SKILL.md',
+    interruptActiveTurn: async () => undefined,
+    runTurn: async (_threadId: string, input: Array<Record<string, unknown>>) => {
+      const isGeneration = input.some((item) => item.type === 'skill');
+      turnKinds.push(isGeneration ? 'generation' : 'analysis');
+      if (isGeneration) {
+        generationPrompt = String(input[0].text);
+        const outputPath = generationPrompt.match(/exactly (.+?final\.png)/i)?.[1];
+        if (!outputPath) throw new Error('Test nie znalazł final.png w prompcie postaci.');
+        await writeCharacterSheet(outputPath, 32, 32);
+        return {
+          turnId: 'turn-character-generation', items: [],
+          finalMessage: JSON.stringify({
+            status: 'completed', finalPath: outputPath, category: 'character', tags: ['bohaterka'],
+            pivot: { x: 0.5, y: 0 }, description: 'Bohaterka z pełnym chodem', message: '',
+          }),
+        };
+      }
+      analysisPrompt = String(input[0].text);
+      analysisImages = input.filter((item) => item.type === 'localImage');
+      analysisSawFinalOutput = database.listAssets()[0]?.latestVersion?.finalPath !== null;
+      return {
+        turnId: 'turn-character-analysis', items: [],
+        finalMessage: JSON.stringify(passedMovementAnalysis([
+          'north_west', 'north_east', 'south_east', 'south_west',
+        ])),
+      };
+    },
+  } as unknown as CodexService;
+  const queue = new GenerationQueue(fakeCodex);
+  queue.attach(database);
+  const terminal = waitForGenerationTerminal(queue);
+  const job = queue.enqueue({
+    name: 'Bohaterka', prompt: 'Czerwona peleryna', mode: 'generate', category: 'character',
+    relativeWidth: 1, relativeHeight: 2, footprint: { x: 1, y: 1 },
+    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+  });
+
+  const terminalEvent = await terminal;
+  if (terminalEvent.type === 'failed') throw new Error(terminalEvent.message);
+  expect(terminalEvent).toMatchObject({ type: 'completed', jobId: job.id });
+  expect(turnKinds).toEqual(['generation', 'analysis']);
+  expect(analysisSawFinalOutput).toBe(false);
+  expect(generationPrompt).toContain('exactly 160x128px with 5 columns and 4 rows');
+  expect(generationPrompt).toContain('overrides any additional request for a one-off action pose');
+  expect(generationPrompt).toContain('Held or worn equipment explicitly belonging to the character is allowed');
+  expect(generationPrompt).toContain('Imagegen may return a supported native canvas size');
+  expect(generationPrompt).toContain('Use exactly one built-in image generation call');
+  expect(generationPrompt).toContain('never from the preview or from RGB values hidden under alpha=0');
+  expect(generationPrompt).toContain('Do not make a second image-generation/edit call');
+  expect(generationPrompt).toContain('NW (north_west), NE (north_east), SE (south_east), SW (south_west)');
+  expect(generationPrompt).toContain('separate mandatory read-only motion-analysis turn');
+  expect(analysisPrompt).toContain('wyłącznie odczytową analizę animacji ruchu postaci');
+  expect(analysisPrompt).toContain('W4→W1');
+  expect(analysisPrompt).toContain('NW (north_west), NE (north_east), SE (south_east), SW (south_west)');
+  expect(analysisImages).toHaveLength(6);
+  expect(database.getAsset(job.assetId)?.versions[0]).toMatchObject({
+    status: 'needs_review', width: 160, height: 128, aiVerificationStatus: 'passed',
+    pivot: { x: 0.5, y: 0.125 },
+    characterAnimation: {
+      settings: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+      frameSize: { width: 32, height: 32 },
+      sheetSize: { width: 160, height: 128 },
+      movementAnalysis: {
+        status: 'passed', turnId: 'turn-character-analysis',
+        directions: [
+          { direction: 'north_west', status: 'passed' },
+          { direction: 'north_east', status: 'passed' },
+          { direction: 'south_east', status: 'passed' },
+          { direction: 'south_west', status: 'passed' },
+        ],
+      },
+    },
+  });
+  await queue.shutdown();
+  database.close();
+});
+
+it('ponawia samą analizę ruchu po błędzie technicznym bez ponownego generowania arkusza', async () => {
+  const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-character-analysis-retry-')), 'project');
+  temporaryDirectories.push(path.dirname(root));
+  mkdirSync(root);
+  const database = ProjectDatabase.create(root, {
+    name: 'Retry analizatora postaci', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+  });
+  let generationTurns = 0;
+  let analysisTurns = 0;
+  const fakeCodex = {
+    health: () => ({ state: 'ready', message: 'Gotowy' }),
+    runExclusive: async <T>(operation: () => Promise<T>) => operation(),
+    ensureAssetThread: async () => 'thread-character-analysis-retry',
+    startUtilityThread: async () => `thread-character-analysis-retry-${analysisTurns + 1}`,
+    skillPath: () => '/Applications/ChatGPT.app/imagegen/SKILL.md',
+    interruptActiveTurn: async () => undefined,
+    runTurn: async (_threadId: string, input: Array<Record<string, unknown>>) => {
+      if (input.some((item) => item.type === 'skill')) {
+        generationTurns += 1;
+        const prompt = String(input[0].text);
+        const outputPath = prompt.match(/exactly (.+?final\.png)/i)?.[1];
+        if (!outputPath) throw new Error('Test nie znalazł final.png w prompcie postaci.');
+        await writeCharacterSheet(outputPath, 32, 32);
+        return {
+          turnId: 'turn-character-analysis-retry-generation', items: [],
+          finalMessage: JSON.stringify({
+            status: 'completed', finalPath: outputPath, category: 'character', tags: [],
+            pivot: { x: 0.5, y: 0 }, description: 'Postać', message: '',
+          }),
+        };
+      }
+      analysisTurns += 1;
+      return {
+        turnId: `turn-character-analysis-retry-${analysisTurns}`, items: [],
+        finalMessage: analysisTurns === 1
+          ? '{"status":"passed","summary":"niepełny raport"}'
+          : JSON.stringify(passedMovementAnalysis(['north', 'east', 'south', 'west'])),
+      };
+    },
+  } as unknown as CodexService;
+  const queue = new GenerationQueue(fakeCodex);
+  queue.attach(database);
+  const terminal = waitForGenerationTerminal(queue);
+  const job = queue.enqueue({
+    name: 'Zwiadowca', prompt: '', mode: 'generate', category: 'character',
+    relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
+    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+  });
+
+  await expect(terminal).resolves.toMatchObject({ type: 'completed', jobId: job.id });
+  expect(generationTurns).toBe(1);
+  expect(analysisTurns).toBe(2);
+  expect(database.listGenerationLogs(job.assetId).some((entry) => (
+    entry.stage === 'retry' && entry.message.includes('Ponawiam samą analizę')
+  ))).toBe(true);
+  expect(database.getJob(job.id)?.status).toBe('needs_review');
+  await queue.shutdown();
+  database.close();
+});
+
+it('ponawia arkusz postaci po odrzuceniu jednego kierunku przez analizatora', async () => {
+  const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-character-retry-')), 'project');
+  temporaryDirectories.push(path.dirname(root));
+  mkdirSync(root);
+  const database = ProjectDatabase.create(root, {
+    name: 'Postać top-down', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+  });
+  let generationTurns = 0;
+  let analysisTurns = 0;
+  let retryPrompt = '';
+  let sawPersistedRejectionBeforeRetry = false;
+  const fakeCodex = {
+    health: () => ({ state: 'ready', message: 'Gotowy' }),
+    runExclusive: async <T>(operation: () => Promise<T>) => operation(),
+    ensureAssetThread: async () => 'thread-character-top-down',
+    startUtilityThread: async () => `thread-character-analysis-${analysisTurns + 1}`,
+    skillPath: () => '/Applications/ChatGPT.app/imagegen/SKILL.md',
+    interruptActiveTurn: async () => undefined,
+    runTurn: async (_threadId: string, input: Array<Record<string, unknown>>) => {
+      if (input.some((item) => item.type === 'skill')) {
+        generationTurns += 1;
+        const prompt = String(input[0].text);
+        if (generationTurns === 2) {
+          retryPrompt = prompt;
+          sawPersistedRejectionBeforeRetry = database.getAsset(database.listAssets()[0].id)
+            ?.versions[0].characterAnimation?.movementAnalysis.status === 'failed';
+        }
+        const outputPath = prompt.match(/exactly (.+?final\.png)/i)?.[1];
+        if (!outputPath) throw new Error('Test nie znalazł final.png w prompcie retry postaci.');
+        await writeCharacterSheet(outputPath, 32, 32);
+        return {
+          turnId: `turn-character-generation-${generationTurns}`, items: [],
+          finalMessage: JSON.stringify({
+            status: 'completed', finalPath: outputPath, category: 'character', tags: [],
+            pivot: { x: 0.5, y: 0 }, description: 'Postać top-down', message: '',
+          }),
+        };
+      }
+      analysisTurns += 1;
+      const result = passedMovementAnalysis(['north', 'east', 'south', 'west']);
+      if (analysisTurns === 1) {
+        result.status = 'failed';
+        result.summary = 'Kierunek zachodni ma ślizg stóp.';
+        result.directions[3] = {
+          direction: 'west', status: 'failed', message: 'Stopa przesuwa się po podłożu między W2 i W3.',
+        };
+      }
+      return {
+        turnId: `turn-character-analysis-${analysisTurns}`, items: [], finalMessage: JSON.stringify(result),
+      };
+    },
+  } as unknown as CodexService;
+  const queue = new GenerationQueue(fakeCodex);
+  queue.attach(database);
+  const terminal = waitForGenerationTerminal(queue);
+  const job = queue.enqueue({
+    name: 'Łowca', prompt: '', mode: 'generate', category: 'character',
+    relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
+    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 10 },
+  });
+
+  const terminalEvent = await terminal;
+  if (terminalEvent.type === 'failed') throw new Error(terminalEvent.message);
+  expect(terminalEvent).toMatchObject({ type: 'completed', jobId: job.id });
+  expect(generationTurns).toBe(2);
+  expect(analysisTurns).toBe(2);
+  expect(sawPersistedRejectionBeforeRetry).toBe(true);
+  expect(retryPrompt).toContain('Kierunek zachodni ma ślizg stóp.');
+  expect(retryPrompt).toContain('west: Stopa przesuwa się po podłożu');
+  expect(retryPrompt).toContain('N (north), E (east), S (south), W (west)');
+  expect(database.getAsset(job.assetId)?.versions[0].characterAnimation?.movementAnalysis.status).toBe('passed');
+  expect(database.listGenerationLogs(job.assetId).some((entry) => entry.stage === 'retry')).toBe(true);
+  await queue.shutdown();
+  database.close();
+});
+
+it('samodzielnie ponawia postać po needs_user_decision i odrzuceniu źródła bez alfa', async () => {
+  const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-character-contract-retry-')), 'project');
+  temporaryDirectories.push(path.dirname(root));
+  mkdirSync(root);
+  const database = ProjectDatabase.create(root, {
+    name: 'Retry kontraktu postaci', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+  });
+  database.createProjectSettingsProposal({
+    reason: 'Stara, niezwiązana propozycja pozostaje do późniejszego rozpatrzenia.',
+    settings: { pixelsPerUnit: 16 },
+    referenceIds: [],
+  });
+  let generationTurns = 0;
+  let analysisTurns = 0;
+  let retryPrompt = '';
+  let retryImages: Array<Record<string, unknown>> = [];
+  const fakeCodex = {
+    health: () => ({ state: 'ready', message: 'Gotowy' }),
+    runExclusive: async <T>(operation: () => Promise<T>) => operation(),
+    ensureAssetThread: async () => 'thread-character-contract-retry',
+    startUtilityThread: async () => 'thread-character-contract-analysis',
+    skillPath: () => '/Applications/ChatGPT.app/imagegen/SKILL.md',
+    interruptActiveTurn: async () => undefined,
+    runTurn: async (_threadId: string, input: Array<Record<string, unknown>>) => {
+      if (!input.some((item) => item.type === 'skill')) {
+        analysisTurns += 1;
+        return {
+          turnId: 'turn-character-contract-analysis', items: [],
+          finalMessage: JSON.stringify(passedMovementAnalysis(['north', 'east', 'south', 'west'])),
+        };
+      }
+      generationTurns += 1;
+      const prompt = String(input[0].text);
+      const outputPath = prompt.match(/exactly (.+?final\.png)/i)?.[1];
+      if (!outputPath) throw new Error('Test nie znalazł final.png w prompcie retry kontraktu postaci.');
+      if (generationTurns === 1) {
+        const sourcePath = path.join(path.dirname(outputPath), 'source.png');
+        const bakedCheckerboardPath = path.join(path.dirname(outputPath), 'baked-checkerboard.png');
+        const secondBakedCheckerboardPath = path.join(path.dirname(outputPath), 'baked-checkerboard-2.png');
+        mkdirSync(path.dirname(sourcePath), { recursive: true });
+        await sharp({
+          create: { width: 192, height: 128, channels: 3, background: '#cccccc' },
+        }).png().toFile(sourcePath);
+        await sharp({
+          create: { width: 160, height: 128, channels: 3, background: '#d9d9d9' },
+        }).png().toFile(bakedCheckerboardPath);
+        await sharp({
+          create: { width: 160, height: 128, channels: 3, background: '#f0f0f0' },
+        }).png().toFile(secondBakedCheckerboardPath);
+        return {
+          turnId: 'turn-character-contract-source',
+          items: [
+            { type: 'imageGeneration', savedPath: sourcePath },
+            { type: 'imageGeneration', savedPath: bakedCheckerboardPath },
+            { type: 'imageGeneration', savedPath: secondBakedCheckerboardPath },
+          ],
+          finalMessage: JSON.stringify({
+            status: 'needs_user_decision', finalPath: '', category: 'character', tags: ['łowca'],
+            pivot: { x: 0.5, y: 0 }, description: 'Kandydat o złym rozmiarze',
+            message: 'Wbudowany generator nie zachował dokładnego rozmiaru arkusza.',
+          }),
+        };
+      }
+      retryPrompt = prompt;
+      retryImages = input.filter((item) => item.type === 'localImage');
+      await writeCharacterSheet(outputPath, 32, 32);
+      return {
+        turnId: 'turn-character-contract-repaired', items: [],
+        finalMessage: JSON.stringify({
+          status: 'completed', finalPath: outputPath, category: 'character', tags: ['łowca'],
+          pivot: { x: 0.5, y: 0 }, description: 'Poprawiony łowca', message: '',
+        }),
+      };
+    },
+  } as unknown as CodexService;
+  const queue = new GenerationQueue(fakeCodex);
+  queue.attach(database);
+  const terminal = waitForGenerationTerminal(queue);
+  const job = queue.enqueue({
+    name: 'Łowca kontraktowy', prompt: '', mode: 'generate', category: 'character',
+    relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
+    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+  });
+
+  await expect(terminal).resolves.toMatchObject({ type: 'completed', jobId: job.id });
+  expect(generationTurns).toBe(2);
+  expect(analysisTurns).toBe(1);
+  expect(retryImages).toHaveLength(1);
+  expect(retryImages[0].path).toContain(`${path.sep}attempt-1${path.sep}selected-source.png`);
+  expect(retryPrompt).toContain('Wbudowany generator nie zachował dokładnego rozmiaru arkusza.');
+  expect(retryPrompt).toContain('nie ma kanału alfa');
+  expect(database.listProjectSettingsProposals()).toHaveLength(1);
+  expect(database.listGenerationLogs(job.assetId).some((entry) => entry.stage === 'retry')).toBe(true);
+  expect(database.getJob(job.id)?.status).toBe('needs_review');
+  await queue.shutdown();
+  database.close();
+});
+
+it('wybiera najlepszy wynik imagegen, normalizuje go i kończy bez zbędnego retry', async () => {
+  const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-character-source-selection-')), 'project');
+  temporaryDirectories.push(path.dirname(root));
+  mkdirSync(root);
+  const database = ProjectDatabase.create(root, {
+    name: 'Wybór źródła postaci', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+  });
+  let generationTurns = 0;
+  let analysisTurns = 0;
+  const fakeCodex = {
+    health: () => ({ state: 'ready', message: 'Gotowy' }),
+    runExclusive: async <T>(operation: () => Promise<T>) => operation(),
+    ensureAssetThread: async () => 'thread-character-source-selection',
+    startUtilityThread: async () => 'thread-character-source-analysis',
+    skillPath: () => '/Applications/ChatGPT.app/imagegen/SKILL.md',
+    interruptActiveTurn: async () => undefined,
+    runTurn: async (_threadId: string, input: Array<Record<string, unknown>>) => {
+      if (!input.some((item) => item.type === 'skill')) {
+        analysisTurns += 1;
+        return {
+          turnId: 'turn-character-source-analysis', items: [],
+          finalMessage: JSON.stringify(passedMovementAnalysis(['north', 'east', 'south', 'west'])),
+        };
+      }
+      generationTurns += 1;
+      const prompt = String(input[0].text);
+      const finalPath = prompt.match(/exactly (.+?final\.png)/i)?.[1];
+      if (!finalPath) throw new Error('Test nie znalazł final.png w prompcie wyboru źródła postaci.');
+      const sourcePath = path.join(path.dirname(finalPath), 'first-rgba-source.png');
+      const staticExactPath = path.join(path.dirname(finalPath), 'static-exact-rgba.png');
+      const bakedPath = path.join(path.dirname(finalPath), 'second-baked.png');
+      const secondBakedPath = path.join(path.dirname(finalPath), 'third-baked.png');
+      await writeStaticCharacterSheet(staticExactPath, 32, 32);
+      await writeCharacterSheet(sourcePath, 40, 32);
+      await sharp({ create: { width: 160, height: 128, channels: 3, background: '#cccccc' } })
+        .png().toFile(bakedPath);
+      await sharp({ create: { width: 160, height: 128, channels: 3, background: '#f0f0f0' } })
+        .png().toFile(secondBakedPath);
+      return {
+        turnId: 'turn-character-source-generation',
+        items: [
+          { type: 'imageGeneration', savedPath: staticExactPath },
+          { type: 'imageGeneration', savedPath: sourcePath },
+          { type: 'imageGeneration', savedPath: bakedPath },
+          { type: 'imageGeneration', savedPath: secondBakedPath },
+        ],
+        finalMessage: JSON.stringify({
+          status: 'completed', finalPath: '', category: 'character', tags: ['drwal'],
+          pivot: { x: 0.2, y: 0.8 }, description: 'Pierwszy użyteczny arkusz RGBA',
+          message: 'Generator zgłosił problem z docelowym canvasem.',
+        }),
+      };
+    },
+  } as unknown as CodexService;
+  const queue = new GenerationQueue(fakeCodex);
+  queue.attach(database);
+  const terminal = waitForGenerationTerminal(queue);
+  const job = queue.enqueue({
+    name: 'Drwal testowy', prompt: '', mode: 'generate', category: 'character',
+    relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
+    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+  });
+
+  await expect(terminal).resolves.toMatchObject({ type: 'completed', jobId: job.id });
+  expect(generationTurns).toBe(1);
+  expect(analysisTurns).toBe(1);
+  expect(database.listGenerationLogs(job.assetId).some((entry) => entry.stage === 'retry')).toBe(false);
+  expect(database.listGenerationLogs(job.assetId).some((entry) => (
+    entry.message.includes('Przepakowano źródłowy arkusz 200×128px')
+  ))).toBe(true);
+  const completedVersion = database.getAsset(job.assetId)?.versions[0];
+  expect(completedVersion).toMatchObject({
+    status: 'needs_review', width: 160, height: 128, pivot: { x: 0.5, y: 0.0625 },
+    generationMetadata: {
+      characterSourceNormalization: {
+        normalized: true, sourceWidth: 200, sourceHeight: 128, outputWidth: 160, outputHeight: 128,
+      },
+    },
+  });
+  const persistedSourcePath = path.join(root, 'assets', job.assetId, job.versionId, 'source.png');
+  expect(existsSync(persistedSourcePath)).toBe(true);
+  expect(await sharp(persistedSourcePath).metadata()).toMatchObject({
+    width: 200, height: 128, hasAlpha: true,
+  });
+  await queue.shutdown();
+  database.close();
+});
+
+it('nie publikuje postaci, gdy ten sam turn utworzył propozycję ustawień mimo statusu completed', async () => {
+  const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-character-settings-proposal-')), 'project');
+  temporaryDirectories.push(path.dirname(root));
+  mkdirSync(root);
+  const database = ProjectDatabase.create(root, {
+    name: 'Propozycja ustawień postaci', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+  });
+  let generationTurns = 0;
+  const fakeCodex = {
+    health: () => ({ state: 'ready', message: 'Gotowy' }),
+    runExclusive: async <T>(operation: () => Promise<T>) => operation(),
+    ensureAssetThread: async () => 'thread-character-settings-proposal',
+    skillPath: () => '/Applications/ChatGPT.app/imagegen/SKILL.md',
+    interruptActiveTurn: async () => undefined,
+    runTurn: async (
+      _threadId: string,
+      _input: Array<Record<string, unknown>>,
+      _outputSchema: Record<string, unknown>,
+      onEvent?: (notification: { method: string; params: Record<string, unknown> }) => void,
+    ) => {
+      generationTurns += 1;
+      database.createProjectSettingsProposal({
+        reason: 'Referencja wymaga zmiany bazowej skali projektu przed dalszą generacją.',
+        settings: { pixelsPerUnit: 16 },
+        referenceIds: [],
+      });
+      onEvent?.({
+        method: 'item/started',
+        params: {
+          item: {
+            type: 'dynamicToolCall', namespace: 'registry', tool: 'propose_project_settings',
+            arguments: { settings: { pixelsPerUnit: 16 } },
+          },
+        },
+      });
+      return {
+        turnId: 'turn-character-settings-proposal', items: [],
+        finalMessage: JSON.stringify({
+          status: 'completed', finalPath: '', category: 'character', tags: [],
+          pivot: { x: 0.5, y: 0 }, description: '',
+          message: 'Najpierw zatwierdź propozycję zmiany skali projektu.',
+        }),
+      };
+    },
+  } as unknown as CodexService;
+  const queue = new GenerationQueue(fakeCodex);
+  queue.attach(database);
+  const terminal = waitForGenerationTerminal(queue);
+  const job = queue.enqueue({
+    name: 'Postać wymagająca skali', prompt: '', mode: 'generate', category: 'character',
+    relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
+    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+  });
+
+  await expect(terminal).resolves.toMatchObject({
+    type: 'failed', jobId: job.id,
+    message: 'Najpierw zatwierdź propozycję zmiany skali projektu.',
+  });
+  expect(generationTurns).toBe(1);
+  expect(database.listProjectSettingsProposals()).toHaveLength(1);
+  expect(database.listGenerationLogs(job.assetId).some((entry) => entry.stage === 'retry')).toBe(false);
+  await queue.shutdown();
+  database.close();
+});
+
+it('blokuje lokalny generator postaci, gdy obowiązkowy analizator Codex jest niedostępny', async () => {
+  const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-character-no-agent-')), 'project');
+  temporaryDirectories.push(path.dirname(root));
+  mkdirSync(root);
+  const database = ProjectDatabase.create(root, {
+    name: 'Brak analizatora', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+  });
+  let providerCalls = 0;
+  const fakeCodex = {
+    health: () => ({ state: 'unavailable', message: 'Codex App Server jest wyłączony.' }),
+  } as unknown as CodexService;
+  const fakeComfy = {
+    health: () => ({ state: 'ready', message: 'Gotowy' }),
+    generate: async () => {
+      providerCalls += 1;
+      throw new Error('Nie powinno zostać wywołane.');
+    },
+  };
+  const queue = new GenerationQueue(fakeCodex, undefined, fakeComfy as never);
+  queue.attach(database);
+  const terminal = waitForGenerationTerminal(queue);
+  const job = queue.enqueue({
+    name: 'Wojownik', prompt: '', mode: 'generate', category: 'character', generatorProvider: 'comfyui',
+    footprint: { x: 1, y: 1 },
+    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+  });
+
+  await expect(terminal).resolves.toMatchObject({
+    type: 'failed', jobId: job.id, message: 'Codex App Server jest wyłączony.',
+  });
+  expect(providerCalls).toBe(0);
+  expect(database.getAsset(job.assetId)?.versions[0]).toMatchObject({
+    status: 'failed', finalPath: null,
+    characterAnimation: { movementAnalysis: { status: 'pending' } },
+  });
+  await queue.shutdown();
+  database.close();
+});
+
+it('nie publikuje postaci, gdy raport analizatora pomija kanoniczny kierunek', async () => {
+  const root = path.join(mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-character-bad-report-')), 'project');
+  temporaryDirectories.push(path.dirname(root));
+  mkdirSync(root);
+  const database = ProjectDatabase.create(root, {
+    name: 'Błędny raport', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+  });
+  let generationTurns = 0;
+  const fakeCodex = {
+    health: () => ({ state: 'ready', message: 'Gotowy' }),
+    runExclusive: async <T>(operation: () => Promise<T>) => operation(),
+    ensureAssetThread: async () => 'thread-character-invalid-report',
+    startUtilityThread: async () => 'thread-character-invalid-analysis',
+    skillPath: () => '/Applications/ChatGPT.app/imagegen/SKILL.md',
+    interruptActiveTurn: async () => undefined,
+    runTurn: async (_threadId: string, input: Array<Record<string, unknown>>) => {
+      if (input.some((item) => item.type === 'skill')) {
+        generationTurns += 1;
+        const prompt = String(input[0].text);
+        const outputPath = prompt.match(/exactly (.+?final\.png)/i)?.[1];
+        if (!outputPath) throw new Error('Test nie znalazł final.png w prompcie postaci.');
+        await writeCharacterSheet(outputPath, 32, 32);
+        return {
+          turnId: 'turn-character-invalid-generation', items: [],
+          finalMessage: JSON.stringify({
+            status: 'completed', finalPath: outputPath, category: 'character', tags: [],
+            pivot: { x: 0.5, y: 0 }, description: 'Postać', message: '',
+          }),
+        };
+      }
+      return {
+        turnId: 'turn-character-invalid-analysis', items: [],
+        finalMessage: JSON.stringify(passedMovementAnalysis(['north', 'east', 'south', 'south'])),
+      };
+    },
+  } as unknown as CodexService;
+  const queue = new GenerationQueue(fakeCodex);
+  queue.attach(database);
+  const terminal = waitForGenerationTerminal(queue);
+  const job = queue.enqueue({
+    name: 'Łuczniczka', prompt: '', mode: 'generate', category: 'character',
+    relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
+    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+  });
+
+  await expect(terminal).resolves.toMatchObject({
+    type: 'failed',
+    jobId: job.id,
+    message: expect.stringContaining('Raport ruchu musi zawierać dokładnie kierunki north, east, south, west'),
+  });
+  expect(generationTurns).toBe(1);
+  expect(database.getAsset(job.assetId)?.versions[0]).toMatchObject({
+    status: 'failed', finalPath: null,
+    characterAnimation: { movementAnalysis: { status: 'pending', turnId: null } },
+  });
+  await queue.shutdown();
+  database.close();
+});
+
+function waitForGenerationTerminal(queue: GenerationQueue): Promise<GenerationEvent> {
+  return new Promise<GenerationEvent>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Kolejka nie zakończyła testowego zadania.')), 15_000);
+    queue.on('event', (event: GenerationEvent) => {
+      if (event.type === 'completed' || event.type === 'failed') {
+        clearTimeout(timeout);
+        resolve(event);
+      }
+    });
+  });
+}
+
+function passedMovementAnalysis(directions: string[]) {
+  return {
+    status: 'passed' as 'passed' | 'failed',
+    summary: 'Postać zachowuje tożsamość, kontakt z podłożem i płynny cykl w każdym kierunku.',
+    directions: directions.map((direction) => ({
+      direction,
+      status: 'passed' as 'passed' | 'failed',
+      message: 'Kierunek, fazy kroku i pętla są czytelne i stabilne.',
+    })),
+  };
+}
+
+async function writeCharacterSheet(filePath: string, frameWidth: number, frameHeight: number): Promise<void> {
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  const phaseLegs = [
+    [[14, 27], [17, 27]],
+    [[10, 27], [19, 25]],
+    [[12, 26], [18, 27]],
+    [[14, 27], [17, 25]],
+    [[11, 26], [20, 27]],
+  ];
+  const colors = ['#7f5bd5', '#3e8cde', '#d4773b', '#4ca56b'];
+  const composites: OverlayOptions[] = [];
+  for (let row = 0; row < 4; row += 1) {
+    for (let column = 0; column < 5; column += 1) {
+      const [[leftLegX, leftLegBottom], [rightLegX, rightLegBottom]] = phaseLegs[column];
+      const svg = [
+        `<svg width="${frameWidth}" height="${frameHeight}" xmlns="http://www.w3.org/2000/svg">`,
+        `<g fill="${colors[row]}">`,
+        '<circle cx="16" cy="6" r="3"/>',
+        '<rect x="12" y="9" width="8" height="11" rx="2"/>',
+        `<rect x="${leftLegX}" y="19" width="3" height="${leftLegBottom - 19 + 1}"/>`,
+        `<rect x="${rightLegX}" y="19" width="3" height="${rightLegBottom - 19 + 1}"/>`,
+        '</g></svg>',
+      ].join('');
+      composites.push({ input: Buffer.from(svg), left: column * frameWidth, top: row * frameHeight });
+    }
+  }
+  await sharp({
+    create: {
+      width: frameWidth * 5,
+      height: frameHeight * 4,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
+  }).composite(composites).png().toFile(filePath);
+}
+
+async function writeStaticCharacterSheet(filePath: string, frameWidth: number, frameHeight: number): Promise<void> {
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  const composites: OverlayOptions[] = [];
+  for (let row = 0; row < 4; row += 1) {
+    for (let column = 0; column < 5; column += 1) {
+      const svg = [
+        `<svg width="${frameWidth}" height="${frameHeight}" xmlns="http://www.w3.org/2000/svg">`,
+        '<g fill="#536d9b"><circle cx="16" cy="6" r="3"/><rect x="12" y="9" width="8" height="11" rx="2"/>',
+        '<rect x="12" y="19" width="3" height="9"/><rect x="18" y="19" width="3" height="9"/></g></svg>',
+      ].join('');
+      composites.push({ input: Buffer.from(svg), left: column * frameWidth, top: row * frameHeight });
+    }
+  }
+  await sharp({
+    create: {
+      width: frameWidth * 5,
+      height: frameHeight * 4,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
+  }).composite(composites).png().toFile(filePath);
+}

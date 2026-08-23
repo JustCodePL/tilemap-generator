@@ -3,6 +3,7 @@ node_modules/
 out/
 out-*/
 coverage/
+dist/
 .vitest-results.json
 bin/
 obj/

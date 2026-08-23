@@ -16,6 +16,7 @@ const config: ForgeConfig = {
     },
     appBundleId: 'ac.justcode.tilemap-generator',
     executableName: 'tilemap-generator',
+    extraResource: ['dist/mcp'],
     icon: undefined,
     osxSign: {
       identity: '-',

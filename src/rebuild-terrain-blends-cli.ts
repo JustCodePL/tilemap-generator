@@ -43,14 +43,14 @@ if (!exportRootArgument) {
 const exportRoot = path.resolve(exportRootArgument);
 const manifestPath = path.join(exportRoot, 'tilemap-assets.json');
 const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as ExportManifest;
-if (manifest.schemaVersion !== 8
+if (manifest.schemaVersion !== 9
   || !Array.isArray(manifest.managedFiles)
   || !manifest.managedFiles.includes('tilemap-assets.json')
   || !manifest.project
   || !['isometric', 'top_down'].includes(manifest.project.projection)
   || !manifest.tile
   || !Array.isArray(manifest.assets)) {
-  throw new Error('Nieobsługiwany lub niekompletny manifest eksportu. Wymagany jest bieżący schemat v8.');
+  throw new Error('Nieobsługiwany lub niekompletny manifest eksportu. Wymagany jest bieżący schemat v9.');
 }
 const managedFiles = new Set(manifest.managedFiles.map(validateManagedRelativePath));
 const projection = manifest.project.projection;

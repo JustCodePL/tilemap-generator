@@ -72,11 +72,21 @@ async function createWindowOnce(): Promise<void> {
     if (mainWindow === window) mainWindow = null;
   });
 
-  cleanup = registerIpc(window, projects, new AppLogger(app.getPath('userData')));
-  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
-    await window.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
-  } else {
-    await window.loadFile(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`));
+  try {
+    const userDataPath = app.getPath('userData');
+    cleanup = await registerIpc(window, projects, new AppLogger(userDataPath), userDataPath);
+    if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
+      await window.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
+    } else {
+      await window.loadFile(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`));
+    }
+  } catch (error) {
+    const partialCleanup = cleanup;
+    cleanup = null;
+    await partialCleanup?.();
+    if (!window.isDestroyed()) window.destroy();
+    if (mainWindow === window) mainWindow = null;
+    throw error;
   }
 }
 
@@ -96,6 +106,9 @@ void app.whenReady().then(async () => {
   app.on('activate', () => {
     void createWindow();
   });
+}).catch((error) => {
+  console.error('Nie udało się uruchomić Tilemap Generator.', error);
+  app.quit();
 });
 
 app.on('window-all-closed', () => {
@@ -103,9 +116,13 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', (event) => {
-  if (readyToQuit || !cleanup) return;
+  if (readyToQuit) return;
+  if (cleanupStarted) {
+    event.preventDefault();
+    return;
+  }
+  if (!cleanup) return;
   event.preventDefault();
-  if (cleanupStarted) return;
   cleanupStarted = true;
   const shutdown = cleanup;
   cleanup = null;

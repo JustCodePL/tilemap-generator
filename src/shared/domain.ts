@@ -20,6 +20,109 @@ export const projectProjections = ['isometric', 'top_down'] as const;
 export const projectProjectionSchema = z.enum(projectProjections);
 export type ProjectProjection = z.infer<typeof projectProjectionSchema>;
 
+export const characterDirectionIds = [
+  'north_west',
+  'north_east',
+  'south_east',
+  'south_west',
+  'north',
+  'east',
+  'south',
+  'west',
+] as const;
+
+export const characterDirectionSchema = z.enum(characterDirectionIds);
+export type CharacterDirectionId = z.infer<typeof characterDirectionSchema>;
+
+export interface CharacterDirection {
+  id: CharacterDirectionId;
+  shortLabel: 'NW' | 'NE' | 'SE' | 'SW' | 'N' | 'E' | 'S' | 'W';
+  label: string;
+  screenDelta: { x: -1 | 0 | 1; y: -1 | 0 | 1 };
+  gridDelta: { x: -1 | 0 | 1; y: -1 | 0 | 1 };
+}
+
+const isometricCharacterDirections = [
+  {
+    id: 'north_west', shortLabel: 'NW', label: 'Północny zachód',
+    screenDelta: { x: -1, y: -1 }, gridDelta: { x: -1, y: 0 },
+  },
+  {
+    id: 'north_east', shortLabel: 'NE', label: 'Północny wschód',
+    screenDelta: { x: 1, y: -1 }, gridDelta: { x: 0, y: -1 },
+  },
+  {
+    id: 'south_east', shortLabel: 'SE', label: 'Południowy wschód',
+    screenDelta: { x: 1, y: 1 }, gridDelta: { x: 1, y: 0 },
+  },
+  {
+    id: 'south_west', shortLabel: 'SW', label: 'Południowy zachód',
+    screenDelta: { x: -1, y: 1 }, gridDelta: { x: 0, y: 1 },
+  },
+] as const satisfies readonly CharacterDirection[];
+
+const topDownCharacterDirections = [
+  {
+    id: 'north', shortLabel: 'N', label: 'Północ',
+    screenDelta: { x: 0, y: -1 }, gridDelta: { x: 0, y: 1 },
+  },
+  {
+    id: 'east', shortLabel: 'E', label: 'Wschód',
+    screenDelta: { x: 1, y: 0 }, gridDelta: { x: 1, y: 0 },
+  },
+  {
+    id: 'south', shortLabel: 'S', label: 'Południe',
+    screenDelta: { x: 0, y: 1 }, gridDelta: { x: 0, y: -1 },
+  },
+  {
+    id: 'west', shortLabel: 'W', label: 'Zachód',
+    screenDelta: { x: -1, y: 0 }, gridDelta: { x: -1, y: 0 },
+  },
+] as const satisfies readonly CharacterDirection[];
+
+export function characterDirectionsForProjection(
+  projection: ProjectProjection,
+): readonly CharacterDirection[] {
+  return projection === 'top_down' ? topDownCharacterDirections : isometricCharacterDirections;
+}
+
+export const characterAnimationSettingsSchema = z.object({
+  action: z.literal('walk').default('walk'),
+  framesPerDirection: z.literal(4).default(4),
+  framesPerSecond: z.number().int().min(1).max(24).default(8),
+});
+export type CharacterAnimationSettings = z.infer<typeof characterAnimationSettingsSchema>;
+
+export const defaultCharacterAnimationSettings: CharacterAnimationSettings = Object.freeze({
+  action: 'walk',
+  framesPerDirection: 4,
+  framesPerSecond: 8,
+});
+
+export type CharacterMovementAnalysisStatus = 'pending' | 'passed' | 'failed';
+
+export interface CharacterMovementDirectionAnalysis {
+  direction: CharacterDirectionId;
+  status: Exclude<CharacterMovementAnalysisStatus, 'pending'>;
+  message: string;
+}
+
+export interface CharacterMovementAnalysis {
+  status: CharacterMovementAnalysisStatus;
+  summary: string;
+  directions: CharacterMovementDirectionAnalysis[];
+  turnId: string | null;
+  analyzedAt: string | null;
+}
+
+export interface CharacterAnimationSet {
+  settings: CharacterAnimationSettings;
+  directions: CharacterDirection[];
+  frameSize: { width: number; height: number };
+  sheetSize: { width: number; height: number };
+  movementAnalysis: CharacterMovementAnalysis;
+}
+
 export interface RoadConnectionDirection {
   id: 'north_west' | 'north_east' | 'south_east' | 'south_west' | 'north' | 'east' | 'south' | 'west';
   bit: 1 | 2 | 4 | 8;
@@ -125,6 +228,19 @@ export const generatorProviders = ['codex', 'comfyui', 'stable_diffusion_cpp'] a
 export const generatorProviderSchema = z.enum(generatorProviders);
 export type GeneratorProvider = z.infer<typeof generatorProviderSchema>;
 
+export const generatorProviderSelectionSchema = z.array(generatorProviderSchema)
+  .min(1, 'Wybierz co najmniej jeden generator obrazów.')
+  .max(generatorProviders.length)
+  .superRefine((providers, context) => {
+    if (new Set(providers).size !== providers.length) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Każdy generator może być wybrany tylko raz.',
+      });
+    }
+  })
+  .transform((providers) => generatorProviders.filter((provider) => providers.includes(provider)));
+
 export const exportIntegrations = ['unity'] as const;
 export const exportIntegrationSchema = z.enum(exportIntegrations);
 export type ExportIntegration = z.infer<typeof exportIntegrationSchema>;
@@ -202,8 +318,32 @@ export const enqueueGenerationSchema = z.object({
   elevationLevels: z.number().int().min(1).max(16).optional(),
   relativeWidth: z.number().min(0.25).max(16).optional(),
   relativeHeight: z.number().min(0.25).max(16).optional(),
+  characterAnimation: characterAnimationSettingsSchema.optional(),
   footprint: footprintSchema.default({ x: 1, y: 1 }),
   generatorProvider: generatorProviderSchema.optional(),
+  generatorProviders: generatorProviderSelectionSchema.optional(),
+}).superRefine((input, context) => {
+  if (input.characterAnimation && input.category !== undefined && input.category !== 'character') {
+    context.addIssue({
+      code: 'custom',
+      path: ['characterAnimation'],
+      message: 'Ustawienia animacji postaci są dozwolone tylko dla kategorii character.',
+    });
+  }
+  if (input.generatorProvider && input.generatorProviders) {
+    context.addIssue({
+      code: 'custom',
+      path: ['generatorProviders'],
+      message: 'Nie można łączyć pojedynczego generatora z zestawem generatorów.',
+    });
+  }
+  if (input.assetId && input.generatorProviders) {
+    context.addIssue({
+      code: 'custom',
+      path: ['generatorProviders'],
+      message: 'Zestaw generatorów można wybrać tylko dla nowego assetu.',
+    });
+  }
 });
 export type EnqueueGenerationInput = z.infer<typeof enqueueGenerationSchema>;
 
@@ -304,6 +444,7 @@ export interface AssetVersion {
   relativeHeight: number;
   roadConnections?: number;
   roadVariants?: RoadVariant[];
+  characterAnimation: CharacterAnimationSet | null;
   tags: string[];
   finalPath: string | null;
   imageUrl: string | null;
@@ -424,6 +565,46 @@ export function assetPixelSize(
     };
   }
   return null;
+}
+
+export function characterAnimationFrameSize(
+  project: Pick<ProjectInfo, 'tileWidthPx' | 'tileHeightPx'>,
+  asset: Pick<AssetVersion, 'relativeWidth' | 'relativeHeight'>,
+): { width: number; height: number } {
+  return {
+    width: Math.round(project.tileWidthPx * asset.relativeWidth),
+    height: Math.round(project.tileHeightPx * asset.relativeHeight),
+  };
+}
+
+export function characterAnimationSheetSize(
+  project: Pick<ProjectInfo, 'tileWidthPx' | 'tileHeightPx'>,
+  asset: Pick<AssetVersion, 'relativeWidth' | 'relativeHeight'>,
+  settings?: CharacterAnimationSettings,
+): { width: number; height: number };
+export function characterAnimationSheetSize(
+  frameSize: { width: number; height: number },
+  settings?: CharacterAnimationSettings,
+): { width: number; height: number };
+export function characterAnimationSheetSize(
+  projectOrFrame: Pick<ProjectInfo, 'tileWidthPx' | 'tileHeightPx'> | { width: number; height: number },
+  assetOrSettings?: Pick<AssetVersion, 'relativeWidth' | 'relativeHeight'> | CharacterAnimationSettings,
+  explicitSettings: CharacterAnimationSettings = defaultCharacterAnimationSettings,
+): { width: number; height: number } {
+  const usingFrameSize = 'width' in projectOrFrame;
+  const frame = usingFrameSize
+    ? projectOrFrame
+    : characterAnimationFrameSize(
+      projectOrFrame,
+      assetOrSettings as Pick<AssetVersion, 'relativeWidth' | 'relativeHeight'>,
+    );
+  const settings = usingFrameSize
+    ? (assetOrSettings as CharacterAnimationSettings | undefined) ?? defaultCharacterAnimationSettings
+    : explicitSettings;
+  return {
+    width: frame.width * (settings.framesPerDirection + 1),
+    height: frame.height * 4,
+  };
 }
 
 export interface ProjectSettingsProposal {

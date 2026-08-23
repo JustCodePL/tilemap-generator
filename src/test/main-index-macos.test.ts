@@ -104,3 +104,36 @@ it('na macOS ukrywa zamknięte okno i ponownie je pokazuje bez duplikowania IPC'
   expect(state.windows).toHaveLength(1);
   expect(state.registerIpc).toHaveBeenCalledTimes(1);
 });
+
+it('nie pozwala drugiemu Cmd-Q ominąć trwającego cleanup aplikacji', async () => {
+  vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+  (globalThis as Record<string, unknown>).MAIN_WINDOW_VITE_DEV_SERVER_URL = 'http://127.0.0.1:5173';
+  (globalThis as Record<string, unknown>).MAIN_WINDOW_VITE_NAME = 'main_window';
+  let finishCleanup: () => void = () => undefined;
+  const cleanup = vi.fn(() => new Promise<undefined>((resolve) => {
+    finishCleanup = () => resolve(undefined);
+  }));
+  state.registerIpc.mockImplementationOnce(() => cleanup);
+
+  await import('../main/index');
+  await vi.waitFor(() => expect(state.windows).toHaveLength(1));
+  const beforeQuit = state.appListeners.get('before-quit');
+  expect(beforeQuit).toBeTypeOf('function');
+
+  const firstEvent = { preventDefault: vi.fn() };
+  beforeQuit?.(firstEvent);
+  expect(firstEvent.preventDefault).toHaveBeenCalledOnce();
+  expect(cleanup).toHaveBeenCalledOnce();
+
+  const repeatedEvent = { preventDefault: vi.fn() };
+  beforeQuit?.(repeatedEvent);
+  expect(repeatedEvent.preventDefault).toHaveBeenCalledOnce();
+  expect(cleanup).toHaveBeenCalledOnce();
+  expect(state.app.quit).not.toHaveBeenCalled();
+
+  finishCleanup();
+  await vi.waitFor(() => expect(state.app.quit).toHaveBeenCalledOnce());
+  const finalEvent = { preventDefault: vi.fn() };
+  beforeQuit?.(finalEvent);
+  expect(finalEvent.preventDefault).not.toHaveBeenCalled();
+});

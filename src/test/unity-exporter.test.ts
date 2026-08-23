@@ -15,7 +15,13 @@ import sharp from 'sharp';
 import { afterEach, expect, it, vi } from 'vitest';
 import { ProjectDatabase } from '../main/db/project-database';
 import { UnityExporter } from '../main/services/unity-exporter';
-import type { AssetCategory } from '../shared/domain';
+import {
+  characterDirectionsForProjection,
+  defaultCharacterAnimationSettings,
+  type AssetCategory,
+  type CharacterAnimationSet,
+  type ProjectProjection,
+} from '../shared/domain';
 
 const directories: string[] = [];
 afterEach(() => directories.splice(0).forEach((directory) => rmSync(directory, { recursive: true, force: true })));
@@ -64,6 +70,32 @@ function addApprovedAsset(
   return job;
 }
 
+function passedCharacterAnimation(
+  projection: ProjectProjection,
+  frameWidth: number,
+  frameHeight: number,
+  framesPerSecond = 8,
+): CharacterAnimationSet {
+  const directions = [...characterDirectionsForProjection(projection)];
+  return {
+    settings: { ...defaultCharacterAnimationSettings, framesPerSecond },
+    directions,
+    frameSize: { width: frameWidth, height: frameHeight },
+    sheetSize: { width: frameWidth * 5, height: frameHeight * 4 },
+    movementAnalysis: {
+      status: 'passed',
+      summary: 'Każdy kierunek ma czytelny, spójny i poprawnie zapętlony chód.',
+      directions: directions.map((direction) => ({
+        direction: direction.id,
+        status: 'passed',
+        message: `Chód ${direction.shortLabel} jest poprawny.`,
+      })),
+      turnId: 'turn-character-analysis',
+      analyzedAt: '2026-08-22T12:00:00.000Z',
+    },
+  };
+}
+
 it('eksportuje manifest i nie modyfikuje istniejącego .meta', async () => {
   const parent = mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-export-'));
   directories.push(parent);
@@ -98,7 +130,7 @@ it('eksportuje manifest i nie modyfikuje istniejącego .meta', async () => {
     assets: Array<{ elevationLevels: number; relativeSize: { width: number; height: number }; expectedCanvasPx: null }>;
     tile: { widthPx: number; heightPx: number };
   };
-  expect(manifest.schemaVersion).toBe(8);
+  expect(manifest.schemaVersion).toBe(9);
   expect(manifest.project.projection).toBe('isometric');
   expect(manifest.assets).toHaveLength(1);
   expect(manifest.tile.widthPx).toBe(256);
@@ -147,11 +179,11 @@ it('eksportuje budynek z prefabowym workflow Grid i pędzlem footprintu', async 
   const unityAssets = createUnityAssets(parent);
   const exporter = new UnityExporter();
   const preview = await exporter.preview(database, { integration: 'unity', targetDirectory: unityAssets });
-  expect(preview.files).toHaveLength(17);
+  expect(preview.files).toHaveLength(19);
   expect(preview.files[0].role).toBe('asset');
   expect(preview.files.slice(1).every((file) => file.role === 'integration_support')).toBe(true);
   const result = exporter.run(database, preview.token);
-  expect(result).toMatchObject({ assetCount: 1, fileCount: 17, writtenFileCount: 17 });
+  expect(result).toMatchObject({ assetCount: 1, fileCount: 19, writtenFileCount: 19 });
 
   const manifest = JSON.parse(readFileSync(result.manifestPath, 'utf8')) as {
     assets: Array<{
@@ -192,7 +224,108 @@ it('eksportuje budynek z prefabowym workflow Grid i pędzlem footprintu', async 
   database.close();
 });
 
-it('eksportuje 16 wariantów road tile do manifestu v8 z provenance', async () => {
+it('eksportuje przeanalizowany arkusz postaci do ścisłego manifestu v9 i authoringu Unity', async () => {
+  const parent = mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-character-export-'));
+  directories.push(parent);
+  const root = path.join(parent, 'project'); mkdirSync(root);
+  const database = ProjectDatabase.create(root, {
+    name: 'Bohaterowie', artBrief: '', projection: 'top_down', tileWidthPx: 64,
+  });
+  const job = database.enqueueGeneration({
+    name: 'Łuczniczka', prompt: '', mode: 'generate', category: 'character',
+    relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
+    characterAnimation: { ...defaultCharacterAnimationSettings, framesPerSecond: 12 },
+  });
+  const source = path.join(root, 'archer-sheet.png');
+  await sharp({
+    create: { width: 320, height: 256, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+  }).composite([{ input: Buffer.from(
+    '<svg width="320" height="256"><rect x="8" y="8" width="304" height="240" rx="8" fill="#5e8f63"/></svg>',
+  ) }]).png().toFile(source);
+  const animation = passedCharacterAnimation('top_down', 64, 64, 12);
+  database.finalizeGeneration(job.id, {
+    finalPath: database.relative(source), width: 320, height: 256,
+    category: 'character', tags: ['łuczniczka'], pivot: { x: 0.5, y: 0.08 },
+    description: 'Łuczniczka', characterAnimation: animation,
+  });
+  database.reviewVersion({
+    versionId: job.versionId, decision: 'approved', tags: ['łuczniczka'],
+    footprint: { x: 1, y: 1 }, pivot: { x: 0.5, y: 0.08 },
+  });
+
+  const unityAssets = createUnityAssets(parent);
+  const exporter = new UnityExporter();
+  const preview = await exporter.preview(database, { integration: 'unity', targetDirectory: unityAssets });
+  expect(preview.files).toHaveLength(19);
+  expect(preview.files[0]).toMatchObject({ role: 'asset', action: 'create' });
+  expect(preview.files.slice(1).every((file) => file.role === 'integration_support')).toBe(true);
+  const result = exporter.run(database, preview.token);
+  const manifest = JSON.parse(readFileSync(result.manifestPath, 'utf8')) as {
+    schemaVersion: number;
+    assets: Array<{
+      file: string;
+      expectedCanvasPx: { width: number; height: number };
+      characterAnimation: {
+        schemaVersion: number;
+        settings: { action: string; framesPerDirection: number; framesPerSecond: number };
+        sheet: Record<string, unknown>;
+        directions: Array<Record<string, unknown>>;
+        clips: Array<{ id: string; framesPerSecond: number; frames: unknown[] }>;
+        movementAnalysis: { status: string; analyzer: { provider: string; turnId: string } };
+      };
+    }>;
+  };
+  expect(manifest.schemaVersion).toBe(9);
+  expect(manifest.assets[0].expectedCanvasPx).toEqual({ width: 320, height: 256 });
+  expect(manifest.assets[0].characterAnimation).toMatchObject({
+    schemaVersion: 1,
+    settings: { action: 'walk', framesPerDirection: 4, framesPerSecond: 12 },
+    sheet: {
+      file: manifest.assets[0].file,
+      widthPx: 320,
+      heightPx: 256,
+      frameWidthPx: 64,
+      frameHeightPx: 64,
+      columns: 5,
+      rows: 4,
+      origin: 'top_left',
+    },
+    movementAnalysis: {
+      status: 'passed', analyzer: { provider: 'codex', turnId: 'turn-character-analysis' },
+    },
+  });
+  expect(manifest.assets[0].characterAnimation.directions).toEqual([
+    { id: 'north', label: 'N', row: 0, screenDelta: { x: 0, y: -1 }, gridDelta: { x: 0, y: 1 } },
+    { id: 'east', label: 'E', row: 1, screenDelta: { x: 1, y: 0 }, gridDelta: { x: 1, y: 0 } },
+    { id: 'south', label: 'S', row: 2, screenDelta: { x: 0, y: 1 }, gridDelta: { x: 0, y: -1 } },
+    { id: 'west', label: 'W', row: 3, screenDelta: { x: -1, y: 0 }, gridDelta: { x: -1, y: 0 } },
+  ]);
+  expect(manifest.assets[0].characterAnimation.clips).toHaveLength(8);
+  expect(manifest.assets[0].characterAnimation.clips[0]).toMatchObject({
+    id: 'idle_north', framesPerSecond: 12, frames: [expect.objectContaining({ column: 0, row: 0 })],
+  });
+  expect(manifest.assets[0].characterAnimation.clips[1]).toMatchObject({
+    id: 'walk_north', framesPerSecond: 12,
+  });
+  expect(manifest.assets[0].characterAnimation.clips[1].frames).toHaveLength(4);
+
+  const integrationRoot = path.join(unityAssets, 'TilemapGeneratorIntegration');
+  expect(existsSync(path.join(integrationRoot, 'Runtime', 'CharacterDefinition.cs'))).toBe(true);
+  expect(existsSync(path.join(integrationRoot, 'Runtime', 'DirectionalCharacterAnimator.cs'))).toBe(true);
+  const importerSource = readFileSync(path.join(integrationRoot, 'Editor', 'TerrainBlendImporter.cs'), 'utf8');
+  expect(importerSource).toContain('BlendTreeType.SimpleDirectional2D');
+  expect(importerSource).toContain('Character.controller');
+
+  database.sqlite.prepare(`
+    UPDATE character_animation_sets SET analysis_status = 'failed' WHERE version_id = ?
+  `).run(job.versionId);
+  await expect(exporter.preview(database, {
+    integration: 'unity', targetDirectory: unityAssets,
+  })).rejects.toThrow(/analiza ruchu/);
+  database.close();
+});
+
+it('eksportuje 16 wariantów road tile do manifestu v9 z provenance', async () => {
   const parent = mkdtempSync(path.join(os.tmpdir(), 'tilemap-generator-road-export-'));
   directories.push(parent);
   const root = path.join(parent, 'project'); mkdirSync(root);
@@ -225,7 +358,7 @@ it('eksportuje 16 wariantów road tile do manifestu v8 z provenance', async () =
   const unityAssets = createUnityAssets(parent);
   const exporter = new UnityExporter();
   const preview = await exporter.preview(database, { integration: 'unity', targetDirectory: unityAssets });
-  expect(preview.files).toHaveLength(32);
+  expect(preview.files).toHaveLength(34);
   expect(preview.files.slice(0, 16).map((file) => file.variantMask)).toEqual(Array.from({ length: 16 }, (_, mask) => mask));
   expect(preview.files.slice(16).every((file) => file.role === 'integration_support')).toBe(true);
   const result = exporter.run(database, preview.token);
@@ -239,8 +372,8 @@ it('eksportuje 16 wariantów road tile do manifestu v8 z provenance', async () =
       generatedBy: { provider: string; model: string | null };
     }>;
   };
-  expect(result).toMatchObject({ assetCount: 1, fileCount: 32, writtenFileCount: 32 });
-  expect(manifest.schemaVersion).toBe(8);
+  expect(result).toMatchObject({ assetCount: 1, fileCount: 34, writtenFileCount: 34 });
+  expect(manifest.schemaVersion).toBe(9);
   expect(manifest.assets[0]).toMatchObject({
     category: 'road_tile',
     file: null,
@@ -332,7 +465,7 @@ it('eksportuje top-down jako kwadratowy projekt z kierunkami dróg N/E/S/W', asy
     }>;
   };
   expect(manifest).toMatchObject({
-    schemaVersion: 8,
+    schemaVersion: 9,
     project: { projection: 'top_down' },
     tile: { widthPx: 32, heightPx: 32 },
   });
@@ -381,13 +514,13 @@ it('eksportuje atlas 47 wariantów blendingu dla zatwierdzonego elevated terrain
   const unityAssets = createUnityAssets(parent);
   const exporter = new UnityExporter();
   const preview = await exporter.preview(database, { integration: 'unity', targetDirectory: unityAssets });
-  expect(preview.files).toHaveLength(19);
+  expect(preview.files).toHaveLength(21);
   expect(preview.files.map((file) => file.role)).toEqual([
     'asset', 'terrain_blend_atlas', 'terrain_wall',
-    ...Array.from({ length: 16 }, () => 'integration_support'),
+    ...Array.from({ length: 18 }, () => 'integration_support'),
   ]);
   const result = exporter.run(database, preview.token);
-  expect(result).toMatchObject({ assetCount: 1, fileCount: 19, writtenFileCount: 19 });
+  expect(result).toMatchObject({ assetCount: 1, fileCount: 21, writtenFileCount: 21 });
 
   const manifest = JSON.parse(readFileSync(result.manifestPath, 'utf8')) as {
     schemaVersion: number;
@@ -401,7 +534,7 @@ it('eksportuje atlas 47 wariantów blendingu dla zatwierdzonego elevated terrain
       };
     }>;
   };
-  expect(manifest.schemaVersion).toBe(8);
+  expect(manifest.schemaVersion).toBe(9);
   expect(manifest.assets[0].terrainBlend).toMatchObject({
     mode: 'blob47_top_overlay',
     pivotNormalized: { x: 0.5, y: 0.75 },
@@ -456,7 +589,7 @@ it('usuwa z delivery wyłącznie plik cofniętego zatwierdzenia i zachowuje jego
     assets: unknown[];
   };
   expect(manifest).toMatchObject({
-    schemaVersion: 8,
+    schemaVersion: 9,
     managedFiles: ['tilemap-assets.json'],
     assets: [],
   });
@@ -541,7 +674,7 @@ it('pozostawia poprzednie delivery przy eksporcie do innego projektu Unity', asy
 
 it.each([
   ['obcy', JSON.stringify({
-    schemaVersion: 8,
+    schemaVersion: 9,
     managedFiles: ['tilemap-assets.json'],
     project: { id: randomUUID(), name: 'Foreign', projection: 'isometric' },
     assets: [],
@@ -688,7 +821,7 @@ it.each([
   const target = path.join(createUnityAssets(parent), 'Delivery');
   mkdirSync(target);
   writeFileSync(path.join(target, 'tilemap-assets.json'), JSON.stringify({
-    schemaVersion: 8,
+    schemaVersion: 9,
     managedFiles: ['tilemap-assets.json', managedPath],
     project: {
       id: database.getProject().id,

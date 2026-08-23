@@ -52,13 +52,39 @@ Artefakty dystrybucyjne powstają w `out/make/`.
    - `Elevated tile` jest dostępny tylko w projekcie izometrycznym i dodaje wysokość wyrażoną w poziomach. Poziom `N` daje canvas o wysokości `bazowa wysokość × (1 + N)`; dla kafla 256×128 px i poziomu 2 wynik ma 256×384 px.
    - `Road tile` jest kompletnym zestawem transparentnych nakładek 1×1 tworzonym w jednym jobie. Imagegen przygotowuje tylko jedną nieprzezroczystą, pełnokadrową próbkę materiału nawierzchni. Aplikacja buduje z niej deterministycznie wszystkie 16 geometrii, nakłada alfę i identyczne porty połączeń oraz tworzy izolowany fragment, cztery zakończenia, dwie proste, cztery zakręty, cztery warianty T i skrzyżowanie. Kierunki to NW/NE/SE/SW dla izometrii i N/E/S/W dla top-down. Każdy kafel jest walidowany osobno, a review pokazuje cały zestaw jako siatkę 4×4. Zielone/różowe chroma-key i źródła z przezroczystym tłem są odrzucane przed utworzeniem zestawu.
    - `Building` ma relatywną szerokość i wysokość względem bazowego kafla. Domyślne `1×2` daje canvas 256×256 px przy bazie izometrycznej 256×128 albo 256×512 px przy bazie top-down 256×256.
-   - `Character` działa tak samo, z domyślnym rozmiarem `0,5×1,5`: odpowiednio 128×192 px albo 128×384 px dla tych samych baz.
+   - Postacie powstają w osobnej sekcji **Postacie**. Rozmiar `0,5×1,5` opisuje pojedynczą klatkę: 128×192 px w projekcie izometrycznym albo 128×384 px w top-down dla tych samych baz. Aplikacja buduje jeden arkusz 5×4: kolumna idle oraz cztery fazy zapętlonego chodu dla każdego z czterech kierunków. Izometria używa NW/NE/SE/SW, a top-down N/E/S/W. Po kontroli wymiarów, przezroczystości, stabilności sylwetki i pętli osobna tura Codexa analizuje widoczny ruch w każdym kierunku. Postać nie trafia do review i nie może zostać zatwierdzona, dopóki wszystkie cztery kierunki nie otrzymają wyniku `passed`; tej bramki nie wyłącza ogólne ustawienie weryfikacji AI.
    - Typ i parametry rozmiaru są zapisywane w każdej wersji. Kolejna iteracja może je zmienić bez modyfikowania starszych wersji.
    Jeśli referencje są sprzeczne z konfiguracją projektu, agent może zapisać propozycję zmiany briefu, bazowej szerokości kafla lub PPU. Projekt zmienia się dopiero po jej zatwierdzeniu w aplikacji.
 3. Po przygotowaniu finalnego PNG agent wyznacza proponowany pivot na podstawie rzeczywistego obrazu. Sprawdź PNG, footprint, pivot, typ, parametry rozmiaru i tagi; pivot możesz nadpisać przed zatwierdzeniem.
 4. Zatwierdź, odrzuć bez kasowania lub utwórz edycję/nowy wariant. Asset może mieć tylko jedną zatwierdzoną wersję; zatwierdzenie można cofnąć, aby wybrać inną.
 5. Po zatwierdzeniu Codex aktualizuje wersjonowane podsumowanie stylu.
 6. Otwórz **Eksport**, wybierz integrację i wskaż dokładny katalog docelowy. Katalog biblioteki pozostaje niezależny od miejsc eksportu, a każda integracja zapamiętuje swój cel osobno. Eksport synchronizuje zatwierdzone wersje z wybranym celem; po cofnięciu ostatniego zatwierdzenia pusty plan assetów może usunąć wcześniej zarządzane pliki. Dla Unity wybierz miejsce wewnątrz `Assets`, na przykład `Assets/TilemapGenerator`; zestaw drogi trafia do własnego podkatalogu jako `road-00.png`…`road-15.png`, a manifest zawiera maskę i kierunki każdego pliku. Narzędzia Unity są instalowane raz, niezależnie od celu, w `Assets/TilemapGeneratorIntegration`. Unity tworzy z wariantów drogi jeden `RoadRuleTile.asset`, który dobiera wariant automatycznie podczas malowania. Każdy zatwierdzony `flat_tile` i `elevated_tile` dostaje też atlas blendingu oraz gotowe assety auto-tile w Unity.
+
+## MCP dla Codexa
+
+Lokalny serwer MCP pozwala sterować uruchomioną aplikacją z Codexa bez otwierania bazy SQLite w drugim procesie. Aplikacja pozostaje jedynym właścicielem projektu i kolejki, dlatego projekcja, wymiary, kierunki, dozwolone kategorie, walidatory oraz obowiązkowa analiza ruchu postaci nadal są egzekwowane dokładnie tak samo jak w UI.
+
+Serwer udostępnia narzędzia do wyboru projektu, odczytu jego wymagań i stylu, zmiany stylu, przeglądania i dodawania referencji, kolejkowania assetu, śledzenia jobów oraz pobierania faktycznego PNG do końcowej analizy. Aktywny projekt aplikacji jest projektem powiązanym i Codex używa go bez pytania. Jeżeli żaden projekt nie jest aktywny, a na liście ostatnich jest kilka poprawnych projektów, Codex musi pokazać wybór i zaczekać na decyzję. MCP nigdy nie zatwierdza wersji automatycznie.
+
+W trybie deweloperskim zbuduj stabilny, pozbawiony modułów natywnych entrypoint i zarejestruj go w lokalnym Codexie na macOS:
+
+```bash
+npm run build:mcp
+
+CODEX=/Applications/ChatGPT.app/Contents/Resources/codex
+MCP_NODE=/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node
+MCP_ROOT="$PWD"
+"$CODEX" mcp add tilemap_generator -- \
+  /usr/bin/env -C "$MCP_ROOT" \
+  "$MCP_NODE" "$MCP_ROOT/dist/mcp/server.mjs"
+"$CODEX" mcp get tilemap_generator --json
+```
+
+W utworzonej sekcji `[mcp_servers.tilemap_generator]` w `~/.codex/config.toml` ustaw `default_tools_approval_mode = "writes"`. Odczyty kontekstu i obrazów mogą wtedy działać bez dodatkowego potwierdzenia, natomiast aktywacja innego projektu, zmiana stylu, dodanie referencji i kolejka generacji pozostają jawnymi operacjami zapisującymi.
+
+Aplikacja musi działać, ale nie trzeba udostępniać portu HTTP. Proces MCP odkrywa prywatny Unix socket w `~/Library/Application Support/Tilemap Generator/mcp`, uwierzytelnia się rotowanym tokenem dostępnym tylko dla bieżącego użytkownika i przekazuje żądania do tego samego runtime co UI. Token oraz wewnętrzne ścieżki projektu i zarządzanych plików nie są zwracane modelowi; `add_reference` przyjmuje wyłącznie jawnie wskazaną ścieżkę źródłową. Po rejestracji rozpocznij nowe zadanie Codexa albo uruchom ponownie klienta, aby odświeżył listę MCP. Status można sprawdzić także przez `/mcp`; wycofanie konfiguracji wykonuje `"$CODEX" mcp remove tilemap_generator`.
+
+`npm run package` i `npm run make` automatycznie budują MCP oraz kopiują go do `Contents/Resources/mcp` w paczce macOS. W aplikacji własny wewnętrzny `codex app-server` ma tę integrację wyłączoną, aby generacja obrazu nie uruchamiała rekurencyjnie kolejnej generacji MCP.
 
 ## Integracja Unity: terrain blending i auto-tile
 
@@ -89,6 +115,10 @@ Aby stawiać budynki:
 5. `Erase` usuwa cały budynek po kliknięciu dowolnej zajętej komórki. `Pick` wybiera typ klikniętego budynku.
 
 Położenie świata jest zawsze przeliczane przez `Grid.GetCellCenterWorld(originCell)` na Gridzie zgodnym z projekcją projektu. `Szerokość/wysokość canvasa` określa rozmiar PNG względem tile, a `Footprint (komórki)` liczbę logicznie zajętych pól — wysoki budynek może więc mieć canvas 1×3 i footprint 1×1. Ponowny eksport aktualizuje wygenerowaną definicję i prefab; ręczną odbudowę można uruchomić z `Tools > Tilemap Generator > Rebuild Generated Assets`.
+
+## Postacie w Unity
+
+Zatwierdzony arkusz postaci jest eksportowany tylko z kompletnym raportem ruchu. Importer Unity dzieli go na 20 stabilnie nazwanych sprite'ów i tworzy pod `<wybrany katalog>/Generated/Characters/<asset-id>/` cztery klipy idle, cztery zapętlone klipy chodu, `CharacterDefinition.asset`, `Character.controller` oraz prefab `Character.prefab`. `DirectionalCharacterAnimator.SetMovement(direction, speed)` wybiera właściwy kierunek i stan animacji, ale celowo nie przesuwa obiektu ani nie uruchamia root motion — fizyka i transform pozostają pod kontrolą gry.
 
 Eksport można też uruchomić bez UI (przy wyłączonym `npm start`):
 
@@ -140,11 +170,11 @@ Assety wymagające kanału alpha używają dodatkowo node'ów usuwania tła oraz
 models/background_removal/birefnet.safetensors
 ```
 
-Na stronie projektu można niezależnie włączać i wyłączać `Codex + imagegen`, `ComfyUI · Z-Image Turbo` oraz `stable-diffusion.cpp · Z-Image Turbo`; co najmniej jeden generator musi pozostać aktywny. Każdy aktywny renderer zapisuje osobną wersję pod tym samym assetem. Ekran review i lista wersji pokazują badge `system · model`. Registry przechowuje także identyfikator przebiegu, hash zarządzanego workflow oraz metadane, m.in. seed, sampler, scheduler, kroki i CFG. Manifest eksportu Unity ma schemat v8, jawną listę plików zarządzanych, pole `generatedBy` oraz projekcję projektu.
+Na stronie projektu można niezależnie włączać i wyłączać `Codex + imagegen`, `ComfyUI · Z-Image Turbo` oraz `stable-diffusion.cpp · Z-Image Turbo`; co najmniej jeden generator musi pozostać aktywny. Każdy aktywny renderer zapisuje osobną wersję pod tym samym assetem. Ekran review i lista wersji pokazują badge `system · model`. Registry przechowuje także identyfikator przebiegu, hash zarządzanego workflow oraz metadane, m.in. seed, sampler, scheduler, kroki i CFG. Manifest eksportu Unity ma schemat v9, jawną listę plików zarządzanych, pole `generatedBy`, projekcję projektu oraz ścisłe metadane zatwierdzonych animacji postaci.
 
 Codex może odczytać stan przez `registry.get_generation_settings` i zaproponować zmianę generatorów przez `registry.propose_project_settings`. Tak jak pozostałe zmiany projektu, propozycja zaczyna obowiązywać dopiero po zatwierdzeniu w UI.
 
-ComfyUI odpowiada za generację i workflow usuwania tła, ale nie jest traktowane jako niezależny recenzent semantyczny. Każdy jego wynik przechodzi te same lokalne, deterministyczne walidatory co wynik Codexa: poprawność PNG i kanału alpha, wymagane wymiary, geometrię tile, test szwów 3×3 oraz komplet i porty 16 wariantów drogi. Gdy weryfikacja AI jest włączona i Codex jest gotowy, Codex może dodatkowo ocenić gotowy wariant ComfyUI. Bez Codexa asset nadal może przejść kontrole techniczne i trafić do ręcznego review.
+ComfyUI odpowiada za generację i workflow usuwania tła, ale nie jest traktowane jako niezależny recenzent semantyczny. Każdy jego wynik przechodzi te same lokalne, deterministyczne walidatory co wynik Codexa: poprawność PNG i kanału alpha, wymagane wymiary, geometrię tile, test szwów 3×3 oraz komplet i porty 16 wariantów drogi. Gdy weryfikacja AI jest włączona i Codex jest gotowy, Codex może dodatkowo ocenić gotowy wariant ComfyUI. Zwykły asset bez Codexa może nadal przejść kontrole techniczne i trafić do ręcznego review; postać jest wyjątkiem i zawsze wymaga gotowego Codexa do obowiązkowej końcowej analizy ruchu.
 
 ## stable-diffusion.cpp: instalator i wybór modelu
 

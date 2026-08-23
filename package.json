@@ -8,11 +8,14 @@
   "license": "UNLICENSED",
   "private": true,
   "scripts": {
+    "build:mcp": "vite build --config vite.mcp.config.ts",
     "native:electron": "electron-rebuild --force --only better-sqlite3",
     "native:node": "npm rebuild better-sqlite3",
     "prestart": "npm run native:electron",
     "start": "electron-forge start",
+    "prepackage": "npm run build:mcp",
     "package": "electron-forge package",
+    "premake": "npm run build:mcp",
     "make": "electron-forge make",
     "preexport:unity": "npm run native:node",
     "export:unity": "npx --yes vite-node src/export-unity-cli.ts",
@@ -35,7 +38,7 @@
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "sharp": "^0.35.3",
-    "zod": "^4.1.12"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@electron-forge/cli": "^7.10.2",
@@ -46,6 +49,7 @@
     "@electron-forge/plugin-vite": "^7.10.2",
     "@electron/fuses": "^1.8.0",
     "@electron/rebuild": "^3.7.2",
+    "@modelcontextprotocol/server": "^2.0.0",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.0",
     "@types/better-sqlite3": "^7.6.13",

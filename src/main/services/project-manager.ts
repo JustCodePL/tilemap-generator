@@ -1,11 +1,34 @@
 import { app, dialog } from 'electron';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import type { CreateProjectInput, RecentProject, UpdateProjectSettingsInput } from '../../shared/domain';
+import { z } from 'zod';
+import {
+  projectProjectionSchema,
+  type CreateProjectInput,
+  type ProjectProjection,
+  type RecentProject,
+  type UpdateProjectSettingsInput,
+} from '../../shared/domain';
 import { ProjectDatabase } from '../db/project-database';
 
 interface SettingsFile {
   recentProjects: RecentProject[];
+}
+
+const projectManifestSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string().trim().min(1),
+  projection: projectProjectionSchema,
+  database: z.literal('registry.sqlite'),
+}).passthrough();
+
+export interface AvailableProject {
+  projectId: string;
+  name: string;
+  projection: ProjectProjection;
+  rootPath: string;
+  openedAt: string | null;
+  active: boolean;
 }
 
 export class ProjectManager {
@@ -104,6 +127,74 @@ export class ProjectManager {
     return this.readSettings().recentProjects;
   }
 
+  availableProjects(): AvailableProject[] {
+    const active = this.database?.getProject() ?? null;
+    const activeRoot = this.database?.rootPath ?? null;
+    const candidates: AvailableProject[] = [];
+    if (active && activeRoot) {
+      candidates.push({
+        projectId: active.id,
+        name: active.name,
+        projection: active.projection,
+        rootPath: activeRoot,
+        openedAt: new Date().toISOString(),
+        active: true,
+      });
+    }
+
+    for (const recent of this.recents()) {
+      const rootPath = path.resolve(recent.rootPath);
+      if (activeRoot && samePath(rootPath, activeRoot)) continue;
+      try {
+        if (!existsSync(path.join(rootPath, 'registry.sqlite'))) continue;
+        const manifest = projectManifestSchema.parse(JSON.parse(
+          readFileSync(path.join(rootPath, 'tilemap-project.json'), 'utf8'),
+        ));
+        candidates.push({
+          projectId: manifest.id,
+          name: manifest.name,
+          projection: manifest.projection,
+          rootPath,
+          openedAt: recent.openedAt,
+          active: false,
+        });
+      } catch {
+        // Stale or malformed recent entries stay visible in the ordinary UI,
+        // but are never exposed as projects that an MCP client can activate.
+      }
+    }
+
+    const seen = new Map<string, string>();
+    for (const candidate of candidates) {
+      const previousRoot = seen.get(candidate.projectId);
+      if (previousRoot && !samePath(previousRoot, candidate.rootPath)) {
+        throw new Error(`Identyfikator projektu ${candidate.projectId} występuje w więcej niż jednej bibliotece.`);
+      }
+      seen.set(candidate.projectId, candidate.rootPath);
+    }
+    return candidates.sort((left, right) => (
+      Number(right.active) - Number(left.active)
+      || String(right.openedAt ?? '').localeCompare(String(left.openedAt ?? ''))
+      || left.name.localeCompare(right.name, 'pl')
+    ));
+  }
+
+  openAvailableProject(projectId: string): ProjectDatabase {
+    const matches = this.availableProjects().filter((project) => project.projectId === projectId);
+    if (matches.length !== 1) {
+      throw new Error(matches.length
+        ? `Projekt ${projectId} jest niejednoznaczny.`
+        : `Projekt ${projectId} nie jest dostępny.`);
+    }
+    if (matches[0].active && this.database) return this.database;
+    const database = this.open(matches[0].rootPath);
+    if (database.getProject().id !== projectId) {
+      this.close();
+      throw new Error('Projekt zmienił identyfikator podczas otwierania.');
+    }
+    return database;
+  }
+
   removeRecent(rootPath: string): void {
     const settings = this.readSettings();
     const normalized = path.resolve(rootPath).toLocaleLowerCase();
@@ -146,6 +237,10 @@ export class ProjectManager {
     mkdirSync(path.dirname(this.settingsPath()), { recursive: true });
     writeFileSync(this.settingsPath(), JSON.stringify(settings, null, 2), 'utf8');
   }
+}
+
+function samePath(left: string, right: string): boolean {
+  return path.resolve(left).toLocaleLowerCase() === path.resolve(right).toLocaleLowerCase();
 }
 
 export function slugify(value: string): string {

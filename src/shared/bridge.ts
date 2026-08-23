@@ -42,6 +42,7 @@ export const ipcChannels = {
   projectRemoveRecent: 'projects:remove-recent',
   projectSettingsProposals: 'projects:settings-proposals',
   projectSettingsProposalReview: 'projects:settings-proposal-review',
+  projectChanged: 'projects:changed',
   assetsList: 'assets:list',
   assetsGet: 'assets:get',
   assetsReview: 'assets:review',
@@ -92,6 +93,7 @@ export interface TilemapGeneratorApi {
     removeRecent(rootPath: string): Promise<void>;
     settingsProposals(): Promise<ProjectSettingsProposal[]>;
     reviewSettingsProposal(input: ReviewProjectSettingsProposalInput): Promise<ProjectSettingsProposal>;
+    onChanged(listener: (project: ProjectInfo | null) => void): () => void;
   };
   assets: {
     list(): Promise<AssetSummary[]>;
