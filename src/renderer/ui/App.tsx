@@ -200,6 +200,7 @@ export function App() {
 
 function Welcome({ onOpened }: { onOpened: (project: ProjectInfo) => void }) {
   const queryClient = useQueryClient();
+  const [mode, setMode] = useState<'projects' | 'create'>('projects');
   const [name, setName] = useState('Nowy świat');
   const [artBrief, setArtBrief] = useState('');
   const [projection, setProjection] = useState<ProjectProjection>('isometric');
@@ -261,54 +262,74 @@ function Welcome({ onOpened }: { onOpened: (project: ProjectInfo) => void }) {
         <div className="feature-line"><Archive size={17} /> Pełna historia, bez kasowania odrzuceń</div>
         <div className="feature-line"><Download size={17} /> Eksport przez integracje</div>
       </section>
-      <section className="welcome-card">
-        <div className="card-heading">
-          <div><p className="eyebrow">NOWY PROJEKT</p><h2>Zdefiniuj siatkę</h2></div>
-          <button className="icon-button" title="Otwórz istniejący projekt" onClick={() => open.mutate()}><FolderOpen /></button>
-        </div>
-        <label>Nazwa projektu<input value={name} onChange={(event) => setName(event.target.value)} /></label>
-        <label>Kierunek artystyczny<textarea rows={4} placeholder="Np. ręcznie malowane kamienie, ciepłe światło, czytelne sylwetki…" value={artBrief} onChange={(event) => setArtBrief(event.target.value)} /></label>
-        <label>Projekcja<select value={projection} onChange={(event) => setProjection(event.target.value as ProjectProjection)}><option value="isometric">Izometryczna 2:1</option><option value="top_down">Top-down 1:1</option></select></label>
-        <div className="form-grid two">
-          <label>Bazowa szerokość tile (px)<input type="number" min={16} max={4096} step={projection === 'isometric' ? 2 : 1} value={width} onChange={(event) => setWidth(Number(event.target.value))} /></label>
-          <label>{projection === 'isometric' ? 'Wysokość 2:1' : 'Wysokość 1:1'}<input value={`${tileHeightForProjection(projection, width)}px`} readOnly /></label>
-        </div>
-        <label className="welcome-character-frames">Klatki chodu na kierunek<input aria-label="Klatki chodu na kierunek" type="number" min={2} max={16} step={1} value={characterFramesPerDirection} onChange={(event) => setCharacterFramesPerDirection(Number(event.target.value))} /><small>Liczba obrazów pozy chodu dla każdego kierunku. FPS określa osobno tempo animacji.</small></label>
-        <div className="directory-picker">
-          <FolderOpen />
-          <div><small>KATALOG BIBLIOTEKI</small><strong title={storageDirectory}>{storageDirectory || 'Nie wybrano'}</strong></div>
-          <button className="secondary" type="button" disabled={chooseStorageDirectory.isPending} onClick={() => chooseStorageDirectory.mutate()}>
-            {chooseStorageDirectory.isPending ? <LoaderCircle className="spin" /> : <FolderOpen />} Wybierz katalog biblioteki
+      {mode === 'projects' ? (
+        <section className="welcome-card project-browser-card">
+          <button className="primary wide welcome-new-project" type="button" onClick={() => { setError(''); setMode('create'); }}>
+            <ImagePlus /> Nowy projekt
           </button>
-        </div>
-        <p className="directory-help">Wybierz pusty katalog. Tutaj aplikacja zapisze registry, historię i wszystkie wersje assetów. Miejsce dla zatwierdzonych plików wybierzesz osobno podczas eksportu.</p>
-        {projection === 'isometric' && width % 2 !== 0 && <p className="inline-warning"><AlertTriangle size={15} /> Bazowa szerokość musi być parzysta, aby wysokość 2:1 była całkowita.</p>}
-        {error && <ErrorBox message={error} />}
-        <button className="primary wide" disabled={create.isPending || !storageDirectory || name.trim().length < 2 || !Number.isInteger(characterFramesPerDirection) || characterFramesPerDirection < 2 || characterFramesPerDirection > 16 || (projection === 'isometric' && width % 2 !== 0)} onClick={() => create.mutate()}>
-          {create.isPending ? <LoaderCircle className="spin" /> : <ImagePlus />} Utwórz projekt
-        </button>
-        {!!recents.data?.length && <div className="recents"><span>Ostatnie projekty</span>{recents.data.slice(0, 3).map((recent) => <div className="recent-row" key={recent.rootPath}>
-          <button
-            type="button"
-            className="recent-open"
-            disabled={openRecent.isPending || removeRecent.isPending}
-            aria-label={`Otwórz projekt ${recent.name}`}
-            onClick={() => openRecent.mutate(recent.rootPath)}
-          >
-            {openRecent.isPending && openRecent.variables === recent.rootPath ? <LoaderCircle className="spin" /> : <CircleDot />}
-            <strong>{recent.name}</strong>
-            <small title={recent.rootPath}>{recent.rootPath}</small>
+          <div className="card-heading project-browser-heading">
+            <div><p className="eyebrow">BIBLIOTEKA</p><h2>Projekty</h2></div>
+            <button className="icon-button" type="button" title="Otwórz istniejący projekt" aria-label="Otwórz istniejący projekt" disabled={open.isPending} onClick={() => open.mutate()}>
+              {open.isPending ? <LoaderCircle className="spin" /> : <FolderOpen />}
+            </button>
+          </div>
+          {error && <ErrorBox message={error} />}
+          <div className="project-list" role="list" aria-label="Lista projektów">
+            {recents.isLoading ? <div className="project-list-status"><LoaderCircle className="spin" /> Wczytywanie projektów…</div> : recents.data?.length ? recents.data.map((recent) => <div className="recent-row" role="listitem" key={recent.rootPath}>
+              <button
+                type="button"
+                className="recent-open"
+                disabled={openRecent.isPending || removeRecent.isPending}
+                aria-label={`Otwórz projekt ${recent.name}`}
+                onClick={() => openRecent.mutate(recent.rootPath)}
+              >
+                {openRecent.isPending && openRecent.variables === recent.rootPath ? <LoaderCircle className="spin" /> : <CircleDot />}
+                <span><strong>{recent.name}</strong><small title={recent.rootPath}>{recent.rootPath}</small></span>
+                <ChevronRight />
+              </button>
+              <button
+                type="button"
+                className="recent-remove"
+                disabled={openRecent.isPending || removeRecent.isPending}
+                aria-label={`Usuń projekt ${recent.name} z listy`}
+                title="Usuń z listy projektów"
+                onClick={() => removeRecent.mutate(recent.rootPath)}
+              >{removeRecent.isPending && removeRecent.variables === recent.rootPath ? <LoaderCircle className="spin" /> : <Trash2 />}</button>
+            </div>) : <div className="project-list-empty"><Layers3 /><strong>Nie masz jeszcze projektów</strong><span>Utwórz nowy projekt albo otwórz istniejący z dysku.</span></div>}
+          </div>
+          <button className="secondary wide open-project-button" type="button" disabled={open.isPending} onClick={() => open.mutate()}>
+            {open.isPending ? <LoaderCircle className="spin" /> : <FolderOpen />} Otwórz istniejący projekt
           </button>
-          <button
-            type="button"
-            className="recent-remove"
-            disabled={openRecent.isPending || removeRecent.isPending}
-            aria-label={`Usuń projekt ${recent.name} z listy`}
-            title="Usuń z listy ostatnich projektów"
-            onClick={() => removeRecent.mutate(recent.rootPath)}
-          >{removeRecent.isPending && removeRecent.variables === recent.rootPath ? <LoaderCircle className="spin" /> : <Trash2 />}</button>
-        </div>)}</div>}
-      </section>
+        </section>
+      ) : (
+        <section className="welcome-card project-create-card">
+          <div className="card-heading">
+            <div><p className="eyebrow">NOWY PROJEKT</p><h2>Zdefiniuj siatkę</h2></div>
+            <button className="icon-button" type="button" title="Wróć do listy projektów" aria-label="Wróć do listy projektów" onClick={() => { setError(''); setMode('projects'); }}><X /></button>
+          </div>
+          <label>Nazwa projektu<input value={name} onChange={(event) => setName(event.target.value)} /></label>
+          <label>Kierunek artystyczny<textarea rows={4} placeholder="Np. ręcznie malowane kamienie, ciepłe światło, czytelne sylwetki…" value={artBrief} onChange={(event) => setArtBrief(event.target.value)} /></label>
+          <label>Projekcja<select value={projection} onChange={(event) => setProjection(event.target.value as ProjectProjection)}><option value="isometric">Izometryczna 2:1</option><option value="top_down">Top-down 1:1</option></select></label>
+          <div className="form-grid two">
+            <label>Bazowa szerokość tile (px)<input type="number" min={16} max={4096} step={projection === 'isometric' ? 2 : 1} value={width} onChange={(event) => setWidth(Number(event.target.value))} /></label>
+            <label>{projection === 'isometric' ? 'Wysokość 2:1' : 'Wysokość 1:1'}<input value={`${tileHeightForProjection(projection, width)}px`} readOnly /></label>
+          </div>
+          <label className="welcome-character-frames">Klatki chodu na kierunek<input aria-label="Klatki chodu na kierunek" type="number" min={2} max={16} step={1} value={characterFramesPerDirection} onChange={(event) => setCharacterFramesPerDirection(Number(event.target.value))} /><small>Liczba obrazów pozy chodu dla każdego kierunku. FPS określa osobno tempo animacji.</small></label>
+          <div className="directory-picker">
+            <FolderOpen />
+            <div><small>KATALOG BIBLIOTEKI</small><strong title={storageDirectory}>{storageDirectory || 'Nie wybrano'}</strong></div>
+            <button className="secondary" type="button" disabled={chooseStorageDirectory.isPending} onClick={() => chooseStorageDirectory.mutate()}>
+              {chooseStorageDirectory.isPending ? <LoaderCircle className="spin" /> : <FolderOpen />} Wybierz katalog biblioteki
+            </button>
+          </div>
+          <p className="directory-help">Wybierz pusty katalog. Tutaj aplikacja zapisze registry, historię i wszystkie wersje assetów. Miejsce dla zatwierdzonych plików wybierzesz osobno podczas eksportu.</p>
+          {projection === 'isometric' && width % 2 !== 0 && <p className="inline-warning"><AlertTriangle size={15} /> Bazowa szerokość musi być parzysta, aby wysokość 2:1 była całkowita.</p>}
+          {error && <ErrorBox message={error} />}
+          <button className="primary wide" disabled={create.isPending || !storageDirectory || name.trim().length < 2 || !Number.isInteger(characterFramesPerDirection) || characterFramesPerDirection < 2 || characterFramesPerDirection > 16 || (projection === 'isometric' && width % 2 !== 0)} onClick={() => create.mutate()}>
+            {create.isPending ? <LoaderCircle className="spin" /> : <ImagePlus />} Utwórz projekt
+          </button>
+        </section>
+      )}
     </main>
   );
 }

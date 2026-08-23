@@ -222,10 +222,14 @@ function mockOpenedProject(project: ProjectInfo, assets: AssetSummary[] = []) {
   });
 }
 
-it('pokazuje ekran tworzenia projektu bez otwartego registry', async () => {
+it('pokazuje listę projektów i otwiera formularz przyciskiem Nowy projekt', async () => {
   render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
   expect(await screen.findByRole('heading', { name: /Spójny świat/i })).toBeInTheDocument();
+  expect(screen.getByRole('heading', { name: 'Projekty' })).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: /Utwórz projekt/i })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Nowy projekt' }));
   expect(screen.getByRole('button', { name: /Utwórz projekt/i })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Wróć do listy projektów' })).toBeInTheDocument();
   expect(screen.getByText('Eksport przez integracje')).toBeInTheDocument();
   expect(screen.queryByText('Eksport gotowy dla Unity')).not.toBeInTheDocument();
 });
@@ -276,6 +280,7 @@ it('tworzy projekt top-down z bazowym tile 1:1', async () => {
   vi.mocked(window.tilemap.projects.create).mockResolvedValue(projectFixture);
   render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
 
+  fireEvent.click(await screen.findByRole('button', { name: 'Nowy projekt' }));
   expect(await screen.findByRole('button', { name: /Utwórz projekt/i })).toBeDisabled();
   expect(screen.getByLabelText('Klatki chodu na kierunek')).toHaveValue(8);
   fireEvent.click(screen.getByRole('button', { name: 'Wybierz katalog biblioteki' }));
@@ -306,6 +311,19 @@ it('sprawdza ostatni projekt przed otwarciem i pozwala usunąć go z listy', asy
   fireEvent.click(screen.getByRole('button', { name: 'Usuń projekt Nieistniejący świat z listy' }));
   await waitFor(() => expect(window.tilemap.projects.removeRecent).toHaveBeenCalledWith(recent.rootPath));
   expect(screen.queryByText('Nieistniejący świat')).not.toBeInTheDocument();
+});
+
+it('pokazuje wszystkie projekty zamiast ograniczać listę do trzech', async () => {
+  vi.mocked(window.tilemap.projects.recents).mockResolvedValue(Array.from({ length: 5 }, (_, index) => ({
+    name: `Świat ${index + 1}`,
+    rootPath: `C:\\projekty\\swiat-${index + 1}`,
+    openedAt: `2026-08-${String(index + 1).padStart(2, '0')}T10:00:00.000Z`,
+  })));
+
+  render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
+
+  expect(await screen.findByRole('button', { name: 'Otwórz projekt Świat 5' })).toBeInTheDocument();
+  expect(screen.getAllByRole('listitem')).toHaveLength(5);
 });
 
 it('oddziela katalog biblioteki od neutralnego ekranu integracji eksportu', async () => {
