@@ -1069,7 +1069,10 @@ function AssetReview({
   const [showError, setShowError] = useState(false);
   const [retryError, setRetryError] = useState('');
   const [verificationError, setVerificationError] = useState('');
+  const [detailTab, setDetailTab] = useState<'description' | 'timeline'>('description');
   const errorTriggerRef = useRef<HTMLButtonElement>(null);
+  const descriptionTabRef = useRef<HTMLButtonElement>(null);
+  const timelineTabRef = useRef<HTMLButtonElement>(null);
   const asset = detail.data;
   const version = asset?.versions.find((item) => item.id === selectedVersionId) ?? asset?.versions[0];
   const retryJob = version
@@ -1116,7 +1119,12 @@ function AssetReview({
   });
 
   useEffect(() => { if (version && !isTileAssetCategory(version.category)) setRepeatTerrain(false); }, [version?.category]);
-  useEffect(() => { setShowError(false); setRetryError(''); setVerificationError(''); }, [version?.id]);
+  useEffect(() => {
+    setShowError(false);
+    setRetryError('');
+    setVerificationError('');
+    setDetailTab('description');
+  }, [version?.id]);
   if (detail.isLoading || !asset || !version) return <FullScreenLoader label="Wczytywanie assetu…" compact />;
 
   const isTerrain = isTileAssetCategory(version.category);
@@ -1134,10 +1142,21 @@ function AssetReview({
     && ['needs_review', 'approved', 'rejected'].includes(version.status);
   const verificationDetails = verificationError
     || (version.aiVerificationStatus === 'failed' ? version.aiVerificationMessage : '');
+  const descriptionTabId = `asset-description-tab-${version.id}`;
+  const descriptionPanelId = `asset-description-panel-${version.id}`;
+  const timelineTabId = `asset-timeline-tab-${version.id}`;
+  const timelinePanelId = `asset-timeline-panel-${version.id}`;
+  const generationActive = jobs.some((job) => job.assetId === asset.id && ['queued', 'generating'].includes(job.status));
+  const selectDetailTab = (nextTab: 'description' | 'timeline', focus = false) => {
+    setDetailTab(nextTab);
+    if (focus) {
+      (nextTab === 'description' ? descriptionTabRef : timelineTabRef).current?.focus();
+    }
+  };
 
   return <div className="review-page">
-    <div className="section-heading compact">
-      <div><p className="eyebrow">ASSET / {categoryLabels[version.category].toLocaleUpperCase()}</p><h2>{asset.name}</h2><p>{version.aiDescription || version.prompt}</p></div>
+    <div className="section-heading compact review-heading">
+      <div><p className="eyebrow">ASSET / {categoryLabels[version.category].toLocaleUpperCase()}</p><h2>{asset.name}</h2></div>
       <div className="status-actions">
         <GeneratorBadge version={version} />
         <StatusBadge
@@ -1154,6 +1173,65 @@ function AssetReview({
         </button>}
       </div>
     </div>
+    <section className="review-details" aria-label="Szczegóły wersji assetu">
+      <div className="review-detail-tabs" role="tablist" aria-label="Widok szczegółów assetu">
+        <button
+          ref={descriptionTabRef}
+          id={descriptionTabId}
+          type="button"
+          role="tab"
+          aria-selected={detailTab === 'description'}
+          aria-controls={descriptionPanelId}
+          tabIndex={detailTab === 'description' ? 0 : -1}
+          onClick={() => selectDetailTab('description')}
+          onKeyDown={(event) => {
+            if (event.key === 'ArrowRight' || event.key === 'End') {
+              event.preventDefault();
+              selectDetailTab('timeline', true);
+            }
+          }}
+        >Opis</button>
+        <button
+          ref={timelineTabRef}
+          id={timelineTabId}
+          type="button"
+          role="tab"
+          aria-selected={detailTab === 'timeline'}
+          aria-controls={timelinePanelId}
+          tabIndex={detailTab === 'timeline' ? 0 : -1}
+          onClick={() => selectDetailTab('timeline')}
+          onKeyDown={(event) => {
+            if (event.key === 'ArrowLeft' || event.key === 'Home') {
+              event.preventDefault();
+              selectDetailTab('description', true);
+            }
+          }}
+        >Przebieg{generationActive && <i aria-hidden="true" title="Generacja aktywna" />}</button>
+      </div>
+      <div
+        id={descriptionPanelId}
+        className="review-description-panel"
+        role="tabpanel"
+        aria-labelledby={descriptionTabId}
+        hidden={detailTab !== 'description'}
+      >
+        <p>{version.aiDescription || version.prompt || 'Brak opisu tej wersji.'}</p>
+      </div>
+      <div
+        id={timelinePanelId}
+        className="review-timeline-panel"
+        role="tabpanel"
+        aria-labelledby={timelineTabId}
+        hidden={detailTab !== 'timeline'}
+      >
+        <GenerationLogPanel
+          assetId={asset.id}
+          versions={asset.versions}
+          active={generationActive}
+          embedded
+        />
+      </div>
+    </section>
     {verificationDetails && <p className="geometry-warning"><AlertTriangle /> Weryfikacja AI: {verificationDetails}</p>}
     <div className="review-layout">
       <div className="preview-column">
@@ -1205,11 +1283,6 @@ function AssetReview({
       </div>
       <ReviewControls asset={asset} version={version} project={project} onChanged={handleChanged} />
     </div>
-    <GenerationLogPanel
-      assetId={asset.id}
-      versions={asset.versions}
-      active={jobs.some((job) => job.assetId === asset.id && ['queued', 'generating'].includes(job.status))}
-    />
     {showError && <ErrorDetailsModal
       message={errorDetails || 'Brak dodatkowych szczegółów błędu.'}
       onClose={() => setShowError(false)}
@@ -1602,10 +1675,12 @@ export function GenerationLogPanel({
   assetId,
   active,
   versions,
+  embedded = false,
 }: {
   assetId: string;
   active: boolean;
   versions?: AssetVersion[];
+  embedded?: boolean;
 }) {
   const entriesRef = useRef<HTMLDivElement>(null);
   const previewTriggerRef = useRef<HTMLButtonElement>(null);
@@ -1627,11 +1702,11 @@ export function GenerationLogPanel({
   useEffect(() => {
     if (active && entriesRef.current) entriesRef.current.scrollTop = entriesRef.current.scrollHeight;
   }, [active, entries.length]);
-  return <section className="generation-log" aria-label="Dziennik generacji" aria-live="polite">
-    <div className="generation-log-heading">
+  return <section className={`generation-log${embedded ? ' embedded' : ''}`} aria-label="Dziennik generacji" aria-live="polite">
+    {!embedded && <div className="generation-log-heading">
       <div><p className="eyebrow">PRZEBIEG</p><strong>Log generacji</strong></div>
       {active && <span className="generation-log-live"><i /> AKTYWNA</span>}
-    </div>
+    </div>}
     <div className="generation-log-entries" ref={entriesRef}>
       {logs.isLoading && <div className="generation-log-empty"><LoaderCircle className="spin" /> Wczytywanie logu…</div>}
       {!logs.isLoading && !entries.length && <div className="generation-log-empty">Log pojawi się po rozpoczęciu generacji.</div>}

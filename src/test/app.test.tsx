@@ -1631,9 +1631,24 @@ it('pokazuje podejścia w prawym sidebarze assetu, a Art Direction tylko na pozi
   fireEvent.click(await screen.findByRole('button', { name: /Łąka/i }));
   expect(await screen.findByRole('heading', { name: 'Podejścia' })).toBeInTheDocument();
   expect(screen.queryByRole('heading', { name: 'DNA stylu' })).not.toBeInTheDocument();
+
+  const descriptionTab = await screen.findByRole('tab', { name: 'Opis' });
+  const timelineTab = screen.getByRole('tab', { name: 'Przebieg' });
+  expect(descriptionTab).toHaveAttribute('aria-selected', 'true');
+  expect(timelineTab).toHaveAttribute('aria-selected', 'false');
+  expect(screen.getByRole('tabpanel', { name: 'Opis' })).toHaveTextContent('Łąka');
+  expect(screen.queryByRole('region', { name: 'Dziennik generacji' })).not.toBeInTheDocument();
+
+  fireEvent.click(timelineTab);
   const generationLog = await screen.findByRole('region', { name: 'Dziennik generacji' });
   expect(generationLog.closest('.review-page')).not.toBeNull();
   expect(generationLog.closest('.asset-attempts-panel')).toBeNull();
+  expect(timelineTab).toHaveAttribute('aria-selected', 'true');
+  expect(screen.getByRole('tabpanel', { name: 'Przebieg' })).toContainElement(generationLog);
+
+  fireEvent.keyDown(timelineTab, { key: 'ArrowLeft' });
+  expect(descriptionTab).toHaveFocus();
+  expect(descriptionTab).toHaveAttribute('aria-selected', 'true');
 
   fireEvent.click(screen.getByRole('button', { name: /Tile obok tile/i }));
   const gridSize = screen.getByRole('group', { name: 'Rozmiar siatki podglądu' });
