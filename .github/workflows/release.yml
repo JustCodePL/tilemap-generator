@@ -291,6 +291,21 @@ jobs:
       - name: Configure GitHub Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 
+      - name: Ensure GNU tar for the Pages artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! brew list gnu-tar >/dev/null 2>&1; then
+            brew install gnu-tar
+          fi
+          gnu_tar="$(brew --prefix gnu-tar)/bin/gtar"
+          [[ -x "$gnu_tar" ]]
+          tools_directory="$RUNNER_TEMP/tilemap-release-tools"
+          mkdir -p "$tools_directory"
+          ln -sfn "$gnu_tar" "$tools_directory/gtar"
+          echo "$tools_directory" >> "$GITHUB_PATH"
+          "$tools_directory/gtar" --version
+
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:

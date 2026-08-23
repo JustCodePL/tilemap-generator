@@ -33,6 +33,8 @@ it('weryfikuje osobno pełny SemVer, numeryczną wersję Apple i entitlement all
 });
 
 it('publikuje updater z tego samego publicznego repo bez PAT', () => {
+  expect(workflow).toContain('brew list gnu-tar');
+  expect(workflow).toContain('echo "$tools_directory" >> "$GITHUB_PATH"');
   expect(workflow).toContain('actions/upload-pages-artifact@');
   expect(workflow).toContain('actions/deploy-pages@');
   expect(workflow).toContain('https://justcodepl.github.io/tilemap-generator/updates/');
