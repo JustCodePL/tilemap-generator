@@ -435,11 +435,13 @@ function assertExportableCharacterAnimation(
   }
   const expectedDirections = characterDirectionsForProjection(project.projection);
   if (animation.settings.action !== 'walk'
-    || animation.settings.framesPerDirection !== 4
+    || !Number.isInteger(animation.settings.framesPerDirection)
+    || animation.settings.framesPerDirection < 2
+    || animation.settings.framesPerDirection > 16
     || !Number.isInteger(animation.settings.framesPerSecond)
     || animation.settings.framesPerSecond < 1
     || animation.settings.framesPerSecond > 24) {
-    throw new Error('Animacja postaci ma nieobsługiwane ustawienia. Unity wymaga walk v1: idle + 4 klatki chodu.');
+    throw new Error('Animacja postaci ma nieobsługiwane ustawienia. Unity wymaga walk v1: idle oraz 2–16 klatek chodu na kierunek.');
   }
   const expectedFrame = characterAnimationFrameSize(project, version);
   const expectedSheet = characterAnimationSheetSize(expectedFrame, animation.settings);
@@ -449,7 +451,9 @@ function assertExportableCharacterAnimation(
     || animation.sheetSize.height !== expectedSheet.height
     || version.width !== expectedSheet.width
     || version.height !== expectedSheet.height) {
-    throw new Error('Arkusz zatwierdzonej postaci nie odpowiada wymiarom klatki i układowi 5×4 bieżącego projektu.');
+    throw new Error(
+      `Arkusz zatwierdzonej postaci nie odpowiada wymiarom klatki i układowi ${animation.settings.framesPerDirection + 1}×4.`,
+    );
   }
   if (!sameCharacterDirections(animation.directions, expectedDirections)) {
     throw new Error('Arkusz postaci nie zawiera dokładnego zestawu kierunków bieżącej projekcji.');
@@ -537,7 +541,7 @@ function characterAnimationManifest(
       heightPx: animation.sheetSize.height,
       frameWidthPx: animation.frameSize.width,
       frameHeightPx: animation.frameSize.height,
-      columns: 5,
+      columns: animation.settings.framesPerDirection + 1,
       rows: 4,
       origin: 'top_left',
     },

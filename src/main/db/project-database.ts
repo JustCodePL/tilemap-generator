@@ -17,6 +17,7 @@ import {
   characterAnimationSheetSize,
   characterDirectionSchema,
   characterDirectionsForProjection,
+  characterFramesPerDirectionSchema,
   defaultAssetSizing,
   defaultCharacterAnimationSettings,
   exportIntegrationSchema,
@@ -60,7 +61,7 @@ import * as schema from './schema';
 
 const MANIFEST_NAME = 'tilemap-project.json';
 const DATABASE_NAME = 'registry.sqlite';
-const SCHEMA_VERSION = 18;
+const SCHEMA_VERSION = 19;
 
 type Row = Record<string, unknown>;
 
@@ -126,6 +127,9 @@ export class ProjectDatabase {
 
   static create(rootPath: string, input: CreateProjectInput): ProjectDatabase {
     const projection = projectProjectionSchema.parse(input.projection ?? 'isometric');
+    const characterFramesPerDirection = characterFramesPerDirectionSchema.parse(
+      input.characterFramesPerDirection,
+    );
     if (projection === 'isometric' && input.tileWidthPx % 2 !== 0) {
       throw new Error('Bazowa szerokość izometrycznego tile musi być parzysta.');
     }
@@ -149,8 +153,8 @@ export class ProjectDatabase {
     database.sqlite.prepare(`
       INSERT INTO projects (
         id, name, art_brief, projection, tile_width_px, tile_height_px,
-        pixels_per_unit, style_summary_stale, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        pixels_per_unit, character_frames_per_direction, style_summary_stale, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
     `).run(
       projectId,
       input.name,
@@ -159,6 +163,7 @@ export class ProjectDatabase {
       input.tileWidthPx,
       tileHeightPx,
       input.pixelsPerUnit ?? input.tileWidthPx,
+      characterFramesPerDirection,
       now,
       now,
     );
@@ -204,6 +209,7 @@ export class ProjectDatabase {
           id TEXT PRIMARY KEY, name TEXT NOT NULL, art_brief TEXT NOT NULL DEFAULT '',
           projection TEXT NOT NULL DEFAULT 'isometric', tile_width_px INTEGER NOT NULL,
            tile_height_px INTEGER NOT NULL, pixels_per_unit INTEGER NOT NULL,
+           character_frames_per_direction INTEGER NOT NULL DEFAULT 8,
            max_concurrent_jobs INTEGER NOT NULL DEFAULT 1,
            ai_verification_enabled INTEGER NOT NULL DEFAULT 1,
            codex_generation_enabled INTEGER NOT NULL DEFAULT 1,
@@ -250,7 +256,7 @@ export class ProjectDatabase {
         CREATE TABLE IF NOT EXISTS character_animation_sets (
           version_id TEXT PRIMARY KEY REFERENCES asset_versions(id) ON DELETE CASCADE,
           action TEXT NOT NULL DEFAULT 'walk',
-          frames_per_direction INTEGER NOT NULL DEFAULT 4,
+          frames_per_direction INTEGER NOT NULL DEFAULT 8,
           frames_per_second INTEGER NOT NULL DEFAULT 8,
           frame_width INTEGER NOT NULL,
           frame_height INTEGER NOT NULL,
@@ -336,6 +342,9 @@ export class ProjectDatabase {
       }
       if (!projectColumns.some((column) => column.name === 'stable_diffusion_cpp_enabled')) {
         this.sqlite.exec('ALTER TABLE projects ADD COLUMN stable_diffusion_cpp_enabled INTEGER NOT NULL DEFAULT 0;');
+      }
+      if (!projectColumns.some((column) => column.name === 'character_frames_per_direction')) {
+        this.sqlite.exec('ALTER TABLE projects ADD COLUMN character_frames_per_direction INTEGER NOT NULL DEFAULT 8;');
       }
       const assetColumns = this.sqlite.pragma('table_info(assets)') as Array<{ name: string }>;
       const versionColumns = this.sqlite.pragma('table_info(asset_versions)') as Array<{ name: string }>;
@@ -496,6 +505,9 @@ export class ProjectDatabase {
       artBrief: String(row.art_brief), projection: projectProjectionSchema.parse(row.projection),
       tileWidthPx: Number(row.tile_width_px), tileHeightPx: Number(row.tile_height_px),
       pixelsPerUnit: Number(row.pixels_per_unit),
+      characterFramesPerDirection: characterFramesPerDirectionSchema.parse(
+        Number(row.character_frames_per_direction),
+      ),
       maxConcurrentJobs: Number(row.max_concurrent_jobs),
       aiVerificationEnabled: Boolean(row.ai_verification_enabled),
       codexGenerationEnabled: Boolean(row.codex_generation_enabled),
@@ -517,9 +529,13 @@ export class ProjectDatabase {
       throw new Error('Bazowa szerokość izometrycznego tile musi być parzysta.');
     }
     const tileHeightPx = tileHeightForProjection(current.projection, input.tileWidthPx);
+    const characterFramesPerDirection = characterFramesPerDirectionSchema.parse(
+      input.characterFramesPerDirection ?? current.characterFramesPerDirection,
+    );
     this.sqlite.prepare(`
       UPDATE projects SET name = ?, art_brief = ?, tile_width_px = ?, tile_height_px = ?,
-        pixels_per_unit = ?, max_concurrent_jobs = ?, ai_verification_enabled = ?,
+        pixels_per_unit = ?, character_frames_per_direction = ?,
+        max_concurrent_jobs = ?, ai_verification_enabled = ?,
         codex_generation_enabled = ?, comfyui_enabled = ?, comfyui_profile = ?,
         stable_diffusion_cpp_enabled = ?,
         style_summary_stale = ?, updated_at = ? WHERE id = ?
@@ -529,6 +545,7 @@ export class ProjectDatabase {
       input.tileWidthPx,
       tileHeightPx,
       input.pixelsPerUnit,
+      characterFramesPerDirection,
       input.maxConcurrentJobs,
       input.aiVerificationEnabled ? 1 : 0,
       (input.codexGenerationEnabled ?? current.codexGenerationEnabled) ? 1 : 0,
@@ -647,9 +664,22 @@ export class ProjectDatabase {
       const previousAnimation = preserveSizing && input.assetId
         ? this.characterAnimationSettingsForIteration(input.assetId, input.parentVersionId)
         : null;
-      characterAnimation = characterAnimationSettingsSchema.parse(
-        input.characterAnimation ?? previousAnimation ?? defaultCharacterAnimationSettings,
-      );
+      const requestedAnimation = input.characterAnimation
+        ? characterAnimationSettingsSchema.parse(input.characterAnimation)
+        : null;
+      if (requestedAnimation
+        && requestedAnimation.framesPerDirection !== project.characterFramesPerDirection) {
+        throw new Error(
+          `Animacja postaci musi używać projektowej liczby ${project.characterFramesPerDirection} klatek chodu na kierunek.`,
+        );
+      }
+      characterAnimation = characterAnimationSettingsSchema.parse({
+        action: requestedAnimation?.action ?? previousAnimation?.action
+          ?? defaultCharacterAnimationSettings.action,
+        framesPerDirection: project.characterFramesPerDirection,
+        framesPerSecond: requestedAnimation?.framesPerSecond ?? previousAnimation?.framesPerSecond
+          ?? defaultCharacterAnimationSettings.framesPerSecond,
+      });
       characterFrameSize = characterAnimationFrameSize(project, { relativeWidth, relativeHeight });
     }
     const roadConnections = category === 'road_tile' ? 15 : 0;
@@ -911,6 +941,12 @@ export class ProjectDatabase {
     if (data.category !== 'character' || !context.characterAnimation || !data.characterAnimation) {
       throw new Error('Postać wymaga kompletnego zestawu animacji kierunkowej przed finalizacją.');
     }
+    const project = this.getProject();
+    if (context.characterAnimation.framesPerDirection !== project.characterFramesPerDirection) {
+      throw new Error(
+        `Konfiguracja zadania postaci nie odpowiada bieżącej projektowej liczbie ${project.characterFramesPerDirection} klatek chodu na kierunek.`,
+      );
+    }
 
     const stored = this.sqlite.prepare(`
       SELECT * FROM character_animation_sets WHERE version_id = ?
@@ -937,7 +973,7 @@ export class ProjectDatabase {
       throw new Error(`Arkusz animacji postaci musi mieć dokładnie ${sheetSize.width}×${sheetSize.height}px.`);
     }
 
-    const expectedDirections = characterDirectionsForProjection(this.getProject().projection);
+    const expectedDirections = characterDirectionsForProjection(project.projection);
     const resultDirectionIds = data.characterAnimation.directions.map((direction) => direction.id);
     if (resultDirectionIds.length !== expectedDirections.length
       || resultDirectionIds.some((direction, index) => direction !== expectedDirections[index].id)) {
@@ -1175,6 +1211,7 @@ export class ProjectDatabase {
       artBrief: project.artBrief,
       tileWidthPx: project.tileWidthPx,
       pixelsPerUnit: project.pixelsPerUnit,
+      characterFramesPerDirection: project.characterFramesPerDirection,
       codexGenerationEnabled: project.codexGenerationEnabled,
       comfyUiEnabled: project.comfyUiEnabled,
       comfyUiProfile: project.comfyUiProfile,
@@ -1213,6 +1250,9 @@ export class ProjectDatabase {
       if (decision === 'approved') {
         const current = this.getProject();
         const nextTileWidth = proposal.proposed.tileWidthPx ?? current.tileWidthPx;
+        const nextCharacterFramesPerDirection = characterFramesPerDirectionSchema.parse(
+          proposal.proposed.characterFramesPerDirection ?? current.characterFramesPerDirection,
+        );
         if (current.projection === 'isometric' && nextTileWidth % 2 !== 0) {
           throw new Error('Bazowa szerokość izometrycznego tile musi być parzysta.');
         }
@@ -1225,7 +1265,8 @@ export class ProjectDatabase {
         }
         this.sqlite.prepare(`
           UPDATE projects SET art_brief = ?, tile_width_px = ?, tile_height_px = ?,
-            pixels_per_unit = ?, codex_generation_enabled = ?, comfyui_enabled = ?, comfyui_profile = ?,
+            pixels_per_unit = ?, character_frames_per_direction = ?,
+            codex_generation_enabled = ?, comfyui_enabled = ?, comfyui_profile = ?,
             stable_diffusion_cpp_enabled = ?,
             style_summary_stale = 1, updated_at = ? WHERE id = ?
         `).run(
@@ -1233,6 +1274,7 @@ export class ProjectDatabase {
           nextTileWidth,
           tileHeightForProjection(current.projection, nextTileWidth),
           proposal.proposed.pixelsPerUnit ?? current.pixelsPerUnit,
+          nextCharacterFramesPerDirection,
           nextCodexEnabled ? 1 : 0,
           nextComfyEnabled ? 1 : 0,
           proposal.proposed.comfyUiProfile ?? current.comfyUiProfile,

@@ -51,16 +51,18 @@ Sama nazwa wystarcza do rozpoczęcia, ale opis powinien określać funkcję obie
 Postacie powstają w osobnej sekcji **Postacie**.
 
 1. Podaj nazwę i opis postaci.
-2. Ustaw rozmiar pojedynczej klatki względem tile'a, footprint oraz FPS.
+2. Sprawdź projektową liczbę klatek chodu na kierunek, a następnie ustaw rozmiar pojedynczej klatki względem tile'a, footprint oraz FPS. FPS steruje tempem odtwarzania, a nie liczbą klatek.
 3. Wybierz providery.
 4. Uruchom generację.
 
-Aplikacja wymaga arkusza 5×4:
+Aplikacja wymaga arkusza `(N + 1) × 4`, gdzie `N` to ustawienie projektu:
 
-- 5 kolumn: idle oraz cztery fazy chodu;
+- 1 kolumna idle oraz od 2 do 16 kolumn chodu (domyślnie 8);
 - 4 wiersze: wszystkie kierunki projekcji;
 - izometria: NW, NE, SE, SW;
 - top-down: N, E, S, W.
+
+Jeśli starsza wersja ma mniej klatek niż bieżący standard projektu, review pokazuje ostrzeżenie z obiema wartościami. Taka wersja nie jest po cichu reinterpretowana; kolejna generacja używa aktualnego ustawienia projektu.
 
 Po walidacji technicznej osobna, obowiązkowa analiza Codexa sprawdza ruch w każdym kierunku. Postać nie pojawi się jako gotowa do zatwierdzenia, dopóki raport nie ma `passed` dla wszystkich czterech kierunków. Ogólne wyłączenie weryfikacji AI nie wyłącza tej bramki.
 

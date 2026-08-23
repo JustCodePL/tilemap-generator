@@ -83,9 +83,9 @@ commitów do `main`.
 Po przejściu wszystkich lokalnych kontroli:
 
 ```bash
-git tag -a v0.2.0-beta.1 -m "Eksport Phaser i aktualizacje macOS"
+git tag -a v0.2.0-beta.2 -m "Konfigurowalne animacje postaci"
 git push origin main
-git push origin v0.2.0-beta.1
+git push origin v0.2.0-beta.2
 ```
 
 Tag należy wypchnąć dopiero po commicie wersji na `main`. Zakończony zielony

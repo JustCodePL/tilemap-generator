@@ -28,7 +28,7 @@ export const registryDynamicTools = [{
     {
       type: 'function',
       name: 'get_generation_settings',
-      description: 'Read which image generators are enabled for the current project and the selected ComfyUI profile.',
+      description: 'Read the character frame requirement, enabled image generators, and selected ComfyUI profile for the current project.',
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     },
     {
@@ -89,6 +89,7 @@ export const registryDynamicTools = [{
               artBrief: { type: 'string', maxLength: 12000 },
               tileWidthPx: { type: 'integer', minimum: 16, maximum: 4096 },
               pixelsPerUnit: { type: 'integer', minimum: 1, maximum: 4096 },
+              characterFramesPerDirection: { type: 'integer', minimum: 2, maximum: 16 },
               codexGenerationEnabled: { type: 'boolean' },
               comfyUiEnabled: { type: 'boolean' },
               comfyUiProfile: { type: 'string', enum: ['z_image_turbo'] },
@@ -116,6 +117,7 @@ export async function handleRegistryTool(database: ProjectDatabase, params: Reco
   if (tool === 'get_generation_settings') {
     const project = database.getProject();
     return textResult({
+      characterFramesPerDirection: project.characterFramesPerDirection,
       codexGenerationEnabled: project.codexGenerationEnabled,
       comfyUiEnabled: project.comfyUiEnabled,
       comfyUiProfile: project.comfyUiProfile,

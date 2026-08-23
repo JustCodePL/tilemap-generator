@@ -115,16 +115,18 @@ Budynki zapisują rozmiar względny oraz footprint. Dla kategorii bez specjalizo
 Pojedynczy zestaw ma:
 
 - 4 wiersze kierunków;
-- 5 kolumn: idle, W1, W2, W3, W4;
+- `N + 1` kolumn: idle oraz `N` kolejnych klatek chodu, gdzie projekt ustala `N` w zakresie 2–16 (domyślnie 8);
 - stały rozmiar klatki;
 - transparentne tło i gutter;
 - wspólny punkt kontaktu z podłożem;
 - domyślnie 8 FPS, dopuszczalnie 1–24 FPS.
 
+Liczba klatek i FPS są niezależne: `N` określa liczbę różnych faz chodu, a FPS tempo ich odtwarzania. Przykładowo 8 klatek przy 8 FPS daje pętlę trwającą 1 sekundę.
+
 Docelowy rozmiar arkusza:
 
 ```text
-width  = frameWidth × 5
+width  = frameWidth × (N + 1)
 height = frameHeight × 4
 ```
 
@@ -132,7 +134,7 @@ height = frameHeight × 4
 
 Provider może zwrócić standardowy canvas większy niż docelowy. Aplikacja:
 
-1. numerycznie sprawdza kanał alfa i wszystkie 20 komórek;
+1. numerycznie sprawdza kanał alfa i wszystkie `(N + 1) × 4` komórki;
 2. odrzuca RGB z wypaloną szachownicą;
 3. ocenia wszystkich dostępnych kandydatów, zamiast ślepo wybierać pierwszy;
 4. dla użytecznego RGBA przepakowuje każdą komórkę osobno;
@@ -145,13 +147,13 @@ Nie używa generatywnego usuwania tła, jeżeli obraz ma już rzeczywistą alfę
 
 Sprawdzane są między innymi:
 
-- 20 niepustych komórek;
+- wszystkie `(N + 1) × 4` niepuste komórki;
 - transparentne narożniki i gutter;
 - drift baseline'u, centroidu i powierzchni sylwetki;
 - niezerowe różnice kolejnych faz chodu;
 - ciągłość przejścia końca pętli do początku.
 
-Walidator tworzy board analityczny z sekwencją `idle, W1, W2, W3, W4, W1` dla każdego kierunku.
+Walidator tworzy board analityczny z sekwencją `idle, W1, …, WN, W1` dla każdego kierunku.
 
 ### Obowiązkowa analiza agenta
 
@@ -178,6 +180,7 @@ Agent może utworzyć propozycję, jeżeli referencje albo oczekiwany wynik wyma
 - nazwy lub briefu;
 - bazowej szerokości tile'a;
 - PPU;
+- liczby klatek chodu na kierunek;
 - aktywnych generatorów.
 
 Propozycja zawiera stan przed zmianą, proponowane pola, powód i referencje. Nie zmienia projektu przed decyzją użytkownika. Jeżeli propozycja powstała w trakcie generacji, kolejka zatrzymuje publikację fail-closed niezależnie od deklarowanego statusu odpowiedzi agenta.

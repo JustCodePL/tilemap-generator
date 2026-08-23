@@ -2,7 +2,6 @@ import { copyFileSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import sharp, { type OverlayOptions } from 'sharp';
 
-const CHARACTER_COLUMNS = 5;
 const CHARACTER_ROWS = 4;
 const ALPHA_VISIBLE_THRESHOLD = 24;
 
@@ -18,6 +17,9 @@ export interface CharacterAnimationSourceCellInspection {
 export interface CharacterAnimationSourceInspection {
   width: number;
   height: number;
+  columns: number;
+  rows: 4;
+  framesPerDirection: number;
   hasAlpha: boolean;
   alphaMin: number;
   alphaMax: number;
@@ -33,6 +35,7 @@ export interface NormalizeCharacterAnimationSourceInput {
   outputPath: string;
   frameWidthPx: number;
   frameHeightPx: number;
+  framesPerDirection: number;
 }
 
 export interface CharacterAnimationSourceNormalization {
@@ -57,7 +60,10 @@ interface RawImage {
  */
 export async function inspectCharacterAnimationSource(
   filePath: string,
+  framesPerDirection: number,
 ): Promise<CharacterAnimationSourceInspection> {
+  assertFramesPerDirection(framesPerDirection);
+  const columns = framesPerDirection + 1;
   const image = sharp(filePath, { failOn: 'error' });
   const metadata = await image.metadata();
   if (metadata.format !== 'png') throw new Error('Źródło animacji postaci nie jest plikiem PNG.');
@@ -95,9 +101,9 @@ export async function inspectCharacterAnimationSource(
     for (let row = 0; row < CHARACTER_ROWS; row += 1) {
       const top = gridBoundary(row, raw.height, CHARACTER_ROWS);
       const bottom = gridBoundary(row + 1, raw.height, CHARACTER_ROWS);
-      for (let column = 0; column < CHARACTER_COLUMNS; column += 1) {
-        const left = gridBoundary(column, raw.width, CHARACTER_COLUMNS);
-        const right = gridBoundary(column + 1, raw.width, CHARACTER_COLUMNS);
+      for (let column = 0; column < columns; column += 1) {
+        const left = gridBoundary(column, raw.width, columns);
+        const right = gridBoundary(column + 1, raw.width, columns);
         const cell = inspectCell(raw, row, column, left, top, right, bottom);
         cells.push(cell);
         if (!cell.visiblePixels) {
@@ -112,6 +118,9 @@ export async function inspectCharacterAnimationSource(
   return {
     width: raw.width,
     height: raw.height,
+    columns,
+    rows: CHARACTER_ROWS,
+    framesPerDirection,
     hasAlpha,
     alphaMin,
     alphaMax,
@@ -124,7 +133,7 @@ export async function inspectCharacterAnimationSource(
 }
 
 /**
- * Re-packs a generated 5x4 sheet without changing the source. Every cell uses
+ * Re-packs a generated (idle + walk frames) x 4 sheet without changing the source. Every cell uses
  * one common scale, keeps its aspect ratio, is centered horizontally and
  * bottom-aligned inside the target frame. No upscaling or background removal
  * is performed.
@@ -133,14 +142,16 @@ export async function normalizeCharacterAnimationSource(
   input: NormalizeCharacterAnimationSourceInput,
 ): Promise<CharacterAnimationSourceNormalization> {
   assertFrameSize(input.frameWidthPx, input.frameHeightPx);
-  const source = await inspectCharacterAnimationSource(input.sourcePath);
+  assertFramesPerDirection(input.framesPerDirection);
+  const columns = input.framesPerDirection + 1;
+  const source = await inspectCharacterAnimationSource(input.sourcePath, input.framesPerDirection);
   if (!source.usable) throw new Error(source.issues.join(' '));
 
-  const targetWidth = input.frameWidthPx * CHARACTER_COLUMNS;
+  const targetWidth = input.frameWidthPx * columns;
   const targetHeight = input.frameHeightPx * CHARACTER_ROWS;
   const samePath = path.resolve(input.sourcePath) === path.resolve(input.outputPath);
   const normalized = source.width !== targetWidth || source.height !== targetHeight;
-  const sourceCellWidth = source.width / CHARACTER_COLUMNS;
+  const sourceCellWidth = source.width / columns;
   const sourceCellHeight = source.height / CHARACTER_ROWS;
   const horizontalGutter = input.frameWidthPx >= 3 ? 1 : 0;
   const verticalGutter = input.frameHeightPx >= 2 ? 1 : 0;
@@ -150,6 +161,7 @@ export async function normalizeCharacterAnimationSource(
     cell,
     source.width,
     source.height,
+    columns,
   ));
   const maxSourceRegionWidth = Math.max(...sourceRegions.map((region) => region.width));
   const maxSourceRegionHeight = Math.max(...sourceRegions.map((region) => region.height));
@@ -186,8 +198,8 @@ export async function normalizeCharacterAnimationSource(
     } else {
       const overlays: OverlayOptions[] = [];
       for (const [index, sourceRegion] of sourceRegions.entries()) {
-        const row = Math.floor(index / CHARACTER_COLUMNS);
-        const column = index % CHARACTER_COLUMNS;
+        const row = Math.floor(index / columns);
+        const column = index % columns;
         const cellWidth = Math.max(1, Math.min(availableWidth, Math.round(sourceRegion.width * scale)));
         const cellHeight = Math.max(1, Math.min(availableHeight, Math.round(sourceRegion.height * scale)));
         const cell = await sharp(input.sourcePath, { failOn: 'error' })
@@ -222,7 +234,7 @@ export async function normalizeCharacterAnimationSource(
     throw error;
   }
 
-  const output = await inspectCharacterAnimationSource(input.outputPath);
+  const output = await inspectCharacterAnimationSource(input.outputPath, input.framesPerDirection);
   if (!output.usable) {
     rmSync(input.outputPath, { force: true });
     throw new Error(`Znormalizowany arkusz animacji jest niepoprawny. ${output.issues.join(' ')}`);
@@ -293,10 +305,11 @@ function expandedCellRegion(
   cell: CharacterAnimationSourceCellInspection,
   sourceWidth: number,
   sourceHeight: number,
+  columns: number,
 ): { left: number; top: number; width: number; height: number } {
   if (!cell.bounds) throw new Error(`Komórka ${cell.column + 1}×${cell.row + 1} źródła animacji postaci jest pusta.`);
-  const cellLeft = gridBoundary(cell.column, sourceWidth, CHARACTER_COLUMNS);
-  const cellRight = gridBoundary(cell.column + 1, sourceWidth, CHARACTER_COLUMNS);
+  const cellLeft = gridBoundary(cell.column, sourceWidth, columns);
+  const cellRight = gridBoundary(cell.column + 1, sourceWidth, columns);
   const cellTop = gridBoundary(cell.row, sourceHeight, CHARACTER_ROWS);
   const cellBottom = gridBoundary(cell.row + 1, sourceHeight, CHARACTER_ROWS);
   const left = Math.max(cellLeft, cellLeft + cell.bounds.left - 1);
@@ -317,5 +330,11 @@ function gridBoundary(index: number, size: number, count: number): number {
 function assertFrameSize(width: number, height: number): void {
   if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
     throw new Error('Docelowe wymiary klatki animacji muszą być dodatnimi liczbami całkowitymi.');
+  }
+}
+
+function assertFramesPerDirection(value: number): void {
+  if (!Number.isInteger(value) || value < 2 || value > 16) {
+    throw new Error('Liczba klatek chodu na kierunek musi być liczbą całkowitą od 2 do 16.');
   }
 }

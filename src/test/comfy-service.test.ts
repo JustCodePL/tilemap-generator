@@ -270,17 +270,18 @@ it('wykrywa gotowy profil Z-Image Turbo i zapisuje provenance workflow', async (
   await service.generate({
     assetName: 'Strażniczka', category: 'character', projection: 'isometric', prompt: 'Czerwona peleryna', feedback: '',
     artBrief: '', styleSummary: '', outputPath: characterOutput,
-    outputSize: { width: 320, height: 128 },
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+    outputSize: { width: 576, height: 128 },
+    characterAnimation: { action: 'walk', framesPerDirection: 8, framesPerSecond: 8 },
     roadAtlas: false, attempt: 1, verificationFeedback: '', signal: new AbortController().signal,
   });
   const characterWorkflow = (submitted as unknown as Record<string, unknown>).prompt as Record<string, { class_type: string; inputs: Record<string, unknown> }>;
   const characterPrompt = String(characterWorkflow['5'].inputs.text);
-  expect(characterPrompt).toContain('5-column by 4-row');
+  expect(characterPrompt).toContain('9-column by 4-row');
   expect(characterPrompt).toContain('Every frame cell is exactly 64x32px');
   expect(characterPrompt).toContain('NW (north_west), NE (north_east), SE (south_east), SW (south_west)');
-  expect(characterPrompt).toContain('Column 1 is a grounded idle pose');
-  expect(characterPrompt).toContain('left contact, passing, right contact, passing');
+  expect(characterPrompt).toContain('Column 1 is one grounded idle pose');
+  expect(characterPrompt).toContain('Columns 2-9 are exactly 8 chronological');
+  expect(characterPrompt).toContain('make W8 loop smoothly into W1');
 });
 
 it('pozwala generować opaque top-down bez BiRefNet, ale blokuje workflow z przezroczystością', async () => {

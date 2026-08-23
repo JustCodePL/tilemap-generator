@@ -10,6 +10,7 @@ import {
 } from '../main/services/character-animation-source';
 
 const directories: string[] = [];
+const FIXTURE_FRAMES_PER_DIRECTION = 4;
 afterEach(() => directories.splice(0).forEach((directory) => rmSync(directory, { recursive: true, force: true })));
 
 describe('inspectCharacterAnimationSource', () => {
@@ -18,7 +19,7 @@ describe('inspectCharacterAnimationSource', () => {
     const source = path.join(directory, 'hidden-rgb.png');
     await createTransparentSheet(source, 100, 80, { hiddenBackground: { r: 91, g: 45, b: 24 } });
 
-    const result = await inspectCharacterAnimationSource(source);
+    const result = await inspectCharacterAnimationSource(source, FIXTURE_FRAMES_PER_DIRECTION);
 
     expect(result).toMatchObject({
       width: 100,
@@ -28,7 +29,7 @@ describe('inspectCharacterAnimationSource', () => {
       usable: true,
     });
     expect(result.alphaMax).toBeGreaterThan(248);
-    expect(result.cells).toHaveLength(20);
+    expect(result.cells).toHaveLength((FIXTURE_FRAMES_PER_DIRECTION + 1) * 4);
     expect(result.cells.every((cell) => cell.visiblePixels > 0 && !cell.touchesCellEdge)).toBe(true);
   });
 
@@ -44,7 +45,7 @@ describe('inspectCharacterAnimationSource', () => {
       + '</svg>';
     await sharp(Buffer.from(svg)).removeAlpha().png().toFile(source);
 
-    const inspection = await inspectCharacterAnimationSource(source);
+    const inspection = await inspectCharacterAnimationSource(source, FIXTURE_FRAMES_PER_DIRECTION);
     expect(inspection.usable).toBe(false);
     expect(inspection.issues).toContain('Źródło animacji postaci nie ma kanału alfa.');
     await expect(normalizeCharacterAnimationSource({
@@ -52,6 +53,7 @@ describe('inspectCharacterAnimationSource', () => {
       outputPath: path.join(directory, 'final.png'),
       frameWidthPx: 10,
       frameHeightPx: 20,
+      framesPerDirection: FIXTURE_FRAMES_PER_DIRECTION,
     })).rejects.toThrow(/nie ma kanału alfa/);
     expect(existsSync(path.join(directory, 'final.png'))).toBe(false);
   });
@@ -61,7 +63,7 @@ describe('inspectCharacterAnimationSource', () => {
     const source = path.join(directory, 'touching.png');
     await createTransparentSheet(source, 103, 80, { touchFirstCellEdge: true });
 
-    const result = await inspectCharacterAnimationSource(source);
+    const result = await inspectCharacterAnimationSource(source, FIXTURE_FRAMES_PER_DIRECTION);
 
     expect(result.usable).toBe(false);
     expect(result.issues).toContain('Sylwetka w komórce 1×1 dotyka granicy komórki.');
@@ -72,10 +74,10 @@ describe('inspectCharacterAnimationSource', () => {
     const source = path.join(directory, 'empty-cell.png');
     await createTransparentSheet(source, 100, 80, { emptyCell: { row: 2, column: 3 } });
 
-    const result = await inspectCharacterAnimationSource(source);
+    const result = await inspectCharacterAnimationSource(source, FIXTURE_FRAMES_PER_DIRECTION);
 
     expect(result.usable).toBe(false);
-    expect(result.cells).toHaveLength(20);
+    expect(result.cells).toHaveLength((FIXTURE_FRAMES_PER_DIRECTION + 1) * 4);
     expect(result.issues).toContain('Komórka 4×3 źródła animacji postaci jest pusta.');
   });
 });
@@ -96,6 +98,7 @@ describe('normalizeCharacterAnimationSource', () => {
       outputPath: output,
       frameWidthPx: 128,
       frameHeightPx: 384,
+      framesPerDirection: FIXTURE_FRAMES_PER_DIRECTION,
     });
 
     expect(result.normalized).toBe(true);
@@ -105,7 +108,7 @@ describe('normalizeCharacterAnimationSource', () => {
     expect(result.outputCellSize.width).toBe(126);
     expect(result.outputCellSize.height).toBeLessThanOrEqual(126);
     expect(result.output).toMatchObject({ width: 640, height: 1536, hasAlpha: true, usable: true });
-    expect(result.output.cells).toHaveLength(20);
+    expect(result.output.cells).toHaveLength((FIXTURE_FRAMES_PER_DIRECTION + 1) * 4);
     expect(digest(source)).toBe(sourceHash);
 
     const firstBounds = await alphaBounds(output, 0, 0, 128, 384);
@@ -125,6 +128,7 @@ describe('normalizeCharacterAnimationSource', () => {
       outputPath: output,
       frameWidthPx: 10,
       frameHeightPx: 20,
+      framesPerDirection: FIXTURE_FRAMES_PER_DIRECTION,
     });
 
     expect(result.normalized).toBe(false);
@@ -142,8 +146,35 @@ describe('normalizeCharacterAnimationSource', () => {
       outputPath: source,
       frameWidthPx: 10,
       frameHeightPx: 20,
+      framesPerDirection: FIXTURE_FRAMES_PER_DIRECTION,
     })).rejects.toThrow(/innym pliku niż niezmienione źródło/);
     expect(digest(source)).toBe(sourceHash);
+  });
+
+  it('normalizuje pełny projektowy kontrakt idle + 8 klatek dla czterech kierunków', async () => {
+    const directory = temp();
+    const source = path.join(directory, 'source-8.png');
+    const output = path.join(directory, 'final-8.png');
+    const framesPerDirection = 8;
+    const columns = framesPerDirection + 1;
+    await createTransparentSheet(source, 900, 320, { framesPerDirection });
+
+    const result = await normalizeCharacterAnimationSource({
+      sourcePath: source,
+      outputPath: output,
+      frameWidthPx: 64,
+      frameHeightPx: 80,
+      framesPerDirection,
+    });
+
+    expect(result.output).toMatchObject({
+      width: 64 * columns,
+      height: 80 * 4,
+      columns,
+      framesPerDirection,
+      usable: true,
+    });
+    expect(result.output.cells).toHaveLength(columns * 4);
   });
 });
 
@@ -152,6 +183,7 @@ interface SheetOptions {
   touchFirstCellEdge?: boolean;
   emptyCell?: { row: number; column: number };
   fillRatio?: number;
+  framesPerDirection?: number;
 }
 
 async function createTransparentSheet(
@@ -160,14 +192,15 @@ async function createTransparentSheet(
   height: number,
   options: SheetOptions = {},
 ): Promise<void> {
+  const columns = (options.framesPerDirection ?? FIXTURE_FRAMES_PER_DIRECTION) + 1;
   const composites: OverlayOptions[] = [];
   for (let row = 0; row < 4; row += 1) {
     const top = Math.round(row * height / 4);
     const bottom = Math.round((row + 1) * height / 4);
-    for (let column = 0; column < 5; column += 1) {
+    for (let column = 0; column < columns; column += 1) {
       if (options.emptyCell?.row === row && options.emptyCell.column === column) continue;
-      const left = Math.round(column * width / 5);
-      const right = Math.round((column + 1) * width / 5);
+      const left = Math.round(column * width / columns);
+      const right = Math.round((column + 1) * width / columns);
       const cellWidth = right - left;
       const cellHeight = bottom - top;
       const size = Math.max(2, Math.floor(Math.min(cellWidth, cellHeight) * (options.fillRatio ?? 0.42)));

@@ -9,6 +9,8 @@ import { ProjectDatabase } from '../main/db/project-database';
 import { GenerationQueue } from '../main/services/generation-queue';
 
 const temporaryDirectories: string[] = [];
+const CHARACTER_FIXTURE_FRAMES = 4;
+const PROJECT_CHARACTER_FRAMES = 8;
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
@@ -779,10 +781,12 @@ it('publikuje postać dopiero po obowiązkowej analizie ruchu we wszystkich kier
   mkdirSync(root);
   const database = ProjectDatabase.create(root, {
     name: 'Postać izometryczna', artBrief: 'Czytelna bohaterka', tileWidthPx: 32,
+    characterFramesPerDirection: PROJECT_CHARACTER_FRAMES,
   });
   database.updateProjectSettings({
     name: 'Postać izometryczna', artBrief: 'Czytelna bohaterka', tileWidthPx: 32,
-    pixelsPerUnit: 32, maxConcurrentJobs: 1, aiVerificationEnabled: false,
+    pixelsPerUnit: 32, characterFramesPerDirection: PROJECT_CHARACTER_FRAMES,
+    maxConcurrentJobs: 1, aiVerificationEnabled: false,
   });
   const turnKinds: string[] = [];
   let generationPrompt = '';
@@ -803,7 +807,7 @@ it('publikuje postać dopiero po obowiązkowej analizie ruchu we wszystkich kier
         generationPrompt = String(input[0].text);
         const outputPath = generationPrompt.match(/exactly (.+?final\.png)/i)?.[1];
         if (!outputPath) throw new Error('Test nie znalazł final.png w prompcie postaci.');
-        await writeCharacterSheet(outputPath, 32, 32);
+        await writeCharacterSheet(outputPath, 32, 32, PROJECT_CHARACTER_FRAMES);
         return {
           turnId: 'turn-character-generation', items: [],
           finalMessage: JSON.stringify({
@@ -829,7 +833,7 @@ it('publikuje postać dopiero po obowiązkowej analizie ruchu we wszystkich kier
   const job = queue.enqueue({
     name: 'Bohaterka', prompt: 'Czerwona peleryna', mode: 'generate', category: 'character',
     relativeWidth: 1, relativeHeight: 2, footprint: { x: 1, y: 1 },
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+    characterAnimation: { action: 'walk', framesPerDirection: PROJECT_CHARACTER_FRAMES, framesPerSecond: 8 },
   });
 
   const terminalEvent = await terminal;
@@ -837,7 +841,8 @@ it('publikuje postać dopiero po obowiązkowej analizie ruchu we wszystkich kier
   expect(terminalEvent).toMatchObject({ type: 'completed', jobId: job.id });
   expect(turnKinds).toEqual(['generation', 'analysis']);
   expect(analysisSawFinalOutput).toBe(false);
-  expect(generationPrompt).toContain('exactly 160x128px with 5 columns and 4 rows');
+  expect(generationPrompt).toContain('exactly 288x128px with 9 columns and 4 rows');
+  expect(generationPrompt).toContain('exactly 8 walk-frame columns per direction');
   expect(generationPrompt).toContain('overrides any additional request for a one-off action pose');
   expect(generationPrompt).toContain('Held or worn equipment explicitly belonging to the character is allowed');
   expect(generationPrompt).toContain('Imagegen may return a supported native canvas size');
@@ -847,16 +852,17 @@ it('publikuje postać dopiero po obowiązkowej analizie ruchu we wszystkich kier
   expect(generationPrompt).toContain('NW (north_west), NE (north_east), SE (south_east), SW (south_west)');
   expect(generationPrompt).toContain('separate mandatory read-only motion-analysis turn');
   expect(analysisPrompt).toContain('wyłącznie odczytową analizę animacji ruchu postaci');
-  expect(analysisPrompt).toContain('W4→W1');
+  expect(analysisPrompt).toContain('W8→W1');
+  expect(analysisPrompt).toContain('wszystkie 8 klatek chodu');
   expect(analysisPrompt).toContain('NW (north_west), NE (north_east), SE (south_east), SW (south_west)');
   expect(analysisImages).toHaveLength(6);
   expect(database.getAsset(job.assetId)?.versions[0]).toMatchObject({
-    status: 'needs_review', width: 160, height: 128, aiVerificationStatus: 'passed',
+    status: 'needs_review', width: 288, height: 128, aiVerificationStatus: 'passed',
     pivot: { x: 0.5, y: 0.125 },
     characterAnimation: {
-      settings: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+      settings: { action: 'walk', framesPerDirection: PROJECT_CHARACTER_FRAMES, framesPerSecond: 8 },
       frameSize: { width: 32, height: 32 },
-      sheetSize: { width: 160, height: 128 },
+      sheetSize: { width: 288, height: 128 },
       movementAnalysis: {
         status: 'passed', turnId: 'turn-character-analysis',
         directions: [
@@ -878,6 +884,7 @@ it('ponawia samą analizę ruchu po błędzie technicznym bez ponownego generowa
   mkdirSync(root);
   const database = ProjectDatabase.create(root, {
     name: 'Retry analizatora postaci', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+    characterFramesPerDirection: CHARACTER_FIXTURE_FRAMES,
   });
   let generationTurns = 0;
   let analysisTurns = 0;
@@ -918,7 +925,7 @@ it('ponawia samą analizę ruchu po błędzie technicznym bez ponownego generowa
   const job = queue.enqueue({
     name: 'Zwiadowca', prompt: '', mode: 'generate', category: 'character',
     relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+    characterAnimation: { action: 'walk', framesPerDirection: CHARACTER_FIXTURE_FRAMES, framesPerSecond: 8 },
   });
 
   await expect(terminal).resolves.toMatchObject({ type: 'completed', jobId: job.id });
@@ -938,6 +945,7 @@ it('ponawia arkusz postaci po odrzuceniu jednego kierunku przez analizatora', as
   mkdirSync(root);
   const database = ProjectDatabase.create(root, {
     name: 'Postać top-down', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+    characterFramesPerDirection: CHARACTER_FIXTURE_FRAMES,
   });
   let generationTurns = 0;
   let analysisTurns = 0;
@@ -990,7 +998,7 @@ it('ponawia arkusz postaci po odrzuceniu jednego kierunku przez analizatora', as
   const job = queue.enqueue({
     name: 'Łowca', prompt: '', mode: 'generate', category: 'character',
     relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 10 },
+    characterAnimation: { action: 'walk', framesPerDirection: CHARACTER_FIXTURE_FRAMES, framesPerSecond: 10 },
   });
 
   const terminalEvent = await terminal;
@@ -1014,6 +1022,7 @@ it('samodzielnie ponawia postać po needs_user_decision i odrzuceniu źródła b
   mkdirSync(root);
   const database = ProjectDatabase.create(root, {
     name: 'Retry kontraktu postaci', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+    characterFramesPerDirection: CHARACTER_FIXTURE_FRAMES,
   });
   database.createProjectSettingsProposal({
     reason: 'Stara, niezwiązana propozycja pozostaje do późniejszego rozpatrzenia.',
@@ -1089,7 +1098,7 @@ it('samodzielnie ponawia postać po needs_user_decision i odrzuceniu źródła b
   const job = queue.enqueue({
     name: 'Łowca kontraktowy', prompt: '', mode: 'generate', category: 'character',
     relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+    characterAnimation: { action: 'walk', framesPerDirection: CHARACTER_FIXTURE_FRAMES, framesPerSecond: 8 },
   });
 
   await expect(terminal).resolves.toMatchObject({ type: 'completed', jobId: job.id });
@@ -1112,6 +1121,7 @@ it('wybiera najlepszy wynik imagegen, normalizuje go i kończy bez zbędnego ret
   mkdirSync(root);
   const database = ProjectDatabase.create(root, {
     name: 'Wybór źródła postaci', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+    characterFramesPerDirection: CHARACTER_FIXTURE_FRAMES,
   });
   let generationTurns = 0;
   let analysisTurns = 0;
@@ -1166,7 +1176,7 @@ it('wybiera najlepszy wynik imagegen, normalizuje go i kończy bez zbędnego ret
   const job = queue.enqueue({
     name: 'Drwal testowy', prompt: '', mode: 'generate', category: 'character',
     relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+    characterAnimation: { action: 'walk', framesPerDirection: CHARACTER_FIXTURE_FRAMES, framesPerSecond: 8 },
   });
 
   await expect(terminal).resolves.toMatchObject({ type: 'completed', jobId: job.id });
@@ -1200,6 +1210,7 @@ it('nie publikuje postaci, gdy ten sam turn utworzył propozycję ustawień mimo
   mkdirSync(root);
   const database = ProjectDatabase.create(root, {
     name: 'Propozycja ustawień postaci', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+    characterFramesPerDirection: CHARACTER_FIXTURE_FRAMES,
   });
   let generationTurns = 0;
   const fakeCodex = {
@@ -1245,7 +1256,7 @@ it('nie publikuje postaci, gdy ten sam turn utworzył propozycję ustawień mimo
   const job = queue.enqueue({
     name: 'Postać wymagająca skali', prompt: '', mode: 'generate', category: 'character',
     relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+    characterAnimation: { action: 'walk', framesPerDirection: CHARACTER_FIXTURE_FRAMES, framesPerSecond: 8 },
   });
 
   await expect(terminal).resolves.toMatchObject({
@@ -1265,6 +1276,7 @@ it('blokuje lokalny generator postaci, gdy obowiązkowy analizator Codex jest ni
   mkdirSync(root);
   const database = ProjectDatabase.create(root, {
     name: 'Brak analizatora', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+    characterFramesPerDirection: CHARACTER_FIXTURE_FRAMES,
   });
   let providerCalls = 0;
   const fakeCodex = {
@@ -1283,7 +1295,7 @@ it('blokuje lokalny generator postaci, gdy obowiązkowy analizator Codex jest ni
   const job = queue.enqueue({
     name: 'Wojownik', prompt: '', mode: 'generate', category: 'character', generatorProvider: 'comfyui',
     footprint: { x: 1, y: 1 },
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+    characterAnimation: { action: 'walk', framesPerDirection: CHARACTER_FIXTURE_FRAMES, framesPerSecond: 8 },
   });
 
   await expect(terminal).resolves.toMatchObject({
@@ -1304,6 +1316,7 @@ it('nie publikuje postaci, gdy raport analizatora pomija kanoniczny kierunek', a
   mkdirSync(root);
   const database = ProjectDatabase.create(root, {
     name: 'Błędny raport', artBrief: '', projection: 'top_down', tileWidthPx: 32,
+    characterFramesPerDirection: CHARACTER_FIXTURE_FRAMES,
   });
   let generationTurns = 0;
   const fakeCodex = {
@@ -1340,7 +1353,7 @@ it('nie publikuje postaci, gdy raport analizatora pomija kanoniczny kierunek', a
   const job = queue.enqueue({
     name: 'Łuczniczka', prompt: '', mode: 'generate', category: 'character',
     relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+    characterAnimation: { action: 'walk', framesPerDirection: CHARACTER_FIXTURE_FRAMES, framesPerSecond: 8 },
   });
 
   await expect(terminal).resolves.toMatchObject({
@@ -1381,19 +1394,24 @@ function passedMovementAnalysis(directions: string[]) {
   };
 }
 
-async function writeCharacterSheet(filePath: string, frameWidth: number, frameHeight: number): Promise<void> {
+async function writeCharacterSheet(
+  filePath: string,
+  frameWidth: number,
+  frameHeight: number,
+  framesPerDirection = CHARACTER_FIXTURE_FRAMES,
+): Promise<void> {
   mkdirSync(path.dirname(filePath), { recursive: true });
-  const phaseLegs = [
-    [[14, 27], [17, 27]],
-    [[10, 27], [19, 25]],
-    [[12, 26], [18, 27]],
-    [[14, 27], [17, 25]],
-    [[11, 26], [20, 27]],
-  ];
+  const columns = framesPerDirection + 1;
+  const phaseLegs = Array.from({ length: columns }, (_, column) => {
+    if (column === 0) return [[14, 27], [17, 27]];
+    const offset = ((column * 5) % 9) - 4;
+    return [[14 + offset, 26 + (column % 2)], [17 - offset, 26 + ((column + 1) % 2)]];
+  });
   const colors = ['#7f5bd5', '#3e8cde', '#d4773b', '#4ca56b'];
+  const shadedLegColors = ['#6042ae', '#286cae', '#a95929', '#347a4b'];
   const composites: OverlayOptions[] = [];
   for (let row = 0; row < 4; row += 1) {
-    for (let column = 0; column < 5; column += 1) {
+    for (let column = 0; column < columns; column += 1) {
       const [[leftLegX, leftLegBottom], [rightLegX, rightLegBottom]] = phaseLegs[column];
       const svg = [
         `<svg width="${frameWidth}" height="${frameHeight}" xmlns="http://www.w3.org/2000/svg">`,
@@ -1401,7 +1419,7 @@ async function writeCharacterSheet(filePath: string, frameWidth: number, frameHe
         '<circle cx="16" cy="6" r="3"/>',
         '<rect x="12" y="9" width="8" height="11" rx="2"/>',
         `<rect x="${leftLegX}" y="19" width="3" height="${leftLegBottom - 19 + 1}"/>`,
-        `<rect x="${rightLegX}" y="19" width="3" height="${rightLegBottom - 19 + 1}"/>`,
+        `<rect x="${rightLegX}" y="19" width="3" height="${rightLegBottom - 19 + 1}" fill="${shadedLegColors[row]}"/>`,
         '</g></svg>',
       ].join('');
       composites.push({ input: Buffer.from(svg), left: column * frameWidth, top: row * frameHeight });
@@ -1409,7 +1427,7 @@ async function writeCharacterSheet(filePath: string, frameWidth: number, frameHe
   }
   await sharp({
     create: {
-      width: frameWidth * 5,
+      width: frameWidth * columns,
       height: frameHeight * 4,
       channels: 4,
       background: { r: 0, g: 0, b: 0, alpha: 0 },
@@ -1417,11 +1435,17 @@ async function writeCharacterSheet(filePath: string, frameWidth: number, frameHe
   }).composite(composites).png().toFile(filePath);
 }
 
-async function writeStaticCharacterSheet(filePath: string, frameWidth: number, frameHeight: number): Promise<void> {
+async function writeStaticCharacterSheet(
+  filePath: string,
+  frameWidth: number,
+  frameHeight: number,
+  framesPerDirection = CHARACTER_FIXTURE_FRAMES,
+): Promise<void> {
   mkdirSync(path.dirname(filePath), { recursive: true });
+  const columns = framesPerDirection + 1;
   const composites: OverlayOptions[] = [];
   for (let row = 0; row < 4; row += 1) {
-    for (let column = 0; column < 5; column += 1) {
+    for (let column = 0; column < columns; column += 1) {
       const svg = [
         `<svg width="${frameWidth}" height="${frameHeight}" xmlns="http://www.w3.org/2000/svg">`,
         '<g fill="#536d9b"><circle cx="16" cy="6" r="3"/><rect x="12" y="9" width="8" height="11" rx="2"/>',
@@ -1432,7 +1456,7 @@ async function writeStaticCharacterSheet(filePath: string, frameWidth: number, f
   }
   await sharp({
     create: {
-      width: frameWidth * 5,
+      width: frameWidth * columns,
       height: frameHeight * 4,
       channels: 4,
       background: { r: 0, g: 0, b: 0, alpha: 0 },

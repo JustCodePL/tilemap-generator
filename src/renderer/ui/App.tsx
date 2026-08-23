@@ -204,6 +204,7 @@ function Welcome({ onOpened }: { onOpened: (project: ProjectInfo) => void }) {
   const [artBrief, setArtBrief] = useState('');
   const [projection, setProjection] = useState<ProjectProjection>('isometric');
   const [width, setWidth] = useState(256);
+  const [characterFramesPerDirection, setCharacterFramesPerDirection] = useState(8);
   const [storageDirectory, setStorageDirectory] = useState('');
   const [error, setError] = useState('');
   const recents = useQuery({ queryKey: ['recents'], queryFn: () => window.tilemap.projects.recents() });
@@ -223,6 +224,7 @@ function Welcome({ onOpened }: { onOpened: (project: ProjectInfo) => void }) {
       artBrief,
       projection,
       tileWidthPx: width,
+      characterFramesPerDirection,
     }, storageDirectory),
     onSuccess: (project) => project && onOpened(project),
     onError: (reason) => setError(errorMessage(reason)),
@@ -271,6 +273,7 @@ function Welcome({ onOpened }: { onOpened: (project: ProjectInfo) => void }) {
           <label>Bazowa szerokość tile (px)<input type="number" min={16} max={4096} step={projection === 'isometric' ? 2 : 1} value={width} onChange={(event) => setWidth(Number(event.target.value))} /></label>
           <label>{projection === 'isometric' ? 'Wysokość 2:1' : 'Wysokość 1:1'}<input value={`${tileHeightForProjection(projection, width)}px`} readOnly /></label>
         </div>
+        <label className="welcome-character-frames">Klatki chodu na kierunek<input aria-label="Klatki chodu na kierunek" type="number" min={2} max={16} step={1} value={characterFramesPerDirection} onChange={(event) => setCharacterFramesPerDirection(Number(event.target.value))} /><small>Liczba obrazów pozy chodu dla każdego kierunku. FPS określa osobno tempo animacji.</small></label>
         <div className="directory-picker">
           <FolderOpen />
           <div><small>KATALOG BIBLIOTEKI</small><strong title={storageDirectory}>{storageDirectory || 'Nie wybrano'}</strong></div>
@@ -281,7 +284,7 @@ function Welcome({ onOpened }: { onOpened: (project: ProjectInfo) => void }) {
         <p className="directory-help">Wybierz pusty katalog. Tutaj aplikacja zapisze registry, historię i wszystkie wersje assetów. Miejsce dla zatwierdzonych plików wybierzesz osobno podczas eksportu.</p>
         {projection === 'isometric' && width % 2 !== 0 && <p className="inline-warning"><AlertTriangle size={15} /> Bazowa szerokość musi być parzysta, aby wysokość 2:1 była całkowita.</p>}
         {error && <ErrorBox message={error} />}
-        <button className="primary wide" disabled={create.isPending || !storageDirectory || name.trim().length < 2 || (projection === 'isometric' && width % 2 !== 0)} onClick={() => create.mutate()}>
+        <button className="primary wide" disabled={create.isPending || !storageDirectory || name.trim().length < 2 || !Number.isInteger(characterFramesPerDirection) || characterFramesPerDirection < 2 || characterFramesPerDirection > 16 || (projection === 'isometric' && width % 2 !== 0)} onClick={() => create.mutate()}>
           {create.isPending ? <LoaderCircle className="spin" /> : <ImagePlus />} Utwórz projekt
         </button>
         {!!recents.data?.length && <div className="recents"><span>Ostatnie projekty</span>{recents.data.slice(0, 3).map((recent) => <div className="recent-row" key={recent.rootPath}>
@@ -360,7 +363,13 @@ function Workspace(props: {
           <div className="search-box"><Search size={16} /><input placeholder="Szukaj po nazwie lub tagu" value={filter} onChange={(event) => setFilter(event.target.value)} /></div>
           <div className="sidebar-label"><span>REGISTRY</span><small>{assets.data?.length ?? 0}</small></div>
           <div className="asset-list">
-            {visibleAssets.map((asset) => <AssetListItem key={asset.id} asset={asset} active={props.selectedAssetId === asset.id} onClick={() => props.onSelectAsset(asset.id, asset.latestVersion?.category ?? asset.category)} />)}
+            {visibleAssets.map((asset) => <AssetListItem
+              key={asset.id}
+              asset={asset}
+              active={props.selectedAssetId === asset.id}
+              expectedCharacterFrames={props.project.characterFramesPerDirection}
+              onClick={() => props.onSelectAsset(asset.id, asset.latestVersion?.category ?? asset.category)}
+            />)}
             {!visibleAssets.length && <div className="empty-compact"><SquareStack /><span>Brak assetów</span></div>}
           </div>
         </aside>
@@ -398,6 +407,7 @@ function Workspace(props: {
             assetId={props.selectedAssetId}
             selectedVersionId={selectedVersionId}
             onSelectVersion={setSelectedVersionId}
+            expectedCharacterFrames={props.project.characterFramesPerDirection}
           />
           : <StylePanel project={props.project} />}
       </div>
@@ -423,6 +433,7 @@ export function ProjectHome({
   const [tileWidth, setTileWidth] = useState(project.tileWidthPx);
   const [pixelsPerUnit, setPixelsPerUnit] = useState(project.pixelsPerUnit);
   const [maxConcurrentJobs, setMaxConcurrentJobs] = useState(project.maxConcurrentJobs);
+  const [characterFramesPerDirection, setCharacterFramesPerDirection] = useState(project.characterFramesPerDirection);
   const [aiVerificationEnabled, setAiVerificationEnabled] = useState(project.aiVerificationEnabled);
   const [codexGenerationEnabled, setCodexGenerationEnabled] = useState(project.codexGenerationEnabled ?? true);
   const [comfyUiEnabled, setComfyUiEnabled] = useState(project.comfyUiEnabled ?? false);
@@ -435,6 +446,7 @@ export function ProjectHome({
     setTileWidth(project.tileWidthPx);
     setPixelsPerUnit(project.pixelsPerUnit);
     setMaxConcurrentJobs(project.maxConcurrentJobs);
+    setCharacterFramesPerDirection(project.characterFramesPerDirection);
     setAiVerificationEnabled(project.aiVerificationEnabled);
     setCodexGenerationEnabled(project.codexGenerationEnabled ?? true);
     setComfyUiEnabled(project.comfyUiEnabled ?? false);
@@ -448,6 +460,7 @@ export function ProjectHome({
       tileWidthPx: tileWidth,
       pixelsPerUnit,
       maxConcurrentJobs,
+      characterFramesPerDirection,
       aiVerificationEnabled,
       codexGenerationEnabled,
       comfyUiEnabled,
@@ -466,6 +479,7 @@ export function ProjectHome({
     || tileWidth !== project.tileWidthPx
     || pixelsPerUnit !== project.pixelsPerUnit
     || maxConcurrentJobs !== project.maxConcurrentJobs
+    || characterFramesPerDirection !== project.characterFramesPerDirection
     || aiVerificationEnabled !== project.aiVerificationEnabled
     || codexGenerationEnabled !== (project.codexGenerationEnabled ?? true)
     || comfyUiEnabled !== (project.comfyUiEnabled ?? false)
@@ -476,6 +490,9 @@ export function ProjectHome({
     && pixelsPerUnit >= 1
     && maxConcurrentJobs >= 1
     && maxConcurrentJobs <= 8
+    && Number.isInteger(characterFramesPerDirection)
+    && characterFramesPerDirection >= 2
+    && characterFramesPerDirection <= 16
     && (codexGenerationEnabled || comfyUiEnabled || stableDiffusionCppEnabled);
   const tileHeight = tileHeightForProjection(project.projection, tileWidth);
 
@@ -502,6 +519,11 @@ export function ProjectHome({
         <label>Bazowa szerokość tile (px)<input type="number" min={16} max={4096} step={project.projection === 'isometric' ? 2 : 1} value={tileWidth} onChange={(event) => setTileWidth(Number(event.target.value))} /></label>
         <label>{project.projection === 'isometric' ? 'Wysokość rombu 2:1' : 'Wysokość tile 1:1'}<input value={`${tileHeight}px`} readOnly /></label>
         <label>Pixels per unit<input type="number" min={1} max={4096} value={pixelsPerUnit} onChange={(event) => setPixelsPerUnit(Number(event.target.value))} /></label>
+      </div>
+      <div className="character-project-setting">
+        <PersonStanding />
+        <label>Klatki chodu na kierunek<input type="number" min={2} max={16} step={1} value={characterFramesPerDirection} onChange={(event) => setCharacterFramesPerDirection(Number(event.target.value))} /></label>
+        <p><strong>Docelowa liczba klatek w każdej pętli chodu</strong><span>To ustawienie obowiązuje wszystkie nowe postacie i kolejne wersje. Tempo odtwarzania jest określane osobno przez FPS.</span></p>
       </div>
       <div className="queue-concurrency-setting">
         <label>Maks. jednoczesnych zadań<input type="number" min={1} max={8} step={1} value={maxConcurrentJobs} onChange={(event) => setMaxConcurrentJobs(Number(event.target.value))} /></label>
@@ -662,7 +684,17 @@ function ProjectSettingsProposalNotice({ onOpen }: { onOpen: () => void }) {
   </button>;
 }
 
-function AssetListItem({ asset, active, onClick }: { asset: AssetSummary; active: boolean; onClick: () => void }) {
+function AssetListItem({
+  asset,
+  active,
+  expectedCharacterFrames,
+  onClick,
+}: {
+  asset: AssetSummary;
+  active: boolean;
+  expectedCharacterFrames: number;
+  onClick: () => void;
+}) {
   const version = asset.latestVersion;
   const category = version?.category ?? asset.category;
   const relativeWidth = version?.relativeWidth ?? asset.relativeWidth;
@@ -674,9 +706,28 @@ function AssetListItem({ asset, active, onClick }: { asset: AssetSummary; active
     : '';
   return <button className={`asset-row ${active ? 'active' : ''}`} onClick={onClick}>
     <div className="asset-thumb">{version?.imageUrl ? <img src={version.imageUrl} alt="" /> : <Box />}</div>
-    <div className="asset-row-copy"><strong>{asset.name}</strong><span>{categoryLabels[category]}{category === 'elevated_tile' ? ` · h${version?.elevationLevels ?? asset.elevationLevels}` : ''}{dimensionSummary} · {asset.versionCount} wer.</span><StatusBadge status={version?.status ?? 'queued'} /></div>
+    <div className="asset-row-copy"><strong>{asset.name}</strong><span>{categoryLabels[category]}{category === 'elevated_tile' ? ` · h${version?.elevationLevels ?? asset.elevationLevels}` : ''}{dimensionSummary} · {asset.versionCount} wer.</span><CharacterFrameCountWarning version={version} expected={expectedCharacterFrames} compact /><StatusBadge status={version?.status ?? 'queued'} /></div>
     <ChevronRight size={16} />
   </button>;
+}
+
+function CharacterFrameCountWarning({
+  version,
+  expected,
+  compact = false,
+}: {
+  version?: AssetVersion | null;
+  expected: number;
+  compact?: boolean;
+}) {
+  const actual = version?.category === 'character'
+    ? version.characterAnimation?.settings.framesPerDirection
+    : undefined;
+  if (actual === undefined || actual >= expected) return null;
+  const message = `Liczba klatek chodu na kierunek: ${actual}; projekt: ${expected}. Wygeneruj nową wersję postaci.`;
+  return compact
+    ? <span className="character-frame-warning compact" title={message}><AlertTriangle /> {actual}/{expected} kl. · wygeneruj nową wersję</span>
+    : <p className="character-frame-warning" role="alert"><AlertTriangle /> {message}</p>;
 }
 
 function GeneratorProviderPicker({
@@ -865,7 +916,11 @@ function CharacterStudio({
     project.stableDiffusionCppEnabled,
   ]);
   const directions = characterDirectionsForProjection(project.projection);
-  const animationSettings = { action: 'walk' as const, framesPerDirection: 4 as const, framesPerSecond };
+  const animationSettings = {
+    action: 'walk' as const,
+    framesPerDirection: project.characterFramesPerDirection,
+    framesPerSecond,
+  };
   const frameSize = characterAnimationFrameSize(project, { relativeWidth, relativeHeight });
   const sheetSize = characterAnimationSheetSize(frameSize, animationSettings);
   const selectedProviderStates = selectedProviders.map((provider) => ({
@@ -912,12 +967,13 @@ function CharacterStudio({
   return <div className="studio-page character-studio">
     <div className="section-heading">
       <div><p className="eyebrow">STUDIO POSTACI</p><h2>Postać gotowa do ruchu</h2><p>Wygeneruj spójny arkusz z bezruchem i chodem we wszystkich kierunkach bieżącej projekcji.</p></div>
-      <div className="grid-chip"><PersonStanding /><span>5</span><small>×</small><span>4</span><em>klatki</em></div>
+      <div className="grid-chip"><PersonStanding /><span>{project.characterFramesPerDirection + 1}</span><small>×</small><span>{directions.length}</span><em>arkusz</em></div>
     </div>
     {!ready && <ErrorBox message={readinessMessage || 'Generatory nie są jeszcze gotowe.'} />}
     <div className="request-card character-request-card">
-      <div className="form-grid two">
+      <div className="form-grid three">
         <label>Nazwa postaci<input placeholder="Strażniczka lasu" value={name} onChange={(event) => setName(event.target.value)} /></label>
+        <label>Klatki chodu na kierunek<input value={project.characterFramesPerDirection} readOnly /></label>
         <label>Klatki na sekundę (FPS)<input type="number" min={1} max={24} step={1} value={framesPerSecond} onChange={(event) => setFramesPerSecond(Number(event.target.value))} /></label>
       </div>
       <CharacterDirectionSummary projection={project.projection} />
@@ -928,7 +984,7 @@ function CharacterStudio({
         </div>
         <div className="character-sheet-summary" role="note">
           <SquareStack />
-          <div><strong>{frameSize.width}×{frameSize.height}px / klatkę</strong><span>Arkusz {sheetSize.width}×{sheetSize.height}px</span><small>Kolumna 1: idle · kolumny 2–5: chód</small></div>
+          <div><strong>{frameSize.width}×{frameSize.height}px / klatkę</strong><span>Arkusz {sheetSize.width}×{sheetSize.height}px</span><small>Kolumna 1: idle · kolumny 2–{project.characterFramesPerDirection + 1}: chód</small></div>
         </div>
       </div>
       <label>Opis postaci dla agenta (opcjonalnie)<textarea className="hero-textarea" rows={7} placeholder="Sylwetka, strój, wyposażenie, sposób poruszania się…" value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
@@ -954,7 +1010,7 @@ function CharacterStudio({
       </div>
       {error && <ErrorBox message={error} />}
     </div>
-    <div className="process-strip character-process-strip"><ProcessStep number="01" title="Arkusz" detail="Idle + 4 klatki chodu" /><ProcessStep number="02" title="Kierunki" detail={directions.map((direction) => direction.shortLabel).join(' / ')} /><ProcessStep number="03" title="Analiza ruchu" detail="Obowiązkowa kontrola Codex" /><ProcessStep number="04" title="Review" detail="Dopiero po zaliczeniu" /></div>
+    <div className="process-strip character-process-strip"><ProcessStep number="01" title="Arkusz" detail={`Idle + ${project.characterFramesPerDirection} klatek chodu`} /><ProcessStep number="02" title="Kierunki" detail={directions.map((direction) => direction.shortLabel).join(' / ')} /><ProcessStep number="03" title="Analiza ruchu" detail="Obowiązkowa kontrola Codex" /><ProcessStep number="04" title="Review" detail="Dopiero po zaliczeniu" /></div>
   </div>;
 }
 
@@ -1166,10 +1222,12 @@ export function AssetAttemptsSidebar({
   assetId,
   selectedVersionId,
   onSelectVersion,
+  expectedCharacterFrames,
 }: {
   assetId: string;
   selectedVersionId: string | null;
   onSelectVersion: (versionId: string) => void;
+  expectedCharacterFrames: number;
 }) {
   const detail = useQuery({ queryKey: ['asset', assetId], queryFn: () => window.tilemap.assets.get(assetId), refetchInterval: 3_000 });
   const asset = detail.data;
@@ -1182,7 +1240,7 @@ export function AssetAttemptsSidebar({
       <span>{asset?.versions.length ?? 0}</span>
     </div>
     {detail.isLoading && <FullScreenLoader label="Wczytywanie wersji…" compact />}
-    {asset && <VersionRail versions={asset.versions} selected={selected} onSelect={onSelectVersion} />}
+    {asset && <VersionRail versions={asset.versions} selected={selected} onSelect={onSelectVersion} expectedCharacterFrames={expectedCharacterFrames} />}
   </aside>;
 }
 
@@ -1200,6 +1258,7 @@ export function CharacterAnimationPreview({ version, assetName }: { version: Ass
   const [frameIndex, setFrameIndex] = useState(0);
   const directionCount = animation?.directions.length ?? 0;
   const frameCount = action === 'idle' ? 1 : animation?.settings.framesPerDirection ?? 1;
+  const sheetColumnCount = (animation?.settings.framesPerDirection ?? 1) + 1;
   const selectedDirectionIndex = Math.max(0, animation?.directions.findIndex((direction) => direction.id === selectedDirectionId) ?? 0);
   const sheetColumn = action === 'idle' ? 0 : frameIndex + 1;
 
@@ -1228,7 +1287,8 @@ export function CharacterAnimationPreview({ version, assetName }: { version: Ass
   };
   const frameStyle = (column: number, row: number): React.CSSProperties => ({
     backgroundImage: `url(${JSON.stringify(version.imageUrl)})`,
-    backgroundPosition: `${column * 25}% ${directionCount === 1 ? 0 : row * 100 / (directionCount - 1)}%`,
+    backgroundSize: `${sheetColumnCount * 100}% ${directionCount * 100}%`,
+    backgroundPosition: `${sheetColumnCount === 1 ? 0 : column * 100 / (sheetColumnCount - 1)}% ${directionCount === 1 ? 0 : row * 100 / (directionCount - 1)}%`,
   });
 
   return <section className="character-animation-preview" aria-label="Podgląd animacji postaci">
@@ -1497,11 +1557,22 @@ export function TerrainSeamPreview({
   </div>;
 }
 
-function VersionRail({ versions, selected, onSelect }: { versions: AssetVersion[]; selected: string; onSelect: (id: string) => void }) {
+function VersionRail({
+  versions,
+  selected,
+  onSelect,
+  expectedCharacterFrames,
+}: {
+  versions: AssetVersion[];
+  selected: string;
+  onSelect: (id: string) => void;
+  expectedCharacterFrames: number;
+}) {
   return <div className="version-rail">{versions.map((version, index) => <button key={version.id} className={selected === version.id ? 'active' : ''} onClick={() => onSelect(version.id)}>
     <span className="version-number">v{versions.length - index}</span>
     <small>{version.mode === 'edit' ? 'Edycja' : version.mode === 'variant' ? 'Wariant' : 'Generacja'}</small>
     <GeneratorBadge version={version} compact />
+    <CharacterFrameCountWarning version={version} expected={expectedCharacterFrames} compact />
     <StatusBadge status={version.status} />
     {version.imageUrl ? <img src={version.imageUrl} alt="" /> : <div className="version-placeholder"><LoaderCircle className={version.status === 'generating' ? 'spin' : ''} /></div>}
   </button>)}</div>;
@@ -1725,7 +1796,7 @@ export function ReviewControls({
       relativeHeight: isRelativeSizeCategory(category) ? relativeHeight : undefined,
       footprint: nextHasFixedFootprint ? { x: 1, y: 1 } : { x: fx, y: fy },
       characterAnimation: category === 'character'
-        ? { action: 'walk', framesPerDirection: 4, framesPerSecond: characterFramesPerSecond }
+        ? { action: 'walk', framesPerDirection: project.characterFramesPerDirection, framesPerSecond: characterFramesPerSecond }
         : undefined,
     }),
     onSuccess: (jobs) => { setFeedback(''); setError(''); onChanged(jobs[0]?.versionId); },
@@ -1762,13 +1833,14 @@ export function ReviewControls({
 
   return <div className="review-controls">
     <p className="eyebrow">METADANE</p>
+    <CharacterFrameCountWarning version={version} expected={project.characterFramesPerDirection} />
     <label>Typ tej wersji<input value={categoryLabels[version.category]} readOnly /></label>
     {version.category === 'road_tile' && <label>Warianty drogi<input value={`${version.roadVariants?.length ?? 0} / 16`} readOnly /></label>}
-    {version.category === 'character' && version.characterAnimation && <label>Animacja tej wersji<input value={`Idle + ${version.characterAnimation.settings.framesPerDirection} klatki chodu · ${version.characterAnimation.settings.framesPerSecond} FPS · ${version.characterAnimation.directions.length} kierunki`} readOnly /></label>}
+    {version.category === 'character' && version.characterAnimation && <label>Animacja tej wersji<input value={`Idle + ${formatPolishCount(version.characterAnimation.settings.framesPerDirection, 'klatka', 'klatki', 'klatek')} chodu · ${version.characterAnimation.settings.framesPerSecond} FPS · ${version.characterAnimation.directions.length} kierunki`} readOnly /></label>}
     <label>Tagi AI <input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="kamień, droga, mech" /></label>
     {isRelativeSizeCategory(version.category) && <div className="dimension-explainer" role="note">
       <strong>{version.category === 'character' ? 'Klatka animacji' : 'Canvas obrazu'}: {version.relativeWidth}×{version.relativeHeight} tile</strong>
-      <span>{version.category === 'character' ? 'Arkusz zawiera 5 kolumn i 4 wiersze kierunków.' : 'To rozmiar PNG.'} Footprint poniżej określa osobno liczbę komórek zajętych na logicznej siatce.</span>
+      <span>{version.category === 'character' && version.characterAnimation ? `Arkusz tej wersji zawiera ${version.characterAnimation.settings.framesPerDirection + 1} kolumn i ${version.characterAnimation.directions.length} wiersze kierunków.` : 'To rozmiar PNG.'} Footprint poniżej określa osobno liczbę komórek zajętych na logicznej siatce.</span>
     </div>}
     <div className="form-grid two"><label>Footprint X — zajęte komórki<input type="number" min={1} max={64} value={versionHasFixedFootprint ? 1 : fx} disabled={versionHasFixedFootprint} onChange={(event) => setFx(Number(event.target.value))} /></label><label>Footprint Y — zajęte komórki<input type="number" min={1} max={64} value={versionHasFixedFootprint ? 1 : fy} disabled={versionHasFixedFootprint} onChange={(event) => setFy(Number(event.target.value))} /></label></div>
     {version.imageUrl && <div className="form-grid two"><label>Pivot X (propozycja AI)<input type="number" min={0} max={1} step={0.01} value={px} onChange={(event) => setPx(Number(event.target.value))} /></label><label>Pivot Y (propozycja AI)<input type="number" min={0} max={1} step={0.01} value={py} onChange={(event) => setPy(Number(event.target.value))} /></label></div>}
@@ -1792,7 +1864,7 @@ export function ReviewControls({
       {category === 'road_tile' && <RoadSetSummary projection={project.projection} />}
       {category === 'elevated_tile' && <label>Elevation height (poziomy)<input type="number" min={1} max={16} step={1} value={elevationLevels} onChange={(event) => setElevationLevels(Number(event.target.value))} /></label>}
       {isRelativeSizeCategory(category) && <div className="form-grid two"><label>Szerokość canvasa (× tile)<input type="number" min={0.25} max={16} step={0.25} value={relativeWidth} onChange={(event) => setRelativeWidth(Number(event.target.value))} /></label><label>Wysokość canvasa (× tile)<input type="number" min={0.25} max={16} step={0.25} value={relativeHeight} onChange={(event) => setRelativeHeight(Number(event.target.value))} /></label></div>}
-      {category === 'character' && <div className="character-iteration-summary" role="note"><PersonStanding /><div><strong>Idle + 4 klatki chodu × 4 kierunki</strong><span>{characterDirectionsForProjection(project.projection).map((direction) => direction.shortLabel).join(' / ')}</span></div><label>FPS<input type="number" min={1} max={24} step={1} value={characterFramesPerSecond} onChange={(event) => setCharacterFramesPerSecond(Number(event.target.value))} /></label></div>}
+      {category === 'character' && <div className="character-iteration-summary" role="note"><PersonStanding /><div><strong>Idle + {project.characterFramesPerDirection} klatek chodu × 4 kierunki</strong><span>{characterDirectionsForProjection(project.projection).map((direction) => direction.shortLabel).join(' / ')}</span></div><label>Klatki/kierunek<input value={project.characterFramesPerDirection} readOnly /></label><label>FPS<input type="number" min={1} max={24} step={1} value={characterFramesPerSecond} onChange={(event) => setCharacterFramesPerSecond(Number(event.target.value))} /></label></div>}
       {nextExpectedSize && <AssetCanvasSummary size={nextExpectedSize} base={project} detail={category === 'elevated_tile' ? `Elevation ${elevationLevels}` : category === 'road_tile' ? 'Transparentna nakładka 1×1' : category === 'flat_tile' ? project.projection === 'isometric' ? 'Bazowy romb 2:1' : 'Bazowy kwadrat 1:1' : `${relativeWidth}×${relativeHeight} jednostki tile`} />}
       <textarea rows={4} placeholder="Opcjonalnie opisz zmianę. Bez opisu możesz wygenerować nowy wariant." value={feedback} onChange={(event) => setFeedback(event.target.value)} />
       <div><button className="secondary" disabled={feedback.trim().length < 3 || iterate.isPending} onClick={() => iterate.mutate('edit')}><RefreshCw /> Edytuj obraz</button><button className="ghost" disabled={iterate.isPending} onClick={() => iterate.mutate('variant')}><SquareStack /> Przegeneruj</button></div>

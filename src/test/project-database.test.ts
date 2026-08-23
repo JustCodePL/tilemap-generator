@@ -4,7 +4,7 @@ import path from 'node:path';
 import sharp from 'sharp';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ProjectDatabase, normalizeTag } from '../main/db/project-database';
-import { handleRegistryTool } from '../main/codex/registry-tools';
+import { handleRegistryTool, registryDynamicTools } from '../main/codex/registry-tools';
 import {
   characterDirectionsForProjection,
   defaultCharacterAnimationSettings,
@@ -170,11 +170,15 @@ describe('ProjectDatabase', () => {
     database.close();
   });
 
-  it('tworzy kierunkowy zestaw postaci z domyślnymi ustawieniami i zachowuje FPS iteracji', () => {
+  it('tworzy zestaw postaci z projektową liczbą klatek i zachowuje FPS iteracji', () => {
     const root = temporaryProjectRoot();
     const database = ProjectDatabase.create(root, {
-      name: 'Postacie', artBrief: '', tileWidthPx: 256,
+      name: 'Postacie', artBrief: '', tileWidthPx: 256, characterFramesPerDirection: 4,
     });
+    expect(database.getProject().characterFramesPerDirection).toBe(4);
+    expect((database.sqlite.pragma('table_info(character_animation_sets)') as Array<{
+      name: string; dflt_value: string | null;
+    }>).find((column) => column.name === 'frames_per_direction')?.dflt_value).toBe('8');
     const firstJob = database.enqueueGeneration({
       name: 'Rycerz', prompt: '', mode: 'generate', category: 'character',
       footprint: { x: 1, y: 1 },
@@ -196,6 +200,12 @@ describe('ProjectDatabase', () => {
       },
     });
 
+    database.updateProjectSettings({
+      name: 'Postacie', artBrief: '', tileWidthPx: 256, pixelsPerUnit: 256,
+      characterFramesPerDirection: 6,
+      maxConcurrentJobs: 1, aiVerificationEnabled: true,
+    });
+
     const secondJob = database.enqueueGeneration({
       assetId: firstJob.assetId,
       parentVersionId: firstJob.versionId,
@@ -203,10 +213,24 @@ describe('ProjectDatabase', () => {
       footprint: { x: 1, y: 1 },
     });
     expect(database.getJobContext(secondJob.id).characterAnimation).toEqual({
-      action: 'walk', framesPerDirection: 4, framesPerSecond: 12,
+      action: 'walk', framesPerDirection: 6, framesPerSecond: 12,
     });
-    expect(database.getAsset(firstJob.assetId)?.versions.find((version) => version.id === secondJob.versionId)
-      ?.characterAnimation?.settings.framesPerSecond).toBe(12);
+    const versions = database.getAsset(firstJob.assetId)?.versions ?? [];
+    expect(versions.find((version) => version.id === firstJob.versionId)
+      ?.characterAnimation?.settings).toMatchObject({ framesPerDirection: 4, framesPerSecond: 12 });
+    expect(versions.find((version) => version.id === secondJob.versionId)
+      ?.characterAnimation).toMatchObject({
+        settings: { framesPerDirection: 6, framesPerSecond: 12 },
+        sheetSize: { width: 896, height: 768 },
+      });
+
+    expect(() => database.enqueueGeneration({
+      assetId: firstJob.assetId,
+      parentVersionId: firstJob.versionId,
+      name: 'Rycerz', prompt: '', mode: 'edit', category: 'character',
+      footprint: { x: 1, y: 1 },
+      characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 12 },
+    })).toThrow(/projektowej liczby 6 klatek/);
 
     expect(() => database.enqueueGeneration({
       name: 'Kamień', prompt: '', mode: 'generate', category: 'prop',
@@ -228,21 +252,21 @@ describe('ProjectDatabase', () => {
     });
 
     expect(() => database.finalizeGeneration(job.id, {
-      finalPath: 'assets/archer/final.png', width: 320, height: 256,
+      finalPath: 'assets/archer/final.png', width: 576, height: 256,
       category: 'character', tags: ['łucznik'], pivot: { x: 0.5, y: 0 }, description: 'Łucznik',
     })).toThrow(/wymaga kompletnego zestawu animacji/);
 
     const incomplete = passedCharacterAnimation('top_down', 64, 64);
     incomplete.movementAnalysis.directions.pop();
     expect(() => database.finalizeGeneration(job.id, {
-      finalPath: 'assets/archer/final.png', width: 320, height: 256,
+      finalPath: 'assets/archer/final.png', width: 576, height: 256,
       category: 'character', tags: ['łucznik'], pivot: { x: 0.5, y: 0 }, description: 'Łucznik',
       characterAnimation: incomplete,
     })).toThrow(/każdy kanoniczny kierunek/);
 
     const animation = passedCharacterAnimation('top_down', 64, 64);
     database.finalizeGeneration(job.id, {
-      finalPath: 'assets/archer/final.png', width: 320, height: 256,
+      finalPath: 'assets/archer/final.png', width: 576, height: 256,
       category: 'character', tags: ['łucznik'], pivot: { x: 0.5, y: 0 }, description: 'Łucznik',
       characterAnimation: animation,
     });
@@ -254,6 +278,54 @@ describe('ProjectDatabase', () => {
     });
     expect(database.getAsset(job.assetId)?.currentApprovedVersionId).toBe(job.versionId);
     database.close();
+  });
+
+  it('blokuje finalizację zadania postaci po zmianie projektowej liczby klatek', () => {
+    const root = temporaryProjectRoot();
+    const database = ProjectDatabase.create(root, {
+      name: 'Zmiana animacji', artBrief: '', projection: 'top_down', tileWidthPx: 64,
+      characterFramesPerDirection: 4,
+    });
+    const job = database.enqueueGeneration({
+      name: 'Drwal', prompt: '', mode: 'generate', category: 'character',
+      relativeWidth: 1, relativeHeight: 1, footprint: { x: 1, y: 1 },
+    });
+    database.updateProjectSettings({
+      name: 'Zmiana animacji', artBrief: '', tileWidthPx: 64, pixelsPerUnit: 64,
+      characterFramesPerDirection: 8,
+      maxConcurrentJobs: 1, aiVerificationEnabled: true,
+    });
+
+    expect(() => database.finalizeGeneration(job.id, {
+      finalPath: 'assets/lumberjack/final.png', width: 320, height: 256,
+      category: 'character', tags: ['drwal'], pivot: { x: 0.5, y: 0 }, description: 'Drwal',
+      characterAnimation: passedCharacterAnimation('top_down', 64, 64, 4),
+    })).toThrow(/nie odpowiada bieżącej projektowej liczbie 8 klatek/);
+    expect(database.getJob(job.id)?.status).toBe('queued');
+    database.close();
+  });
+
+  it('migruje projekt v18 do 8 klatek bez zmiany rzeczywistej liczby klatek starszej wersji', () => {
+    const root = temporaryProjectRoot();
+    const original = ProjectDatabase.create(root, {
+      name: 'Postać v18', artBrief: '', tileWidthPx: 256, characterFramesPerDirection: 4,
+    });
+    const job = original.enqueueGeneration({
+      name: 'Stary drwal', prompt: '', mode: 'generate', category: 'character',
+      footprint: { x: 1, y: 1 },
+    });
+    original.sqlite.exec(`
+      ALTER TABLE projects DROP COLUMN character_frames_per_direction;
+      PRAGMA user_version = 18;
+    `);
+    original.close();
+
+    const migrated = new ProjectDatabase(root);
+    expect(migrated.getProject().characterFramesPerDirection).toBe(8);
+    expect(migrated.getAsset(job.assetId)?.versions[0].characterAnimation?.settings.framesPerDirection).toBe(4);
+    expect(migrated.sqlite.pragma('user_version', { simple: true })).toBe(19);
+    expect(readdirSync(path.join(root, 'backups')).some((name) => name.startsWith('registry-v18-'))).toBe(true);
+    migrated.close();
   });
 
   it('nie backfilluje statycznej postaci podczas migracji projektu v17', () => {
@@ -568,26 +640,39 @@ describe('ProjectDatabase', () => {
       tool: 'propose_project_settings',
       arguments: {
         reason: 'Referencja ma geometrię 2:1 przygotowaną dla większej komórki i wymaga korekty siatki.',
-        settings: { tileWidthPx: 512, pixelsPerUnit: 512 },
+        settings: { tileWidthPx: 512, pixelsPerUnit: 512, characterFramesPerDirection: 12 },
         referenceIds: [reference.id],
       },
     }) as { contentItems: Array<{ text: string }> };
 
     expect(toolResult.contentItems[0].text).toContain('oczekuje na decyzję użytkownika');
+    expect(JSON.stringify(registryDynamicTools)).toContain('characterFramesPerDirection');
     const proposal = database.listProjectSettingsProposals()[0];
     expect(proposal).toMatchObject({
       status: 'pending',
-      before: { artBrief: 'Małe kafle', tileWidthPx: 256, pixelsPerUnit: 256 },
-      proposed: { tileWidthPx: 512, pixelsPerUnit: 512 },
+      before: {
+        artBrief: 'Małe kafle', tileWidthPx: 256, pixelsPerUnit: 256,
+        characterFramesPerDirection: 8,
+      },
+      proposed: { tileWidthPx: 512, pixelsPerUnit: 512, characterFramesPerDirection: 12 },
       referenceIds: [reference.id],
     });
     expect(database.getProject()).toMatchObject({ tileWidthPx: 256, tileHeightPx: 128, pixelsPerUnit: 256 });
 
     database.reviewProjectSettingsProposal(proposal.id, 'approved');
     expect(database.getProject()).toMatchObject({
-      tileWidthPx: 512, tileHeightPx: 256, pixelsPerUnit: 512, styleSummaryStale: true,
+      tileWidthPx: 512, tileHeightPx: 256, pixelsPerUnit: 512,
+      characterFramesPerDirection: 12, styleSummaryStale: true,
     });
     expect(() => database.reviewProjectSettingsProposal(proposal.id, 'rejected')).toThrow(/już rozpatrzona/);
+    await expect(handleRegistryTool(database, {
+      namespace: 'registry',
+      tool: 'propose_project_settings',
+      arguments: {
+        reason: 'Nieprawidłowa liczba klatek powinna zostać odrzucona przed utworzeniem propozycji.',
+        settings: { characterFramesPerDirection: 17 },
+      },
+    })).rejects.toThrow();
 
     const rejected = database.createProjectSettingsProposal({
       reason: 'Brief powinien opisywać paletę widoczną na referencji.',
@@ -654,6 +739,7 @@ describe('ProjectDatabase', () => {
     });
     expect(database.getProject()).toMatchObject({
       projection: 'isometric', tileHeightPx: 128, maxConcurrentJobs: 1, aiVerificationEnabled: true,
+      characterFramesPerDirection: 8,
     });
 
     const updated = database.updateProjectSettings({
@@ -661,13 +747,14 @@ describe('ProjectDatabase', () => {
       artBrief: 'Malowane bloki terenu',
       tileWidthPx: 512,
       pixelsPerUnit: 512,
+      characterFramesPerDirection: 12,
       maxConcurrentJobs: 4,
       aiVerificationEnabled: false,
     });
 
     expect(updated).toMatchObject({
       name: 'Wyspy', tileWidthPx: 512, tileHeightPx: 256, pixelsPerUnit: 512,
-      maxConcurrentJobs: 4, aiVerificationEnabled: false,
+      characterFramesPerDirection: 12, maxConcurrentJobs: 4, aiVerificationEnabled: false,
     });
     expect(JSON.parse(readFileSync(path.join(root, 'tilemap-project.json'), 'utf8'))).toMatchObject({ name: 'Wyspy' });
     database.close();
@@ -1012,6 +1099,7 @@ it('migrates a v14 project and preserves ComfyUI variant provenance', async () =
     namespace: 'registry', tool: 'get_generation_settings', arguments: {},
   }) as { contentItems: Array<{ text: string }> };
   expect(JSON.parse(generationSettings.contentItems[0].text)).toEqual({
+    characterFramesPerDirection: 8,
     codexGenerationEnabled: false, comfyUiEnabled: true, comfyUiProfile: 'z_image_turbo',
     stableDiffusionCppEnabled: true,
   });
@@ -1040,13 +1128,14 @@ function passedCharacterAnimation(
   projection: ProjectProjection,
   frameWidth: number,
   frameHeight: number,
+  framesPerDirection = defaultCharacterAnimationSettings.framesPerDirection,
 ): CharacterAnimationSet {
   const directions = [...characterDirectionsForProjection(projection)];
   return {
-    settings: { ...defaultCharacterAnimationSettings },
+    settings: { ...defaultCharacterAnimationSettings, framesPerDirection },
     directions,
     frameSize: { width: frameWidth, height: frameHeight },
-    sheetSize: { width: frameWidth * 5, height: frameHeight * 4 },
+    sheetSize: { width: frameWidth * (framesPerDirection + 1), height: frameHeight * 4 },
     movementAnalysis: {
       status: 'passed',
       summary: 'Postać porusza się płynnie i zachowuje spójność we wszystkich kierunkach.',

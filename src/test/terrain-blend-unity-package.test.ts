@@ -38,13 +38,18 @@ it('ustawia prostokątny Grid i Palette dla top-down wyłącznie z manifestu v9'
   expect(terrainBlendImporterSource).not.toContain('manifest.schemaVersion >= 7');
 });
 
-it('importuje ścisły arkusz postaci 5×4 jako stabilne sprite, klipy, controller i prefab', () => {
-  expect(terrainBlendImporterSource).toContain('animation.sheet.columns != 5');
+it('importuje dynamiczny arkusz postaci jako stabilne sprite, klipy, controller i prefab', () => {
+  expect(terrainBlendImporterSource).toContain('animation.settings.framesPerDirection < 2');
+  expect(terrainBlendImporterSource).toContain('animation.settings.framesPerDirection > 16');
+  expect(terrainBlendImporterSource).toContain(
+    'animation.sheet.columns != animation.settings.framesPerDirection + 1',
+  );
   expect(terrainBlendImporterSource).toContain('animation.sheet.rows != 4');
   expect(terrainBlendImporterSource).toContain('animation.sheet.origin != "top_left"');
   expect(terrainBlendImporterSource).toContain('CharacterSpriteName(direction.Id, "idle", 0)');
   expect(terrainBlendImporterSource).toContain('previousIds.TryGetValue(spriteName');
   expect(terrainBlendImporterSource).toContain('BuildCharacterClip(');
+  expect(terrainBlendImporterSource).toContain('Enumerable.Range(0, framesPerDirection)');
   expect(terrainBlendImporterSource).toContain('BuildCharacterController(');
   expect(terrainBlendImporterSource).toContain('BlendTreeType.SimpleDirectional2D');
   expect(terrainBlendImporterSource).toContain('AnimatorConditionMode.If, 0f, "IsMoving"');

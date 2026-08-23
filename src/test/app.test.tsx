@@ -12,6 +12,7 @@ const projectFixture: ProjectInfo = {
   id: '11111111-1111-4111-8111-111111111111', rootPath: 'C:\\project', name: 'Test', artBrief: '',
   projection: 'isometric', tileWidthPx: 256, tileHeightPx: 128, pixelsPerUnit: 256,
   maxConcurrentJobs: 1,
+  characterFramesPerDirection: 8,
   aiVerificationEnabled: true,
   styleSummary: '', styleSummaryStale: false, exportTargets: {},
   createdAt: '2026-08-07T10:00:00.000Z', updatedAt: '2026-08-07T10:00:00.000Z',
@@ -276,6 +277,7 @@ it('tworzy projekt top-down z bazowym tile 1:1', async () => {
   render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
 
   expect(await screen.findByRole('button', { name: /Utwórz projekt/i })).toBeDisabled();
+  expect(screen.getByLabelText('Klatki chodu na kierunek')).toHaveValue(8);
   fireEvent.click(screen.getByRole('button', { name: 'Wybierz katalog biblioteki' }));
   expect(await screen.findByText('C:\\biblioteka')).toBeInTheDocument();
   fireEvent.change(await screen.findByLabelText('Projekcja'), { target: { value: 'top_down' } });
@@ -284,7 +286,7 @@ it('tworzy projekt top-down z bazowym tile 1:1', async () => {
   fireEvent.click(screen.getByRole('button', { name: /Utwórz projekt/i }));
 
   await waitFor(() => expect(window.tilemap.projects.create).toHaveBeenCalledWith({
-    name: 'Nowy świat', artBrief: '', projection: 'top_down', tileWidthPx: 255,
+    name: 'Nowy świat', artBrief: '', projection: 'top_down', tileWidthPx: 255, characterFramesPerDirection: 8,
   }, 'C:\\biblioteka'));
 });
 
@@ -486,6 +488,7 @@ it('pozwala generować asset z samej nazwy bez opcjonalnego opisu', async () => 
     id: '11111111-1111-4111-8111-111111111111', rootPath: 'C:\\project', name: 'Test', artBrief: '',
     projection: 'isometric', tileWidthPx: 256, tileHeightPx: 128, pixelsPerUnit: 256,
     maxConcurrentJobs: 1,
+    characterFramesPerDirection: 8,
     aiVerificationEnabled: true,
     codexGenerationEnabled: true,
     comfyUiEnabled: false,
@@ -654,7 +657,9 @@ it('pokazuje osobną sekcję Postacie i generuje pełny zestaw kierunków izomet
   expect(await screen.findByRole('heading', { name: 'Postać gotowa do ruchu' })).toBeInTheDocument();
   const directions = screen.getByRole('region', { name: 'Kierunki animacji postaci' });
   for (const label of ['NW', 'NE', 'SE', 'SW']) expect(within(directions).getByText(label)).toBeInTheDocument();
-  expect(screen.getByText(/Kolumna 1: idle · kolumny 2–5: chód/)).toBeInTheDocument();
+  expect(screen.getByLabelText('Klatki chodu na kierunek')).toHaveValue('8');
+  expect(screen.getByLabelText('Klatki chodu na kierunek')).toHaveAttribute('readonly');
+  expect(screen.getByText(/Kolumna 1: idle · kolumny 2–9: chód/)).toBeInTheDocument();
   expect(screen.getByText(/Analiza ruchu jest obowiązkowa/)).toBeInTheDocument();
 
   fireEvent.change(screen.getByLabelText('Nazwa postaci'), { target: { value: 'Leśna strażniczka' } });
@@ -672,7 +677,7 @@ it('pokazuje osobną sekcję Postacie i generuje pełny zestaw kierunków izomet
     relativeWidth: 0.5,
     relativeHeight: 1.5,
     footprint: { x: 2, y: 1 },
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 12 },
+    characterAnimation: { action: 'walk', framesPerDirection: 8, framesPerSecond: 12 },
     generatorProviders: ['codex'],
   }));
 
@@ -814,12 +819,42 @@ it('pokazuje raport agenta per kierunek i blokuje review, dopóki ruch nie jest 
   fireEvent.click(screen.getByRole('button', { name: 'Przegeneruj' }));
   await waitFor(() => expect(window.tilemap.generation.enqueue).toHaveBeenCalledWith(expect.objectContaining({
     category: 'character',
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 14 },
+    characterAnimation: { action: 'walk', framesPerDirection: 8, framesPerSecond: 14 },
   })));
   fireEvent.click(approve);
   await waitFor(() => expect(window.tilemap.assets.review).toHaveBeenCalledWith(expect.objectContaining({
     versionId: passedVersion.id, decision: 'approved',
   })));
+});
+
+it('ostrzega, gdy wersja postaci ma mniej klatek niż projekt, i nie ostrzega dla zgodnej wersji', () => {
+  const versionWithFourFrames = characterVersionFixture('passed');
+  const view = render(<QueryClientProvider client={new QueryClient()}><ReviewControls
+    asset={characterAssetFixture(versionWithFourFrames)}
+    version={versionWithFourFrames}
+    project={projectFixture}
+    onChanged={() => undefined}
+  /></QueryClientProvider>);
+
+  expect(screen.getByRole('alert')).toHaveTextContent('Liczba klatek chodu na kierunek: 4; projekt: 8. Wygeneruj nową wersję postaci.');
+  expect(screen.getByText(/Arkusz tej wersji zawiera 5 kolumn i 4 wiersze kierunków\./)).toBeInTheDocument();
+
+  const versionWithEightFrames: AssetVersion = {
+    ...versionWithFourFrames,
+    id: '56565656-5656-4656-8656-565656565656',
+    characterAnimation: {
+      ...versionWithFourFrames.characterAnimation!,
+      settings: { ...versionWithFourFrames.characterAnimation!.settings, framesPerDirection: 8 },
+    },
+  };
+  view.rerender(<QueryClientProvider client={new QueryClient()}><ReviewControls
+    asset={characterAssetFixture(versionWithEightFrames)}
+    version={versionWithEightFrames}
+    project={projectFixture}
+    onChanged={() => undefined}
+  /></QueryClientProvider>);
+
+  expect(screen.queryByText(/Liczba klatek chodu na kierunek:/)).not.toBeInTheDocument();
 });
 
 it('otwiera asset postaci w sekcji Postacie z animacją i zaliczoną analizą', async () => {
@@ -995,6 +1030,7 @@ it('pokazuje retry po nieudanej generacji także bez aktywnego joba', async () =
     tileHeightPx: 128,
     pixelsPerUnit: 256,
     maxConcurrentJobs: 1,
+    characterFramesPerDirection: 8,
     aiVerificationEnabled: true,
     styleSummary: '',
     styleSummaryStale: false,
@@ -1045,6 +1081,7 @@ it('pokazuje szczegóły błędu w modalu i krótką akcję Ponów obok statusu'
     id: '11111111-1111-4111-8111-111111111111', rootPath: 'C:\\project', name: 'Test', artBrief: '',
     projection: 'isometric', tileWidthPx: 256, tileHeightPx: 128, pixelsPerUnit: 256,
     maxConcurrentJobs: 1,
+    characterFramesPerDirection: 8,
     aiVerificationEnabled: true,
     styleSummary: '',
     styleSummaryStale: false, exportTargets: {}, createdAt: failedVersion.createdAt, updatedAt: failedVersion.updatedAt,
@@ -1323,8 +1360,8 @@ it('pokazuje propozycję ustawień agenta i wymaga jawnego zastosowania', async 
   const proposal = {
     id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', status: 'pending' as const,
     reason: 'Referencja wymaga większej komórki 2:1.',
-    before: { artBrief: '', tileWidthPx: 256, pixelsPerUnit: 256 },
-    proposed: { tileWidthPx: 512, tileHeightPx: 256, pixelsPerUnit: 512 },
+    before: { artBrief: '', tileWidthPx: 256, pixelsPerUnit: 256, characterFramesPerDirection: 8 },
+    proposed: { tileWidthPx: 512, tileHeightPx: 256, pixelsPerUnit: 512, characterFramesPerDirection: 8 },
     referenceIds: [], createdAt: '2026-08-07T10:00:00.000Z', decidedAt: null,
   };
   vi.mocked(window.tilemap.projects.settingsProposals).mockResolvedValue([proposal]);
@@ -1575,6 +1612,7 @@ it('pokazuje podejścia w prawym sidebarze assetu, a Art Direction tylko na pozi
     id: '11111111-1111-4111-8111-111111111111', rootPath: 'C:\\project', name: 'Test', artBrief: 'Kreskówkowy',
     projection: 'isometric', tileWidthPx: 256, tileHeightPx: 128, pixelsPerUnit: 256,
     maxConcurrentJobs: 1,
+    characterFramesPerDirection: 8,
     aiVerificationEnabled: true,
     styleSummary: '',
     styleSummaryStale: false, exportTargets: {}, createdAt: version.createdAt, updatedAt: version.updatedAt,
@@ -1640,6 +1678,7 @@ it('otwiera stronę projektu z nagłówka i wylicza wysokość bazowego tile 2:1
     tileHeightPx: 128,
     pixelsPerUnit: 256,
     maxConcurrentJobs: 1,
+    characterFramesPerDirection: 8,
     aiVerificationEnabled: true,
     styleSummary: '',
     styleSummaryStale: false,
@@ -1653,6 +1692,7 @@ it('otwiera stronę projektu z nagłówka i wylicza wysokość bazowego tile 2:1
     tileWidthPx: 512,
     tileHeightPx: 256,
     maxConcurrentJobs: 4,
+    characterFramesPerDirection: 10,
     aiVerificationEnabled: false,
     comfyUiEnabled: true,
   });
@@ -1670,6 +1710,7 @@ it('otwiera stronę projektu z nagłówka i wylicza wysokość bazowego tile 2:1
   expect(await screen.findByText('Polecany: Z-Image Turbo Q4_K')).toBeInTheDocument();
   fireEvent.change(screen.getByLabelText('Bazowa szerokość tile (px)'), { target: { value: '512' } });
   fireEvent.change(screen.getByLabelText('Maks. jednoczesnych zadań'), { target: { value: '4' } });
+  fireEvent.change(screen.getByLabelText('Klatki chodu na kierunek'), { target: { value: '10' } });
   const aiVerification = screen.getByLabelText(/Weryfikacja AI po generowaniu/);
   expect(aiVerification).toBeChecked();
   fireEvent.click(aiVerification);
@@ -1683,7 +1724,7 @@ it('otwiera stronę projektu z nagłówka i wylicza wysokość bazowego tile 2:1
   fireEvent.click(screen.getByRole('button', { name: /Zapisz ustawienia/i }));
 
   await waitFor(() => expect(window.tilemap.projects.update).toHaveBeenCalledWith(expect.objectContaining({
-    tileWidthPx: 512, maxConcurrentJobs: 4, aiVerificationEnabled: false,
+    tileWidthPx: 512, maxConcurrentJobs: 4, characterFramesPerDirection: 10, aiVerificationEnabled: false,
     codexGenerationEnabled: true, comfyUiEnabled: true, comfyUiProfile: 'z_image_turbo',
     stableDiffusionCppEnabled: true,
   })));

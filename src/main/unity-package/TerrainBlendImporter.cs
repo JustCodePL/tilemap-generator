@@ -505,7 +505,8 @@ namespace TilemapGenerator.TerrainBlend.Editor
             var sprites = AssetDatabase.LoadAllAssetsAtPath(texturePath)
                 .OfType<Sprite>()
                 .ToDictionary(sprite => sprite.name, sprite => sprite, StringComparer.Ordinal);
-            if (sprites.Count != 20) return null;
+            var framesPerDirection = animation.settings.framesPerDirection;
+            if (sprites.Count != expectedDirections.Length * (framesPerDirection + 1)) return null;
 
             var assetDirectory = $"{characterRoot}/{character.id}";
             var clipsDirectory = $"{assetDirectory}/Clips";
@@ -518,7 +519,7 @@ namespace TilemapGenerator.TerrainBlend.Editor
             {
                 var idleSpriteName = CharacterSpriteName(direction.Id, "idle", 0);
                 if (!sprites.TryGetValue(idleSpriteName, out var idleSprite)) return null;
-                var walkSprites = Enumerable.Range(0, 4)
+                var walkSprites = Enumerable.Range(0, framesPerDirection)
                     .Select(index => sprites.TryGetValue(
                         CharacterSpriteName(direction.Id, "walk", index),
                         out var sprite) ? sprite : null)
@@ -624,7 +625,7 @@ namespace TilemapGenerator.TerrainBlend.Editor
             var spriteRects = new List<SpriteRect>();
             foreach (var direction in directions)
             {
-                for (var column = 0; column < 5; column++)
+                for (var column = 0; column < animation.settings.framesPerDirection + 1; column++)
                 {
                     var action = column == 0 ? "idle" : "walk";
                     var frameIndex = column == 0 ? 0 : column - 1;
@@ -1469,18 +1470,19 @@ namespace TilemapGenerator.TerrainBlend.Editor
                 || animation.schemaVersion != 1
                 || animation.settings == null
                 || animation.settings.action != "walk"
-                || animation.settings.framesPerDirection != 4
+                || animation.settings.framesPerDirection < 2
+                || animation.settings.framesPerDirection > 16
                 || animation.settings.framesPerSecond < 1
                 || animation.settings.framesPerSecond > 24
                 || animation.sheet == null
                 || animation.sheet.file != asset.file
                 || !IsOwnedAssetPath(animation.sheet.file, managedFiles, false)
-                || animation.sheet.columns != 5
+                || animation.sheet.columns != animation.settings.framesPerDirection + 1
                 || animation.sheet.rows != 4
                 || animation.sheet.origin != "top_left"
                 || animation.sheet.frameWidthPx <= 0
                 || animation.sheet.frameHeightPx <= 0
-                || animation.sheet.widthPx != animation.sheet.frameWidthPx * 5
+                || animation.sheet.widthPx != animation.sheet.frameWidthPx * animation.sheet.columns
                 || animation.sheet.heightPx != animation.sheet.frameHeightPx * 4
                 || animation.sharedPivotNormalized == null
                 || animation.sharedPivotNormalized.x < 0f
@@ -1520,7 +1522,7 @@ namespace TilemapGenerator.TerrainBlend.Editor
                     "walk",
                     expected,
                     animation.settings.framesPerSecond,
-                    new[] { 1, 2, 3, 4 },
+                    Enumerable.Range(1, animation.settings.framesPerDirection).ToArray(),
                     animation.sheet)) return false;
             }
 

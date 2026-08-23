@@ -75,13 +75,14 @@ function passedCharacterAnimation(
   frameWidth: number,
   frameHeight: number,
   framesPerSecond = 8,
+  framesPerDirection = 8,
 ): CharacterAnimationSet {
   const directions = [...characterDirectionsForProjection(projection)];
   return {
-    settings: { ...defaultCharacterAnimationSettings, framesPerSecond },
+    settings: { action: 'walk', framesPerDirection, framesPerSecond },
     directions,
     frameSize: { width: frameWidth, height: frameHeight },
-    sheetSize: { width: frameWidth * 5, height: frameHeight * 4 },
+    sheetSize: { width: frameWidth * (framesPerDirection + 1), height: frameHeight * 4 },
     movementAnalysis: {
       status: 'passed',
       summary: 'Każdy kierunek ma czytelny, spójny i poprawnie zapętlony chód.',
@@ -238,13 +239,13 @@ it('eksportuje przeanalizowany arkusz postaci do ścisłego manifestu v9 i autho
   });
   const source = path.join(root, 'archer-sheet.png');
   await sharp({
-    create: { width: 320, height: 256, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+    create: { width: 576, height: 256, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
   }).composite([{ input: Buffer.from(
-    '<svg width="320" height="256"><rect x="8" y="8" width="304" height="240" rx="8" fill="#5e8f63"/></svg>',
+    '<svg width="576" height="256"><rect x="8" y="8" width="560" height="240" rx="8" fill="#5e8f63"/></svg>',
   ) }]).png().toFile(source);
   const animation = passedCharacterAnimation('top_down', 64, 64, 12);
   database.finalizeGeneration(job.id, {
-    finalPath: database.relative(source), width: 320, height: 256,
+    finalPath: database.relative(source), width: 576, height: 256,
     category: 'character', tags: ['łuczniczka'], pivot: { x: 0.5, y: 0.08 },
     description: 'Łuczniczka', characterAnimation: animation,
   });
@@ -276,17 +277,17 @@ it('eksportuje przeanalizowany arkusz postaci do ścisłego manifestu v9 i autho
     }>;
   };
   expect(manifest.schemaVersion).toBe(9);
-  expect(manifest.assets[0].expectedCanvasPx).toEqual({ width: 320, height: 256 });
+  expect(manifest.assets[0].expectedCanvasPx).toEqual({ width: 576, height: 256 });
   expect(manifest.assets[0].characterAnimation).toMatchObject({
     schemaVersion: 1,
-    settings: { action: 'walk', framesPerDirection: 4, framesPerSecond: 12 },
+    settings: { action: 'walk', framesPerDirection: 8, framesPerSecond: 12 },
     sheet: {
       file: manifest.assets[0].file,
-      widthPx: 320,
+      widthPx: 576,
       heightPx: 256,
       frameWidthPx: 64,
       frameHeightPx: 64,
-      columns: 5,
+      columns: 9,
       rows: 4,
       origin: 'top_left',
     },
@@ -307,7 +308,7 @@ it('eksportuje przeanalizowany arkusz postaci do ścisłego manifestu v9 i autho
   expect(manifest.assets[0].characterAnimation.clips[1]).toMatchObject({
     id: 'walk_north', framesPerSecond: 12,
   });
-  expect(manifest.assets[0].characterAnimation.clips[1].frames).toHaveLength(4);
+  expect(manifest.assets[0].characterAnimation.clips[1].frames).toHaveLength(8);
 
   const integrationRoot = path.join(unityAssets, 'TilemapGeneratorIntegration');
   expect(existsSync(path.join(integrationRoot, 'Runtime', 'CharacterDefinition.cs'))).toBe(true);

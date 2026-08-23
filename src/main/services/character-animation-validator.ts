@@ -2,7 +2,6 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import sharp, { type OverlayOptions } from 'sharp';
 import {
-  characterAnimationSheetSize,
   characterDirectionsForProjection,
   type CharacterDirectionId,
   type ProjectProjection,
@@ -23,6 +22,7 @@ export interface CharacterAnimationValidationInput {
   projection: ProjectProjection;
   frameWidthPx: number;
   frameHeightPx: number;
+  framesPerDirection: number;
 }
 
 export interface CharacterFrameMetrics {
@@ -50,7 +50,8 @@ export interface CharacterAnimationValidationReport {
   height: number;
   frameWidthPx: number;
   frameHeightPx: number;
-  columns: 5;
+  framesPerDirection: number;
+  columns: number;
   rows: 4;
   directions: CharacterDirectionValidation[];
 }
@@ -74,7 +75,7 @@ interface RawSheet {
 }
 
 /**
- * Validates the fixed character-sheet v1 contract. Geometry and measurable
+ * Validates the project character-sheet contract. Geometry and measurable
  * continuity are checked here; semantic facing and gait quality belong to the
  * mandatory final agent analysis.
  */
@@ -82,15 +83,21 @@ export async function validateCharacterAnimationSheet(
   input: CharacterAnimationValidationInput,
 ): Promise<CharacterAnimationValidationReport> {
   assertFrameSize(input.frameWidthPx, input.frameHeightPx);
-  const expected = characterAnimationSheetSize({ width: input.frameWidthPx, height: input.frameHeightPx });
+  assertFramesPerDirection(input.framesPerDirection);
+  const columns = input.framesPerDirection + 1;
+  const expected = {
+    width: input.frameWidthPx * columns,
+    height: input.frameHeightPx * 4,
+  };
   const image = sharp(input.filePath, { failOn: 'error' });
   const metadata = await image.metadata();
   if (metadata.format !== 'png') throw new Error('Arkusz animacji postaci nie jest plikiem PNG.');
   if (!metadata.hasAlpha) throw new Error('Arkusz animacji postaci nie ma kanału alfa.');
   if (metadata.width !== expected.width || metadata.height !== expected.height) {
     throw new Error(
-      `Arkusz animacji postaci v1 musi mieć dokładnie ${expected.width}×${expected.height}px `
-      + `(5 kolumn × 4 kierunki); otrzymano ${metadata.width ?? 0}×${metadata.height ?? 0}px.`,
+      `Arkusz animacji postaci musi mieć dokładnie ${expected.width}×${expected.height}px `
+      + `(${columns} kolumn: idle + ${input.framesPerDirection} klatek chodu × 4 kierunki); `
+      + `otrzymano ${metadata.width ?? 0}×${metadata.height ?? 0}px.`,
     );
   }
 
@@ -105,7 +112,7 @@ export async function validateCharacterAnimationSheet(
   if (directions.length !== 4) throw new Error('Projekcja postaci musi definiować dokładnie cztery kierunki.');
 
   const directionReports = directions.map((direction, row) => {
-    const frames = Array.from({ length: 5 }, (_, column) => measureFrame(
+    const frames = Array.from({ length: columns }, (_, column) => measureFrame(
       raw,
       row,
       column,
@@ -114,15 +121,21 @@ export async function validateCharacterAnimationSheet(
       String(direction.id),
     ));
     validateDirectionGeometry(String(direction.id), frames, input.frameWidthPx, input.frameHeightPx);
-    const transitions = [
-      changedPixelRatio(raw, row, 1, row, 2, input.frameWidthPx, input.frameHeightPx),
-      changedPixelRatio(raw, row, 2, row, 3, input.frameWidthPx, input.frameHeightPx),
-      changedPixelRatio(raw, row, 3, row, 4, input.frameWidthPx, input.frameHeightPx),
-    ];
+    const transitions = Array.from({ length: input.framesPerDirection - 1 }, (_, index) => (
+      changedPixelRatio(
+        raw,
+        row,
+        index + 1,
+        row,
+        index + 2,
+        input.frameWidthPx,
+        input.frameHeightPx,
+      )
+    ));
     const loopTransitionRatio = changedPixelRatio(
       raw,
       row,
-      4,
+      input.framesPerDirection,
       row,
       1,
       input.frameWidthPx,
@@ -151,7 +164,8 @@ export async function validateCharacterAnimationSheet(
     height: raw.height,
     frameWidthPx: input.frameWidthPx,
     frameHeightPx: input.frameHeightPx,
-    columns: 5,
+    framesPerDirection: input.framesPerDirection,
+    columns,
     rows: 4,
     directions: directionReports,
   };
@@ -178,6 +192,12 @@ export async function createCharacterAnimationAnalysisArtifacts(
 function assertFrameSize(width: number, height: number): void {
   if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
     throw new Error('Wymiary klatki animacji postaci muszą być dodatnimi liczbami całkowitymi.');
+  }
+}
+
+function assertFramesPerDirection(value: number): void {
+  if (!Number.isInteger(value) || value < 2 || value > 16) {
+    throw new Error('Liczba klatek chodu na kierunek musi być liczbą całkowitą od 2 do 16.');
   }
 }
 
@@ -328,8 +348,16 @@ async function renderDirectionStrip(
   direction: CharacterDirectionValidation,
   report: CharacterAnimationValidationReport,
 ): Promise<void> {
-  const labels = ['IDLE', 'W1', 'W2', 'W3', 'W4', 'W1 LOOP'];
-  const sourceColumns = [0, 1, 2, 3, 4, 1];
+  const labels = [
+    'IDLE',
+    ...Array.from({ length: report.framesPerDirection }, (_, index) => `W${index + 1}`),
+    'W1 LOOP',
+  ];
+  const sourceColumns = [
+    0,
+    ...Array.from({ length: report.framesPerDirection }, (_, index) => index + 1),
+    1,
+  ];
   const header = 32;
   const width = report.frameWidthPx * sourceColumns.length;
   const height = report.frameHeightPx + header;
@@ -357,7 +385,7 @@ async function renderAnalysisBoard(
   destinationPath: string,
   report: CharacterAnimationValidationReport,
 ): Promise<void> {
-  const stripWidth = report.frameWidthPx * 6;
+  const stripWidth = report.frameWidthPx * (report.columns + 1);
   const stripHeight = report.frameHeightPx + 32;
   const width = BOARD_LABEL_WIDTH + stripWidth;
   const height = BOARD_HEADER_HEIGHT + stripHeight * strips.length;

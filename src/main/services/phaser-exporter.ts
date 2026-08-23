@@ -502,6 +502,7 @@ function imagePackFile(key: string, url: string): PhaserPackFile {
 function characterPackFile(key: string, url: string, version: AssetVersion): PhaserPackFile {
   const animation = version.characterAnimation;
   if (!animation) throw new Error('Postać nie zawiera arkusza animacji.');
+  const columns = animation.settings.framesPerDirection + 1;
   return {
     type: 'spritesheet',
     key,
@@ -510,7 +511,7 @@ function characterPackFile(key: string, url: string, version: AssetVersion): Pha
       frameWidth: animation.frameSize.width,
       frameHeight: animation.frameSize.height,
       startFrame: 0,
-      endFrame: 19,
+      endFrame: columns * animation.directions.length - 1,
     },
   };
 }
@@ -522,6 +523,7 @@ function characterAnimationManifest(
 ): Record<string, unknown> {
   assertExportableCharacterAnimation(project, version);
   const animation = version.characterAnimation;
+  const columns = animation.settings.framesPerDirection + 1;
   const directions = characterDirectionsForProjection(project.projection).map((direction, row) => ({
     id: direction.id,
     label: direction.shortLabel,
@@ -536,10 +538,10 @@ function characterAnimationManifest(
     frameConfig: {
       frameWidth: animation.frameSize.width,
       frameHeight: animation.frameSize.height,
-      columns: 5,
+      columns,
       rows: 4,
       startFrame: 0,
-      endFrame: 19,
+      endFrame: columns * directions.length - 1,
     },
     settings: animation.settings,
     directions,
@@ -548,8 +550,8 @@ function characterAnimationManifest(
         key: `${key}-idle-${direction.id}`,
         action: 'idle',
         direction: direction.id,
-        frameNumbers: [direction.row * 5],
-        frames: [{ key, frame: direction.row * 5 }],
+        frameNumbers: [direction.row * columns],
+        frames: [{ key, frame: direction.row * columns }],
         frameRate: animation.settings.framesPerSecond,
         repeat: -1,
       },
@@ -559,11 +561,11 @@ function characterAnimationManifest(
         direction: direction.id,
         frameNumbers: Array.from(
           { length: animation.settings.framesPerDirection },
-          (_, frame) => direction.row * 5 + frame + 1,
+          (_, frame) => direction.row * columns + frame + 1,
         ),
         frames: Array.from(
           { length: animation.settings.framesPerDirection },
-          (_, frame) => ({ key, frame: direction.row * 5 + frame + 1 }),
+          (_, frame) => ({ key, frame: direction.row * columns + frame + 1 }),
         ),
         frameRate: animation.settings.framesPerSecond,
         repeat: -1,
@@ -610,7 +612,9 @@ function assertExportableCharacterAnimation(
   const expectedFrame = characterAnimationFrameSize(project, version);
   const expectedSheet = characterAnimationSheetSize(expectedFrame, animation.settings);
   if (animation.settings.action !== 'walk'
-    || animation.settings.framesPerDirection !== 4
+    || !Number.isInteger(animation.settings.framesPerDirection)
+    || animation.settings.framesPerDirection < 2
+    || animation.settings.framesPerDirection > 16
     || !Number.isInteger(animation.settings.framesPerSecond)
     || animation.settings.framesPerSecond < 1
     || animation.settings.framesPerSecond > 24
@@ -621,7 +625,9 @@ function assertExportableCharacterAnimation(
     || version.width !== expectedSheet.width
     || version.height !== expectedSheet.height
     || !sameCharacterDirections(animation.directions, expectedDirections)) {
-    throw new Error('Zatwierdzona postać nie odpowiada kontraktowi arkusza walk v1 5×4 bieżącego projektu.');
+    throw new Error(
+      `Zatwierdzona postać nie odpowiada kontraktowi arkusza walk v1 ${animation.settings.framesPerDirection + 1}×4.`,
+    );
   }
   const analysis = animation.movementAnalysis;
   if (analysis.status !== 'passed'

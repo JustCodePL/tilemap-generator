@@ -338,8 +338,10 @@ export function buildPrompt(request: StableDiffusionCppGenerationRequest): strin
 
 function buildCharacterAnimationInstruction(request: StableDiffusionCppGenerationRequest): string {
   const settings = request.characterAnimation;
+  if (!settings) throw new Error('Brakuje projektowej konfiguracji animacji postaci.');
   const directions = characterDirectionsForProjection(request.projection);
-  const columns = 1 + (settings?.framesPerDirection ?? 4);
+  const walkFrames = settings.framesPerDirection;
+  const columns = 1 + walkFrames;
   const rows = directions.length;
   const frameWidth = request.outputSize ? request.outputSize.width / columns : null;
   const frameHeight = request.outputSize ? request.outputSize.height / rows : null;
@@ -350,9 +352,9 @@ function buildCharacterAnimationInstruction(request: StableDiffusionCppGeneratio
       ? `Every frame cell is exactly ${frameWidth}x${frameHeight}px; the complete sheet is exactly ${request.outputSize!.width}x${request.outputSize!.height}px.`
       : '',
     `Rows from top to bottom are exactly: ${directions.map((direction) => `${direction.shortLabel} (${direction.id})`).join(', ')}.`,
-    'Column 1 is a grounded idle pose. Columns 2-5 are one chronological in-place walk loop: left contact, passing, right contact, passing.',
+    `Column 1 is one grounded idle pose. Columns 2-${columns} are exactly ${walkFrames} chronological, evenly spaced phases W1-W${walkFrames} of one complete in-place walk loop. Show alternating left/right contact and passing phases across the full sequence; do not omit, merge or duplicate frames.`,
     'Keep the same character identity, outfit, proportions, scale, lighting and ground-contact pivot in every cell. The root stays fixed; only the gait animates.',
-    'Each row must face and move in its declared direction. Alternate arms and legs naturally, avoid foot sliding, duplicate frames, teleportation, cropping and extra limbs, and make the last walk frame loop smoothly into the first walk frame.',
+    `Each row must face and move in its declared direction. Evaluate all ${walkFrames} walk frames: alternate arms and legs naturally, avoid foot sliding, duplicate frames, teleportation, cropping and extra limbs, and make W${walkFrames} loop smoothly into W1.`,
     'Keep clear background-connected padding inside every cell. Do not draw a floor, cast shadow, text, arrows, direction names or a surrounding scene.',
   ].filter(Boolean).join('\n');
 }

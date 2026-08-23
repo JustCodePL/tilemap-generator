@@ -736,6 +736,7 @@ export class GenerationQueue extends EventEmitter {
                   response.finalPath,
                   resultItems,
                   characterAnimationSheetSize(project, context, context.characterAnimation!),
+                  context.characterAnimation!.framesPerDirection,
                 );
                 stagedFinal = characterSourcePath;
               } else {
@@ -799,6 +800,7 @@ export class GenerationQueue extends EventEmitter {
                 outputPath: normalizedPath,
                 frameWidthPx: frameSize.width,
                 frameHeightPx: frameSize.height,
+                framesPerDirection: context.characterAnimation!.framesPerDirection,
               });
               stagedFinal = normalizedPath;
               previousCandidate = stagedFinal;
@@ -836,6 +838,7 @@ export class GenerationQueue extends EventEmitter {
                 projection: project.projection,
                 frameWidthPx: frameSize.width,
                 frameHeightPx: frameSize.height,
+                framesPerDirection: context.characterAnimation!.framesPerDirection,
               });
               characterPivot = characterPivotFromValidationReport(report);
               const artifacts = await createCharacterAnimationAnalysisArtifacts({
@@ -843,6 +846,7 @@ export class GenerationQueue extends EventEmitter {
                 projection: project.projection,
                 frameWidthPx: frameSize.width,
                 frameHeightPx: frameSize.height,
+                framesPerDirection: context.characterAnimation!.framesPerDirection,
                 outputDirectory: path.join(attemptPath, 'movement-analysis'),
                 report,
               });
@@ -1191,6 +1195,9 @@ export class GenerationQueue extends EventEmitter {
   ): Promise<CharacterMovementAnalysis> {
     const project = database.getProject();
     const expectedDirections = characterDirectionsForProjection(projection);
+    const walkFrames = context.characterAnimation!.framesPerDirection;
+    const columns = walkFrames + 1;
+    const walkLabels = Array.from({ length: walkFrames }, (_, index) => `W${index + 1}`);
     const metrics = report.directions.map((direction) => ({
       direction: direction.direction,
       maxBaselineDriftPx: direction.maxBaselineDriftPx,
@@ -1225,10 +1232,10 @@ export class GenerationQueue extends EventEmitter {
               `Tryb projektu: ${projection}; kierunki w wymaganej kolejności: ${expectedDirections.map((direction) => `${direction.shortLabel} (${direction.id})`).join(', ')}.`,
               `Brief projektu: ${project.artBrief || '(brak)'}`,
               `Kanoniczny styl: ${project.styleSummary || '(brak zatwierdzonych assetów)'}`,
-              `Kontrakt arkusza: 4 wiersze kierunków, po 5 kolumn: IDLE, W1 lewy kontakt, W2 passing, W3 prawy kontakt, W4 passing. Chód zapętla W4→W1 z prędkością ${context.characterAnimation!.framesPerSecond} FPS.`,
-              'Obraz 1 to pełny arkusz. Obraz 2 to plansza kontrolna z sekwencją IDLE,W1,W2,W3,W4,W1 dla każdego kierunku. Kolejne obrazy to powiększone paski kierunków w tej samej kolejności.',
+              `Kontrakt arkusza: 4 wiersze kierunków, po ${columns} kolumn: IDLE oraz dokładnie ${walkFrames} kolejnych klatek chodu ${walkLabels.join(', ')}. Chód zapętla W${walkFrames}→W1 z prędkością ${context.characterAnimation!.framesPerSecond} FPS.`,
+              `Obraz 1 to pełny arkusz. Obraz 2 to plansza kontrolna z sekwencją IDLE,${walkLabels.join(',')},W1 dla każdego kierunku. Kolejne obrazy to powiększone paski kierunków w tej samej kolejności.`,
               `Metryki deterministyczne (pomocnicze, nie zastępują oceny semantycznej): ${JSON.stringify(metrics)}`,
-              'Dla KAŻDEGO kierunku sprawdź: poprawne zwrócenie i czytelny ruch w zadanym kierunku; tę samą tożsamość, strój, proporcje i liczbę kończyn; naturalne naprzemienne fazy nóg i ramion; stabilny punkt kontaktu z podłożem bez ślizgania stóp, teleportacji i dryfu korpusu; brak kadrowania i kolizji między komórkami; płynne przejścia oraz pętlę W4→W1.',
+              `Dla KAŻDEGO kierunku sprawdź wszystkie ${walkFrames} klatek chodu: poprawne zwrócenie i czytelny ruch w zadanym kierunku; tę samą tożsamość, strój, proporcje i liczbę kończyn; naturalne naprzemienne fazy nóg i ramion; stabilny punkt kontaktu z podłożem bez ślizgania stóp, teleportacji i dryfu korpusu; brak kadrowania i kolizji między komórkami; każde kolejne przejście oraz domknięcie pełnej pętli W${walkFrames}→W1.`,
               'Zwróć status passed tylko wtedy, gdy WSZYSTKIE cztery kierunki przechodzą. Każdy wpis directions musi wystąpić dokładnie raz i w podanej kolejności. W message podaj konkretną obserwację po polsku.',
               'Zwróć wyłącznie JSON zgodny ze schematem.',
             ].filter(Boolean).join('\n\n'),
@@ -1454,7 +1461,7 @@ function buildGenerationPrompt(
         'Use exactly one built-in image generation call in this application attempt. The generated PNG is a native-resolution source sheet; the application owns alpha inspection, exact sizing, deterministic composition and retry.',
         `Copy the best native PNG unchanged to exactly ${path.join(stagingPath, 'final.png')}, even when the generator chose a different canvas size or omitted alpha. Do not make a second image-generation/edit call to remove a background or checkerboard in this turn.`,
         'Inspect transparency numerically from PNG metadata and alpha values, never from the preview or from RGB values hidden under alpha=0. If a real alpha channel and transparent pixels exist, accept that source without background removal.',
-        `In the final JSON use ${path.join(stagingPath, 'final.png')} as finalPath. The application will preserve the source, normalize all 20 cells and reject or retry it when necessary.`,
+        `In the final JSON use ${path.join(stagingPath, 'final.png')} as finalPath. The application will preserve the source, normalize all ${(context.characterAnimation!.framesPerDirection + 1) * 4} cells and reject or retry it when necessary.`,
       ].join('\n')
     : `Project-bound output: copy the final ${opaqueTopDownTerrain ? 'PNG' : 'transparent PNG'} to exactly ${path.join(stagingPath, 'final.png')}. Preserve any useful source as ${path.join(stagingPath, 'source.png')}.`;
   return [
@@ -1558,17 +1565,20 @@ function buildCharacterAnimationInstructions(
     throw new Error('Brakuje rozmiaru lub konfiguracji animacji postaci.');
   }
   const directions = characterDirectionsForProjection(projection);
+  const walkFrames = context.characterAnimation.framesPerDirection;
+  const columns = walkFrames + 1;
+  const cells = columns * directions.length;
   return [
     'Asset type: DIRECTIONAL CHARACTER ANIMATION SPRITESHEET. Generate one coherent playable character, not a portrait, pose sheet, turnaround, illustration or scene.',
-    `The application-delivered sheet will be exactly ${sheetSize.width}x${sheetSize.height}px with 5 columns and 4 rows. Imagegen may return a supported native canvas size; keep an equal 5-column by 4-row logical grid across that canvas and let the application extract and normalize every cell.`,
+    `The application-delivered sheet will be exactly ${sheetSize.width}x${sheetSize.height}px with ${columns} columns and 4 rows: one idle column plus exactly ${walkFrames} walk-frame columns per direction. Imagegen may return a supported native canvas size; keep an equal ${columns}-column by 4-row logical grid across that canvas and let the application extract and normalize every cell.`,
     `Each delivered frame cell is ${frameSize.width}x${frameSize.height}px. Keep every source cell equal, leave transparent padding on all four cell edges, and never let a silhouette or equipped item cross into a neighboring cell.`,
     `Rows from top to bottom are exactly: ${directions.map((direction) => `${direction.shortLabel} (${direction.id})`).join(', ')}.`,
-    'Column 1 is a grounded idle pose. Columns 2-5 are one chronological in-place walk loop: left-contact, passing, right-contact, passing.',
+    `Column 1 is a grounded idle pose. Columns 2-${columns} are exactly ${walkFrames} chronological, evenly spaced phases W1-W${walkFrames} of one complete in-place walk loop. Show alternating left/right contact and passing phases across the full sequence; do not omit, merge or duplicate frames.`,
     'This idle-and-walk contract overrides any additional request for a one-off action pose such as chopping, attacking or casting; express the profession through identity and equipment while keeping every required frame a valid idle or walk phase.',
-    `Playback speed is ${context.characterAnimation.framesPerSecond} FPS. The four walk frames must show real alternating gait phases rather than duplicated poses.`,
-    'Keep exactly the same character identity, face, outfit, colors, proportions, scale, lighting and silhouette language in all 20 cells.',
+    `Playback speed is ${context.characterAnimation.framesPerSecond} FPS. All ${walkFrames} walk frames must show meaningful chronological gait progress rather than duplicated poses.`,
+    `Keep exactly the same character identity, face, outfit, colors, proportions, scale, lighting and silhouette language in all ${cells} cells.`,
     'Each row must face and visually move in its declared direction. Keep the root and shared ground-contact pivot fixed in every frame; animate limbs without foot sliding, body teleportation or camera movement.',
-    'The fourth walk frame must connect smoothly back to the first walk frame. Keep baseline, centroid, occupied area and transparent padding stable; do not crop the character or create extra/missing limbs.',
+    `Walk frame W${walkFrames} must connect smoothly back to W1. Keep baseline, centroid, occupied area and transparent padding stable; do not crop the character or create extra/missing limbs.`,
     'Leave every cell background transparent, including all four cell corners. Held or worn equipment explicitly belonging to the character is allowed but must stay inside its cell. Do not draw a floor, cast shadow, unrelated props, arrows, text, direction names or a surrounding scene.',
   ].join('\n');
 }
@@ -1812,6 +1822,7 @@ async function resolveCharacterGeneratedFile(
   reportedPath: string,
   items: Array<Record<string, unknown>>,
   expectedSize: { width: number; height: number },
+  framesPerDirection: number,
 ): Promise<string> {
   const candidates: string[] = [];
   const reported = reportedPath
@@ -1838,10 +1849,11 @@ async function resolveCharacterGeneratedFile(
   });
   if (!allowed.length) throw new Error('Generator nie zapisał finalnego PNG w katalogu projektu.');
 
-  const frameWidthPx = expectedSize.width / 5;
+  const columns = framesPerDirection + 1;
+  const frameWidthPx = expectedSize.width / columns;
   const frameHeightPx = expectedSize.height / 4;
   if (!Number.isInteger(frameWidthPx) || !Number.isInteger(frameHeightPx)) {
-    throw new Error('Docelowy arkusz postaci nie dzieli się na kanoniczną siatkę 5×4.');
+    throw new Error(`Docelowy arkusz postaci nie dzieli się na wymaganą siatkę ${columns}×4.`);
   }
   const projection = database.getProject().projection;
   let selected = allowed[0];
@@ -1850,7 +1862,7 @@ async function resolveCharacterGeneratedFile(
     let score = 0;
     const evaluationPath = path.join(stagingPath, `.candidate-evaluation-${index}.png`);
     try {
-      const inspection = await inspectCharacterAnimationSource(candidate);
+      const inspection = await inspectCharacterAnimationSource(candidate, framesPerDirection);
       if (inspection.usable) {
         score = inspection.width === expectedSize.width && inspection.height === expectedSize.height ? 2 : 1;
         try {
@@ -1859,12 +1871,14 @@ async function resolveCharacterGeneratedFile(
             outputPath: evaluationPath,
             frameWidthPx,
             frameHeightPx,
+            framesPerDirection,
           });
           await validateCharacterAnimationSheet({
             filePath: evaluationPath,
             projection,
             frameWidthPx,
             frameHeightPx,
+            framesPerDirection,
           });
           score += 2;
         } finally {

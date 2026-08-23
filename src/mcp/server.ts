@@ -82,7 +82,7 @@ const footprintSchema = z.object({
 }).strict();
 const characterAnimationSchema = z.object({
   action: z.literal('walk').default('walk'),
-  framesPerDirection: z.literal(4).default(4),
+  framesPerDirection: z.number().int().min(2).max(16).default(8),
   framesPerSecond: z.number().int().min(1).max(24).default(8),
 }).strict();
 const generationRequestSchema = z.object({

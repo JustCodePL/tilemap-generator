@@ -8,6 +8,7 @@ export const projects = sqliteTable('projects', {
   tileWidthPx: integer('tile_width_px').notNull(),
   tileHeightPx: integer('tile_height_px').notNull(),
   pixelsPerUnit: integer('pixels_per_unit').notNull(),
+  characterFramesPerDirection: integer('character_frames_per_direction').notNull().default(8),
   maxConcurrentJobs: integer('max_concurrent_jobs').notNull().default(1),
   aiVerificationEnabled: integer('ai_verification_enabled', { mode: 'boolean' }).notNull().default(true),
   codexGenerationEnabled: integer('codex_generation_enabled', { mode: 'boolean' }).notNull().default(true),
@@ -82,7 +83,7 @@ export const roadVariants = sqliteTable('road_variants', {
 export const characterAnimationSets = sqliteTable('character_animation_sets', {
   versionId: text('version_id').primaryKey().references(() => assetVersions.id, { onDelete: 'cascade' }),
   action: text('action').notNull().default('walk'),
-  framesPerDirection: integer('frames_per_direction').notNull().default(4),
+  framesPerDirection: integer('frames_per_direction').notNull().default(8),
   framesPerSecond: integer('frames_per_second').notNull().default(8),
   frameWidth: integer('frame_width').notNull(),
   frameHeight: integer('frame_height').notNull(),

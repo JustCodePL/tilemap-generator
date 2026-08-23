@@ -106,14 +106,15 @@ it('opisuje kompletny arkusz animacji postaci top-down', () => {
   const prompt = buildPrompt({
     assetName: 'Łowca', category: 'character', projection: 'top_down', prompt: '', feedback: '',
     artBrief: 'Czytelne sylwetki', styleSummary: '', outputPath: '/tmp/character.png',
-    outputSize: { width: 400, height: 256 },
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 10 },
+    outputSize: { width: 720, height: 256 },
+    characterAnimation: { action: 'walk', framesPerDirection: 8, framesPerSecond: 10 },
     roadAtlas: false, attempt: 1, verificationFeedback: '', signal: new AbortController().signal,
   });
 
-  expect(prompt).toContain('5-column by 4-row');
+  expect(prompt).toContain('9-column by 4-row');
   expect(prompt).toContain('Every frame cell is exactly 80x64px');
   expect(prompt).toContain('N (north), E (east), S (south), W (west)');
-  expect(prompt).toContain('Column 1 is a grounded idle pose');
-  expect(prompt).toContain('last walk frame loop smoothly into the first walk frame');
+  expect(prompt).toContain('Column 1 is one grounded idle pose');
+  expect(prompt).toContain('Columns 2-9 are exactly 8 chronological');
+  expect(prompt).toContain('make W8 loop smoothly into W1');
 });

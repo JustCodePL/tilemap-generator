@@ -338,7 +338,20 @@ export class TilemapMcpBackendService {
     if (!runtime.generationQueue.isAttachedTo(runtime.database)) {
       throw new Error('Kolejka generacji nie jest przypięta do projektu wybranego dla MCP.');
     }
-    const request = enqueueGenerationSchema.parse(input.request);
+    const project = runtime.database.getProject();
+    const parsedRequest = enqueueGenerationSchema.parse(input.request);
+    const request = enqueueGenerationSchema.parse(
+      parsedRequest.category === 'character' || parsedRequest.characterAnimation
+        ? {
+            ...parsedRequest,
+            characterAnimation: {
+              action: 'walk',
+              framesPerDirection: project.characterFramesPerDirection,
+              framesPerSecond: parsedRequest.characterAnimation?.framesPerSecond ?? 8,
+            },
+          }
+        : parsedRequest,
+    );
     const references = input.referenceIds.map((referenceId) => {
       const reference = runtime.database.getProjectReference(referenceId);
       if (!reference) throw new Error(`Referencja ${referenceId} nie należy do przypiętego projektu MCP.`);
@@ -427,6 +440,7 @@ export class TilemapMcpBackendService {
         tileWidthPx: project.tileWidthPx,
         tileHeightPx: project.tileHeightPx,
         pixelsPerUnit: project.pixelsPerUnit,
+        characterFramesPerDirection: project.characterFramesPerDirection,
         artBrief: project.artBrief,
         supportedAssetCategories: assetCategories.filter((category) => (
           project.projection !== 'top_down' || category !== 'elevated_tile'

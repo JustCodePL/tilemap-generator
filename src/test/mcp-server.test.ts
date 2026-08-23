@@ -146,7 +146,7 @@ describe('Tilemap Generator MCP server', () => {
         name: 'Bohater',
         mode: 'generate',
         footprint: { x: 1, y: 1 },
-        characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+        characterAnimation: { action: 'walk', framesPerDirection: 8, framesPerSecond: 8 },
       }),
       referenceIds: [REFERENCE_ID],
     }));

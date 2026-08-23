@@ -164,7 +164,7 @@ it('eksportuje 16 top-down wariantów drogi z unikalnymi kluczami i synchronizuj
   database.close();
 });
 
-it('eksportuje postać 5×4 jako spritesheet i gotowe definicje animacji Phaser', async () => {
+it('eksportuje postać 9×4 jako spritesheet i gotowe definicje animacji Phaser', async () => {
   const { root, target, database } = createProject('Postacie Phaser', 'top_down', 64);
   const job = database.enqueueGeneration({
     name: 'Drwal', prompt: '', mode: 'generate', category: 'character',
@@ -173,12 +173,12 @@ it('eksportuje postać 5×4 jako spritesheet i gotowe definicje animacji Phaser'
   });
   const source = path.join(root, 'drwal-sheet.png');
   await sharp({
-    create: { width: 320, height: 256, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+    create: { width: 576, height: 256, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
   }).composite([{ input: Buffer.from(
-    '<svg width="320" height="256"><rect x="8" y="8" width="304" height="240" fill="#7f9858"/></svg>',
+    '<svg width="576" height="256"><rect x="8" y="8" width="560" height="240" fill="#7f9858"/></svg>',
   ) }]).png().toFile(source);
   database.finalizeGeneration(job.id, {
-    finalPath: database.relative(source), width: 320, height: 256, category: 'character', tags: ['drwal'],
+    finalPath: database.relative(source), width: 576, height: 256, category: 'character', tags: ['drwal'],
     pivot: { x: 0.5, y: 0.04 }, description: 'Drwal',
     characterAnimation: passedCharacterAnimation('top_down', 64, 64, 10),
   });
@@ -194,13 +194,13 @@ it('eksportuje postać 5×4 jako spritesheet i gotowe definicje animacji Phaser'
   expect(section.files).toEqual([expect.objectContaining({
     type: 'spritesheet',
     key: `tilemap-${job.assetId}`,
-    frameConfig: { frameWidth: 64, frameHeight: 64, startFrame: 0, endFrame: 19 },
+    frameConfig: { frameWidth: 64, frameHeight: 64, startFrame: 0, endFrame: 35 },
   })]);
   const animation = section.assets[0].characterAnimation;
   expect(animation).toMatchObject({
     textureKey: `tilemap-${job.assetId}`,
     origin: { x: 0.5, y: 0.96 },
-    frameConfig: { frameWidth: 64, frameHeight: 64, columns: 5, rows: 4 },
+    frameConfig: { frameWidth: 64, frameHeight: 64, columns: 9, rows: 4 },
   });
   expect(animation.directions.map((direction: { id: string }) => direction.id)).toEqual(['north', 'east', 'south', 'west']);
   expect(animation.directions.map((direction: { gridDelta: { x: number; y: number } }) => direction.gridDelta))
@@ -210,13 +210,13 @@ it('eksportuje postać 5×4 jako spritesheet i gotowe definicje animacji Phaser'
     frames: [{ key: `tilemap-${job.assetId}`, frame: 0 }], repeat: -1,
   });
   expect(animation.animations[1]).toMatchObject({
-    action: 'walk', direction: 'north', frameNumbers: [1, 2, 3, 4],
-    frames: [1, 2, 3, 4].map((frame) => ({ key: `tilemap-${job.assetId}`, frame })),
+    action: 'walk', direction: 'north', frameNumbers: [1, 2, 3, 4, 5, 6, 7, 8],
+    frames: [1, 2, 3, 4, 5, 6, 7, 8].map((frame) => ({ key: `tilemap-${job.assetId}`, frame })),
     frameRate: 10,
   });
   expect(animation.animations[2]).toMatchObject({
-    action: 'idle', direction: 'east', frameNumbers: [5],
-    frames: [{ key: `tilemap-${job.assetId}`, frame: 5 }],
+    action: 'idle', direction: 'east', frameNumbers: [9],
+    frames: [{ key: `tilemap-${job.assetId}`, frame: 9 }],
   });
 
   database.sqlite.prepare('UPDATE character_animation_sets SET analysis_status = ? WHERE version_id = ?')
@@ -378,7 +378,10 @@ function passedCharacterAnimation(
     settings: { ...defaultCharacterAnimationSettings, framesPerSecond },
     directions,
     frameSize: { width: frameWidth, height: frameHeight },
-    sheetSize: { width: frameWidth * 5, height: frameHeight * 4 },
+    sheetSize: {
+      width: frameWidth * (defaultCharacterAnimationSettings.framesPerDirection + 1),
+      height: frameHeight * 4,
+    },
     movementAnalysis: {
       status: 'passed',
       summary: 'Wszystkie kierunki mają spójny chód.',

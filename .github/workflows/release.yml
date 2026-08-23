@@ -67,7 +67,7 @@ jobs:
           if [[ "$version" == *-beta.* ]]; then
             channel=beta
             prerelease=true
-            title='Eksport Phaser i aktualizacje macOS'
+            title='Konfigurowalne animacje postaci'
           else
             channel=stable
             prerelease=false

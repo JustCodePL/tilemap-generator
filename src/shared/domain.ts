@@ -86,16 +86,18 @@ export function characterDirectionsForProjection(
   return projection === 'top_down' ? topDownCharacterDirections : isometricCharacterDirections;
 }
 
+export const characterFramesPerDirectionSchema = z.number().int().min(2).max(16).default(8);
+
 export const characterAnimationSettingsSchema = z.object({
   action: z.literal('walk').default('walk'),
-  framesPerDirection: z.literal(4).default(4),
+  framesPerDirection: characterFramesPerDirectionSchema,
   framesPerSecond: z.number().int().min(1).max(24).default(8),
 });
 export type CharacterAnimationSettings = z.infer<typeof characterAnimationSettingsSchema>;
 
 export const defaultCharacterAnimationSettings: CharacterAnimationSettings = Object.freeze({
   action: 'walk',
-  framesPerDirection: 4,
+  framesPerDirection: 8,
   framesPerSecond: 8,
 });
 
@@ -262,6 +264,7 @@ export const createProjectSchema = z.object({
   projection: projectProjectionSchema.default('isometric'),
   tileWidthPx: z.number().int().min(16).max(4096).default(256),
   pixelsPerUnit: z.number().int().min(1).max(4096).optional(),
+  characterFramesPerDirection: characterFramesPerDirectionSchema,
 }).superRefine((project, context) => {
   if (project.projection === 'isometric' && project.tileWidthPx % 2 !== 0) {
     context.addIssue({
@@ -272,8 +275,9 @@ export const createProjectSchema = z.object({
   }
 });
 type ParsedCreateProjectInput = z.infer<typeof createProjectSchema>;
-export type CreateProjectInput = Omit<ParsedCreateProjectInput, 'projection'> & {
+export type CreateProjectInput = Omit<ParsedCreateProjectInput, 'projection' | 'characterFramesPerDirection'> & {
   projection?: ProjectProjection;
+  characterFramesPerDirection?: number;
 };
 
 export const updateProjectSettingsSchema = z.object({
@@ -281,6 +285,7 @@ export const updateProjectSettingsSchema = z.object({
   artBrief: z.string().trim().max(12_000),
   tileWidthPx: z.number().int().min(16).max(4096),
   pixelsPerUnit: z.number().int().min(1).max(4096),
+  characterFramesPerDirection: characterFramesPerDirectionSchema,
   maxConcurrentJobs: z.number().int().min(1).max(8),
   aiVerificationEnabled: z.boolean(),
   codexGenerationEnabled: z.boolean().default(true),
@@ -377,6 +382,7 @@ export const proposedProjectSettingsSchema = z.object({
   artBrief: z.string().trim().max(12_000).optional(),
   tileWidthPx: z.number().int().min(16).max(4096).optional(),
   pixelsPerUnit: z.number().int().min(1).max(4096).optional(),
+  characterFramesPerDirection: characterFramesPerDirectionSchema.optional(),
   codexGenerationEnabled: z.boolean().optional(),
   comfyUiEnabled: z.boolean().optional(),
   comfyUiProfile: comfyUiProfileSchema.optional(),
@@ -414,6 +420,7 @@ export interface ProjectInfo {
   tileWidthPx: number;
   tileHeightPx: number;
   pixelsPerUnit: number;
+  characterFramesPerDirection: number;
   maxConcurrentJobs: number;
   aiVerificationEnabled: boolean;
   codexGenerationEnabled?: boolean;
@@ -520,6 +527,7 @@ export interface ProjectSettingsSnapshot {
   artBrief: string;
   tileWidthPx: number;
   pixelsPerUnit: number;
+  characterFramesPerDirection: number;
   codexGenerationEnabled?: boolean;
   comfyUiEnabled?: boolean;
   comfyUiProfile?: ComfyUiProfile;

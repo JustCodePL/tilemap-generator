@@ -69,7 +69,7 @@ it('waliduje niepusty zestaw generatorów wybrany dla nowego assetu', () => {
   })).toThrow(/tylko dla nowego assetu/);
 });
 
-it('definiuje stały kontrakt kierunkowej animacji postaci', () => {
+it('definiuje projektowy kontrakt kierunkowej animacji postaci', () => {
   expect(characterDirectionsForProjection('isometric').map((direction) => direction.id)).toEqual([
     'north_west', 'north_east', 'south_east', 'south_west',
   ]);
@@ -83,41 +83,44 @@ it('definiuje stały kontrakt kierunkowej animacji postaci', () => {
     { x: 0, y: 1 }, { x: 1, y: 0 }, { x: 0, y: -1 }, { x: -1, y: 0 },
   ]);
   expect(defaultCharacterAnimationSettings).toEqual({
-    action: 'walk', framesPerDirection: 4, framesPerSecond: 8,
+    action: 'walk', framesPerDirection: 8, framesPerSecond: 8,
   });
   expect(characterAnimationSettingsSchema.parse({})).toEqual(defaultCharacterAnimationSettings);
-  expect(characterAnimationSettingsSchema.parse({ framesPerSecond: 24 })).toEqual({
-    action: 'walk', framesPerDirection: 4, framesPerSecond: 24,
+  expect(characterAnimationSettingsSchema.parse({ framesPerDirection: 16, framesPerSecond: 24 })).toEqual({
+    action: 'walk', framesPerDirection: 16, framesPerSecond: 24,
   });
-  expect(() => characterAnimationSettingsSchema.parse({ framesPerDirection: 5 })).toThrow();
+  expect(characterAnimationSettingsSchema.parse({ framesPerDirection: 2 }).framesPerDirection).toBe(2);
+  expect(() => characterAnimationSettingsSchema.parse({ framesPerDirection: 1 })).toThrow();
+  expect(() => characterAnimationSettingsSchema.parse({ framesPerDirection: 17 })).toThrow();
+  expect(() => characterAnimationSettingsSchema.parse({ framesPerDirection: 2.5 })).toThrow();
   expect(() => characterAnimationSettingsSchema.parse({ framesPerSecond: 25 })).toThrow();
 });
 
-it('wylicza klatkę i arkusz postaci jako idle plus cztery klatki chodu w czterech kierunkach', () => {
+it('wylicza klatkę i arkusz postaci jako idle plus projektowe klatki chodu w czterech kierunkach', () => {
   const project = { tileWidthPx: 256, tileHeightPx: 128 };
   const asset = { relativeWidth: 0.5, relativeHeight: 1.5 };
   expect(characterAnimationFrameSize(project, asset)).toEqual({ width: 128, height: 192 });
   expect(characterAnimationSheetSize(project, asset, defaultCharacterAnimationSettings)).toEqual({
-    width: 640,
+    width: 1152,
     height: 768,
   });
   expect(characterAnimationSheetSize(
     { width: 128, height: 192 },
     defaultCharacterAnimationSettings,
-  )).toEqual({ width: 640, height: 768 });
+  )).toEqual({ width: 1152, height: 768 });
 });
 
 it('odrzuca ustawienia animacji dla assetu innego niż postać', () => {
   expect(() => enqueueGenerationSchema.parse({
     name: 'Kamień',
     category: 'prop',
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 8 },
+    characterAnimation: { action: 'walk', framesPerDirection: 8, framesPerSecond: 8 },
   })).toThrow(/tylko dla kategorii character/);
   expect(enqueueGenerationSchema.parse({
     name: 'Rycerz',
     category: 'character',
-    characterAnimation: { action: 'walk', framesPerDirection: 4, framesPerSecond: 12 },
-  }).characterAnimation).toEqual({ action: 'walk', framesPerDirection: 4, framesPerSecond: 12 });
+    characterAnimation: { action: 'walk', framesPerDirection: 6, framesPerSecond: 12 },
+  }).characterAnimation).toEqual({ action: 'walk', framesPerDirection: 6, framesPerSecond: 12 });
 });
 
 it('wylicza względne canvasy względem bazowego tile 2:1', () => {
@@ -137,11 +140,17 @@ it('wylicza względne canvasy względem bazowego tile 2:1', () => {
   })).toEqual({ width: 256, height: 128 });
 });
 
-it('normalizuje projekcję projektu i wylicza wysokość siatki 2:1 lub 1:1', () => {
-  expect(createProjectSchema.parse({ name: 'Stary projekt' }).projection).toBe('isometric');
+it('normalizuje projekcję projektu, liczbę klatek postaci i wysokość siatki 2:1 lub 1:1', () => {
+  expect(createProjectSchema.parse({ name: 'Stary projekt' })).toMatchObject({
+    projection: 'isometric', characterFramesPerDirection: 8,
+  });
   expect(createProjectSchema.parse({
     name: 'Widok z góry', projection: 'top_down', tileWidthPx: 255,
-  })).toMatchObject({ projection: 'top_down', tileWidthPx: 255 });
+    characterFramesPerDirection: 16,
+  })).toMatchObject({ projection: 'top_down', tileWidthPx: 255, characterFramesPerDirection: 16 });
+  expect(() => createProjectSchema.parse({
+    name: 'Za mało klatek', characterFramesPerDirection: 1,
+  })).toThrow();
   expect(() => createProjectSchema.parse({
     name: 'Krzywy romb', projection: 'isometric', tileWidthPx: 255,
   })).toThrow(/parzysta/);
@@ -157,6 +166,7 @@ it('normalizuje projekcję projektu i wylicza wysokość siatki 2:1 lub 1:1', ()
     aiVerificationEnabled: true,
   });
   expect(update.tileWidthPx).toBe(255);
+  expect(update.characterFramesPerDirection).toBe(8);
   expect(update).not.toHaveProperty('projection');
 });
 
