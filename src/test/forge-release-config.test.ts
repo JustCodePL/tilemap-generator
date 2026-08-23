@@ -33,6 +33,7 @@ it('zachowuje lokalny podpis ad-hoc poza buildem release', async () => {
   });
   expect(packagerConfig).not.toHaveProperty('osxNotarize');
   expect(packagerConfig).toHaveProperty('appVersion', numericAppVersion(packageJson.version));
+  expect(packagerConfig).toHaveProperty('icon', path.join(process.cwd(), 'assets', 'icon'));
   expect(packagerConfig).not.toHaveProperty('buildVersion');
 });
 

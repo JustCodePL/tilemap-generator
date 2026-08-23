@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { App } from './ui/App';
 import './ui/styles.css';
+import './ui/welcome-artwork.css';
 
 const queryClient = new QueryClient({
   defaultOptions: {

@@ -228,7 +228,6 @@ function mockOpenedProject(project: ProjectInfo, assets: AssetSummary[] = []) {
 it('pokazuje listę projektów i otwiera formularz przyciskiem Nowy projekt', async () => {
   render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
   expect(await screen.findByRole('heading', { name: /Spójny świat/i })).toBeInTheDocument();
-  expect(screen.getByRole('img', { name: 'Kafel terenu wygenerowany w Tilemap Generator' })).toBeInTheDocument();
   expect(screen.getByRole('heading', { name: 'Projekty' })).toBeInTheDocument();
   expect(screen.queryByRole('button', { name: /Utwórz projekt/i })).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Nowy projekt' }));

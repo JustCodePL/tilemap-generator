@@ -18,6 +18,7 @@ if (typeof packageVersion.version !== 'string' || !isTilemapReleaseVersion(packa
   throw new Error(`Nieprawidłowa wersja package.json: ${String(packageVersion.version)}.`);
 }
 const fullPackageVersion = packageVersion.version;
+const appIconPath = path.join(process.cwd(), 'assets', 'icon');
 
 function requiredReleaseEnvironment(name: string): string {
   const value = process.env[name]?.trim();
@@ -82,7 +83,7 @@ const config: ForgeConfig = {
     appBundleId: 'ac.justcode.tilemap-generator',
     executableName: 'tilemap-generator',
     extraResource: ['dist/mcp'],
-    icon: undefined,
+    icon: appIconPath,
     osxSign: macSignConfig,
     ...(releaseBuild ? {
       osxNotarize: {
@@ -104,6 +105,7 @@ const config: ForgeConfig = {
     new MakerSquirrel({
       name: 'tilemap_generator',
       setupExe: 'TilemapGeneratorSetup.exe',
+      setupIcon: `${appIconPath}.ico`,
     }, ['win32']),
     new MakerZIP({}, ['win32']),
     // The release pipeline owns RELEASES.json and UPDATE.json. MakerZIP only
